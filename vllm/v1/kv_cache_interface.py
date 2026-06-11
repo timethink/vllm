@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
@@ -347,6 +348,173 @@ class TQFullAttentionSpec(FullAttentionSpec):
             "All TQ layers in the same KV cache group must use the same tq_slot_size."
         )
         return replace(merged, tq_slot_size=specs[0].tq_slot_size)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ByteV2FullAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec with Byte-v2 compressed page size accounting.
+
+    Byte-v2 compresses BF16 K/V as 16-token by 16-dimension tiles. This spec
+    models the fixed fast-path payload stored in the main cache allocation.
+    Raw tail storage and fallback storage are explicit byte reservations so the
+    allocator accounts for actual HBM usage instead of benchmark-only logical
+    payload bytes.
+    """
+
+    tile_token_size: int = 16
+    tile_head_size: int = 16
+    fast_tile_payload_bytes: int = 386
+    page_header_bytes: int = 16
+    raw_tail_bytes: int | None = None
+    fallback_pool_bytes: int = 0
+    sparse_fallback_pool_ratio: float = 0.0
+    sparse_fallback_pool_min_blocks: int = 0
+    sparse_fallback_block_id_bytes: int = 4
+    sparse_fallback_next_slot_bytes: int = 4
+    sparse_fallback_tile_id_bytes: int = 4
+    sparse_fallback_tile_next_slot_bytes: int = 4
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.block_size % self.tile_token_size != 0:
+            raise ValueError(
+                "Byte-v2 KV cache block_size must be a multiple of "
+                f"{self.tile_token_size}, got {self.block_size}."
+            )
+        if self.head_size % self.tile_head_size != 0:
+            raise ValueError(
+                "Byte-v2 KV cache head_size must be a multiple of "
+                f"{self.tile_head_size}, got {self.head_size}."
+            )
+        if self.head_size_v % self.tile_head_size != 0:
+            raise ValueError(
+                "Byte-v2 KV cache head_size_v must be a multiple of "
+                f"{self.tile_head_size}, got {self.head_size_v}."
+            )
+        if self.raw_tail_bytes is None:
+            object.__setattr__(
+                self,
+                "raw_tail_bytes",
+                max(0, self.raw_block_bytes - self._compressed_payload_bytes),
+            )
+        if self.sparse_fallback_pool_ratio < 0:
+            raise ValueError("Byte-v2 sparse fallback pool ratio must be >= 0")
+        if self.sparse_fallback_pool_min_blocks < 0:
+            raise ValueError(
+                "Byte-v2 sparse fallback pool min blocks must be >= 0"
+            )
+
+    @property
+    def _compressed_payload_bytes(self) -> int:
+        token_tiles = self.block_size // self.tile_token_size
+        k_dim_tiles = self.head_size // self.tile_head_size
+        v_dim_tiles = self.head_size_v // self.tile_head_size
+        compressed_tiles = (
+            token_tiles * self.num_kv_heads * (k_dim_tiles + v_dim_tiles)
+        )
+        return compressed_tiles * self.fast_tile_payload_bytes
+
+    @property
+    def tile_fallback_tiles_per_block(self) -> int:
+        k_dim_tiles = self.head_size // self.tile_head_size
+        v_dim_tiles = self.head_size_v // self.tile_head_size
+        return self.num_kv_heads * (k_dim_tiles + v_dim_tiles)
+
+    @property
+    def raw_block_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size + self.head_size_v)
+            * get_dtype_size(torch.bfloat16)
+        )
+
+    @property
+    def main_page_size_bytes(self) -> int:
+        assert self.raw_tail_bytes is not None
+        return (
+            self.page_header_bytes
+            + self._compressed_payload_bytes
+            + self.raw_tail_bytes
+            + self.fallback_pool_bytes
+        )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.main_page_size_bytes
+
+    def sparse_fallback_pool_blocks(self, num_blocks: int) -> int:
+        if self.sparse_fallback_pool_ratio <= 0 or num_blocks <= 0:
+            return 0
+        return min(
+            num_blocks,
+            max(
+                1,
+                self.sparse_fallback_pool_min_blocks,
+                math.ceil(num_blocks * self.sparse_fallback_pool_ratio),
+            ),
+        )
+
+    def sparse_fallback_metadata_bytes(self, num_blocks: int) -> int:
+        if self.sparse_fallback_pool_blocks(num_blocks) == 0:
+            return 0
+        return (
+            num_blocks * self.sparse_fallback_block_id_bytes
+            + self.sparse_fallback_next_slot_bytes
+            + num_blocks
+            * self.tile_fallback_tiles_per_block
+            * self.sparse_fallback_tile_id_bytes
+            + self.sparse_fallback_tile_next_slot_bytes
+        )
+
+    def allocation_size_bytes(self, num_blocks: int) -> int:
+        main_cache_bytes = num_blocks * self.main_page_size_bytes
+        fallback_pool_bytes = (
+            self.sparse_fallback_pool_blocks(num_blocks) * self.raw_block_bytes
+        )
+        metadata_start = round_up(main_cache_bytes + fallback_pool_bytes, 4)
+        return metadata_start + self.sparse_fallback_metadata_bytes(num_blocks)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        if dcp_world_size * pcp_world_size > 1:
+            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        return self.allocation_size_bytes(cdiv(max_model_len, self.block_size))
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        byte_v2_fields = (
+            "tile_token_size",
+            "tile_head_size",
+            "fast_tile_payload_bytes",
+            "page_header_bytes",
+            "raw_tail_bytes",
+            "fallback_pool_bytes",
+            "sparse_fallback_pool_ratio",
+            "sparse_fallback_pool_min_blocks",
+            "sparse_fallback_block_id_bytes",
+            "sparse_fallback_next_slot_bytes",
+            "sparse_fallback_tile_id_bytes",
+            "sparse_fallback_tile_next_slot_bytes",
+        )
+        for field_name in byte_v2_fields:
+            assert all(
+                getattr(spec, field_name) == getattr(specs[0], field_name)
+                for spec in specs
+            ), (
+                "All Byte-v2 layers in the same KV cache group must use the "
+                f"same {field_name}."
+            )
+        return replace(
+            merged,
+            **{
+                field_name: getattr(specs[0], field_name)
+                for field_name in byte_v2_fields
+            },
+        )
 
 
 @dataclass(frozen=True, kw_only=True)

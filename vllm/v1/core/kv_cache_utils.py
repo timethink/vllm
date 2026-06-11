@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -902,6 +903,18 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    byte_v2_sparse_spec = _get_byte_v2_sparse_fallback_spec(
+        kv_cache_config.kv_cache_groups
+    )
+    if byte_v2_sparse_spec is not None:
+        max_model_len = vllm_config.model_config.max_model_len
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+        if dcp_world_size * pcp_world_size > 1:
+            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        num_block_per_request = cdiv(max_model_len, byte_v2_sparse_spec.block_size)
+        return kv_cache_config.num_blocks / num_block_per_request
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -925,6 +938,72 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_blocks = vllm_config.cache_config.num_gpu_blocks_override
     return num_blocks
+
+
+def _get_byte_v2_sparse_fallback_spec(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> ByteV2FullAttentionSpec | None:
+    if len(kv_cache_groups) != 1:
+        return None
+    spec = kv_cache_groups[0].kv_cache_spec
+    if not isinstance(spec, ByteV2FullAttentionSpec):
+        return None
+    if spec.sparse_fallback_pool_ratio <= 0:
+        return None
+    return spec
+
+
+def _get_num_blocks_byte_v2_sparse_fallback(
+    vllm_config: VllmConfig,
+    num_layers: int,
+    available_memory: int,
+    spec: ByteV2FullAttentionSpec,
+    *,
+    apply_override: bool = True,
+) -> int:
+    if available_memory <= 0:
+        return may_override_num_blocks(vllm_config, 0) if apply_override else 0
+
+    high = max(available_memory // (spec.main_page_size_bytes * num_layers), 0)
+    low = 0
+    result = 0
+    while low <= high:
+        mid = (low + high) // 2
+        needed = num_layers * spec.allocation_size_bytes(mid)
+        if needed <= available_memory:
+            result = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    return may_override_num_blocks(vllm_config, result) if apply_override else result
+
+
+def _pool_bytes_for_num_blocks(
+    kv_cache_groups: list[KVCacheGroupSpec],
+    num_blocks: int,
+) -> int:
+    sparse_spec = _get_byte_v2_sparse_fallback_spec(kv_cache_groups)
+    if sparse_spec is not None:
+        num_layers = len(kv_cache_groups[0].layer_names)
+        return num_layers * sparse_spec.allocation_size_bytes(num_blocks)
+    return num_blocks * _pool_bytes_per_block(kv_cache_groups)
+
+
+def _estimate_num_blocks_from_memory(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> int:
+    sparse_spec = _get_byte_v2_sparse_fallback_spec(kv_cache_groups)
+    if sparse_spec is not None:
+        return _get_num_blocks_byte_v2_sparse_fallback(
+            vllm_config,
+            len(kv_cache_groups[0].layer_names),
+            available_memory,
+            sparse_spec,
+            apply_override=False,
+        )
+    return available_memory // _pool_bytes_per_block(kv_cache_groups)
 
 
 def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
@@ -1277,6 +1356,30 @@ def get_kv_cache_config_from_groups(
         return KVCacheConfig(
             num_blocks=1,
             kv_cache_tensors=[],
+            kv_cache_groups=kv_cache_groups,
+        )
+
+    byte_v2_sparse_spec = _get_byte_v2_sparse_fallback_spec(kv_cache_groups)
+    if byte_v2_sparse_spec is not None:
+        # Byte-v2 compressed-only pages keep the main pages compact and place
+        # rare uncompressible blocks in a separate sparse raw pool. The worker
+        # still receives one KVCacheTensor per layer, but its byte size is not
+        # linear in page_size_bytes because the pool has
+        # ceil(num_blocks * ratio) raw slots plus metadata.
+        num_layers = len(kv_cache_groups[0].layer_names)
+        num_blocks = _get_num_blocks_byte_v2_sparse_fallback(
+            vllm_config, num_layers, available_memory, byte_v2_sparse_spec
+        )
+        kv_cache_tensors = [
+            KVCacheTensor(
+                size=byte_v2_sparse_spec.allocation_size_bytes(num_blocks),
+                shared_by=[layer_name],
+            )
+            for layer_name in kv_cache_groups[0].layer_names
+        ]
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=kv_cache_tensors,
             kv_cache_groups=kv_cache_groups,
         )
 
@@ -1774,6 +1877,13 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    byte_v2_sparse_spec = _get_byte_v2_sparse_fallback_spec(kv_cache_groups)
+    if byte_v2_sparse_spec is not None:
+        return (
+            len(kv_cache_groups[0].layer_names)
+            * byte_v2_sparse_spec.max_memory_usage_bytes(vllm_config)
+        )
+
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
@@ -2042,13 +2152,15 @@ def get_kv_cache_configs(
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
-            bytes_per_block = _pool_bytes_per_block(groups)
+            estimated_blocks = _estimate_num_blocks_from_memory(
+                vllm_config, groups, avail_mem
+            )
             logger.info(
                 "Overriding num_gpu_blocks=%d with num_gpu_blocks_override=%d",
-                avail_mem // bytes_per_block,
+                estimated_blocks,
                 override,
             )
-            adjusted_memory.append(override * bytes_per_block)
+            adjusted_memory.append(_pool_bytes_for_num_blocks(groups, override))
         available_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
@@ -2091,9 +2203,19 @@ def get_kv_cache_configs(
         kv_cache_config.num_blocks = min_num_blocks
 
         # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        byte_v2_sparse_spec = _get_byte_v2_sparse_fallback_spec(
+            kv_cache_config.kv_cache_groups
+        )
+        if byte_v2_sparse_spec is not None:
+            new_tensor_size = byte_v2_sparse_spec.allocation_size_bytes(
+                min_num_blocks
+            )
+            for tensor in kv_cache_config.kv_cache_tensors:
+                tensor.size = new_tensor_size
+        else:
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

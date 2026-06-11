@@ -23,6 +23,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     register_all_kvcache_specs,
 )
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -82,6 +83,7 @@ class _TrulyUnregisteredSpec(KVCacheSpec):
 
 
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
+    ByteV2FullAttentionSpec: FullAttentionManager,
     FullAttentionSpec: FullAttentionManager,
     TQFullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
@@ -95,6 +97,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 }
 
 spec_uniform_base_map: dict[type[KVCacheSpec], type[KVCacheSpec]] = {
+    ByteV2FullAttentionSpec: FullAttentionSpec,
     FullAttentionSpec: FullAttentionSpec,
     TQFullAttentionSpec: FullAttentionSpec,
     MLAAttentionSpec: FullAttentionSpec,
@@ -108,6 +111,13 @@ spec_uniform_base_map: dict[type[KVCacheSpec], type[KVCacheSpec]] = {
 }
 
 spec_args_map: dict[type[KVCacheSpec], dict[str, Any]] = {
+    ByteV2FullAttentionSpec: dict(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.uint8,
+        raw_tail_bytes=4096,
+    ),
     FullAttentionSpec: dict(
         block_size=64, num_kv_heads=8, head_size=128, dtype=torch.bfloat16
     ),

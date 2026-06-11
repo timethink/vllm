@@ -16,13 +16,25 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
 typedef __hip_bfloat16 __nv_bfloat16;
 #else
   #include <cuda.h>
+  #include <cuda_bf16.h>
+  #include <mma.h>
 #endif
+
+#define BYTE_V2_CUDA_CHECK(cmd)                                             \
+  do {                                                                      \
+    cudaError_t err = cmd;                                                  \
+    STD_TORCH_CHECK(err == cudaSuccess, "CUDA error: ", cudaGetErrorString(err)); \
+  } while (0)
 
 #if defined(__gfx942__)
 constexpr float kFp8ScaleDivisor = 224.f;
@@ -808,6 +820,5114 @@ void reshape_and_cache_flash(
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+namespace vllm {
+namespace {
+
+constexpr int kByteV2TileSize = 16;
+constexpr int kByteV2TileElems = kByteV2TileSize * kByteV2TileSize;
+constexpr int kByteV2PackedTileElems = kByteV2TileElems / 2;
+constexpr int kByteV2RawTileBytes = kByteV2TileElems * 2;
+constexpr int kByteV2FastTilePayloadBytes =
+    1 + kByteV2TileElems + kByteV2PackedTileElems + 1;
+constexpr int kByteV2PageHeaderBytes = 16;
+constexpr int kByteV2PageStatusOffset = 0;
+constexpr int kByteV2PageValidRowsOffset = 1;
+constexpr uint8_t kByteV2PageStatusEmpty = 0;
+constexpr uint8_t kByteV2PageStatusCompressed = 1;
+constexpr uint8_t kByteV2PageStatusRawFallback = 2;
+constexpr int kByteV2MaxTilesPerBlock = 2048;
+constexpr int kByteV2MaxPrefillDirectWarps = 8;
+
+constexpr int kByteV2CacheUpdateErrorInvalidPageState = 1;
+constexpr int kByteV2CacheUpdateErrorInvalidSlot = 2;
+constexpr int kByteV2CacheUpdateErrorDuplicateSlot = 3;
+constexpr int kByteV2CacheUpdateErrorFinalizedBlockUpdate = 4;
+constexpr int kByteV2CacheUpdateErrorFallbackPoolMissing = 5;
+constexpr int kByteV2CacheUpdateErrorFallbackPoolInvalidSlot = 6;
+constexpr int kByteV2CacheUpdateErrorFallbackPoolExhausted = 7;
+constexpr int kByteV2CacheUpdateErrorInvalidValidRows = 8;
+constexpr int kByteV2CacheUpdateErrorNoTouchedToken = 9;
+
+__device__ __forceinline__ void byte_v2_record_cache_update_error(
+    int32_t* __restrict__ error, const int code) {
+  atomicCAS(reinterpret_cast<int*>(error), 0, code);
+}
+
+__device__ __forceinline__ void byte_v2_record_cache_update_error_detail(
+    int32_t* __restrict__ error, const int code, const int detail) {
+  const int old = atomicCAS(reinterpret_cast<int*>(error), 0, code);
+  if (old == 0) {
+    error[1] = detail;
+  }
+}
+
+const char* byte_v2_cache_update_error_message(const int code) {
+  switch (code) {
+    case kByteV2CacheUpdateErrorInvalidPageState:
+      return "invalid page state";
+    case kByteV2CacheUpdateErrorInvalidSlot:
+      return "invalid slot mapping";
+    case kByteV2CacheUpdateErrorDuplicateSlot:
+      return "duplicate token slot in one cache update";
+    case kByteV2CacheUpdateErrorFinalizedBlockUpdate:
+      return "attempted to update a finalized KV block";
+    case kByteV2CacheUpdateErrorFallbackPoolMissing:
+      return "sparse fallback pool is required but missing";
+    case kByteV2CacheUpdateErrorFallbackPoolInvalidSlot:
+      return "sparse fallback block id is invalid";
+    case kByteV2CacheUpdateErrorFallbackPoolExhausted:
+      return "sparse fallback pool exhausted";
+    case kByteV2CacheUpdateErrorInvalidValidRows:
+      return "invalid Byte-v2 valid row count";
+    case kByteV2CacheUpdateErrorNoTouchedToken:
+      return "touched block has no source token";
+    default:
+      return "unknown cache update error";
+  }
+}
+constexpr int kByteV2MaxHeadSize = 128;
+constexpr int kByteV2MaxQPerKv = 8;
+
+__device__ __forceinline__ float byte_v2_bf16_bits_to_float(
+    const uint16_t bits) {
+  return __uint_as_float(static_cast<uint32_t>(bits) << 16);
+}
+
+#ifndef USE_ROCM
+__device__ __forceinline__ __nv_bfloat16 byte_v2_bf16_bits_to_wmma(
+    const uint16_t bits) {
+  return __ushort_as_bfloat16(bits);
+}
+#endif
+
+__device__ __forceinline__ uint16_t byte_v2_float_to_bf16_bits(
+    const float value) {
+  const uint32_t bits = __float_as_uint(value);
+  const uint32_t lsb = (bits >> 16) & 1U;
+  return static_cast<uint16_t>((bits + 0x7fffU + lsb) >> 16);
+}
+
+__device__ __forceinline__ float byte_v2_warp_reduce_max(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value = max(value, __shfl_down_sync(0xffffffffU, value, offset));
+  }
+  return value;
+}
+
+__device__ __forceinline__ float byte_v2_warp_reduce_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffU, value, offset);
+  }
+  return value;
+}
+
+__device__ __forceinline__ int byte_v2_tile_index(
+    const bool is_value, const int kv_head, const int dim_tile,
+    const int k_dim_tiles, const int v_dim_tiles) {
+  const int kind_offset = is_value ? k_dim_tiles : 0;
+  return kv_head * (k_dim_tiles + v_dim_tiles) + kind_offset + dim_tile;
+}
+
+__device__ __forceinline__ int byte_v2_tile_start(
+    const bool is_value, const int kv_head, const int dim_tile,
+    const int k_dim_tiles, const int v_dim_tiles) {
+  return kByteV2PageHeaderBytes +
+         byte_v2_tile_index(is_value, kv_head, dim_tile, k_dim_tiles,
+                            v_dim_tiles) *
+             kByteV2FastTilePayloadBytes;
+}
+
+__device__ __forceinline__ int byte_v2_total_tiles(
+    const int num_kv_heads, const int head_size, const int head_size_v) {
+  return num_kv_heads * (head_size / kByteV2TileSize +
+                         head_size_v / kByteV2TileSize);
+}
+
+__device__ __forceinline__ int byte_v2_raw_key_bytes(
+    const int num_kv_heads, const int head_size) {
+  return kByteV2TileSize * num_kv_heads * head_size * 2;
+}
+
+__device__ __forceinline__ int byte_v2_raw_value_bytes(
+    const int num_kv_heads, const int head_size_v) {
+  return kByteV2TileSize * num_kv_heads * head_size_v * 2;
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_u16(
+    const uint8_t* __restrict__ ptr) {
+  return static_cast<uint16_t>(ptr[0]) |
+         (static_cast<uint16_t>(ptr[1]) << 8);
+}
+
+__device__ __forceinline__ void byte_v2_store_u16(uint8_t* __restrict__ ptr,
+                                                  const uint16_t value) {
+  ptr[0] = static_cast<uint8_t>(value & 0xff);
+  ptr[1] = static_cast<uint8_t>(value >> 8);
+}
+
+__device__ __forceinline__ int64_t byte_v2_tile_fallback_capacity(
+    const int fallback_pool_blocks, const int raw_block_bytes) {
+  return (static_cast<int64_t>(fallback_pool_blocks) * raw_block_bytes) /
+         kByteV2RawTileBytes;
+}
+
+__device__ __forceinline__ int byte_v2_allocate_tile_fallback_slot(
+    int32_t* __restrict__ fallback_tile_next_slot,
+    const int64_t tile_capacity) {
+  const int tile_ordinal = atomicAdd(fallback_tile_next_slot, 1);
+  if (static_cast<int64_t>(tile_ordinal) >= tile_capacity) {
+    return -1;
+  }
+  // Full raw-block fallback slots grow from the beginning of fallback_pool.
+  // Raw tile slots grow from the end so the two granularities do not overwrite
+  // each other during mixed prefill/decode runs.
+  return static_cast<int>(tile_capacity - 1 - tile_ordinal);
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_raw_bits_from_tile_pool(
+    const uint8_t* __restrict__ fallback_pool, const int tile_slot,
+    const int row, const int dim_in_tile) {
+  const int elem_offset = (row * kByteV2TileSize + dim_in_tile) * 2;
+  return byte_v2_load_u16(
+      fallback_pool + static_cast<int64_t>(tile_slot) * kByteV2RawTileBytes +
+      elem_offset);
+}
+
+__device__ __forceinline__ void byte_v2_store_raw_bits_to_tile_pool(
+    uint8_t* __restrict__ fallback_pool, const int tile_slot, const int row,
+    const int dim_in_tile, const uint16_t bits) {
+  const int elem_offset = (row * kByteV2TileSize + dim_in_tile) * 2;
+  byte_v2_store_u16(
+      fallback_pool + static_cast<int64_t>(tile_slot) * kByteV2RawTileBytes +
+          elem_offset,
+      bits);
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_raw_bits_from_block(
+    const uint8_t* __restrict__ raw_block, const bool is_value, const int row,
+    const int kv_head, const int dim, const int num_kv_heads,
+    const int head_size, const int head_size_v) {
+  const int raw_kind_offset =
+      is_value ? byte_v2_raw_key_bytes(num_kv_heads, head_size) : 0;
+  const int kind_head_size = is_value ? head_size_v : head_size;
+  const int elem_offset =
+      ((row * num_kv_heads + kv_head) * kind_head_size + dim) * 2;
+  return byte_v2_load_u16(raw_block + raw_kind_offset + elem_offset);
+}
+
+__device__ __forceinline__ void byte_v2_store_raw_bits_to_block(
+    uint8_t* __restrict__ raw_block, const bool is_value, const int row,
+    const int kv_head, const int dim, const int num_kv_heads,
+    const int head_size, const int head_size_v, const uint16_t bits) {
+  const int raw_kind_offset =
+      is_value ? byte_v2_raw_key_bytes(num_kv_heads, head_size) : 0;
+  const int kind_head_size = is_value ? head_size_v : head_size;
+  const int elem_offset =
+      ((row * num_kv_heads + kv_head) * kind_head_size + dim) * 2;
+  byte_v2_store_u16(raw_block + raw_kind_offset + elem_offset, bits);
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_raw_bits_from_page(
+    const uint8_t* __restrict__ page, const bool is_value, const int row,
+    const int kv_head, const int dim, const int num_kv_heads,
+    const int head_size, const int head_size_v) {
+  return byte_v2_load_raw_bits_from_block(page + kByteV2PageHeaderBytes,
+                                          is_value, row, kv_head, dim,
+                                          num_kv_heads, head_size, head_size_v);
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_compressed_bits(
+    const uint8_t* __restrict__ page, const bool is_value, const int row,
+    const int kv_head, const int dim, const int k_dim_tiles,
+    const int v_dim_tiles) {
+  const int dim_tile = dim / kByteV2TileSize;
+  const int dim_in_tile = dim % kByteV2TileSize;
+  const int elem = is_value ? row * kByteV2TileSize + dim_in_tile
+                            : dim_in_tile * kByteV2TileSize + row;
+  const int tile_start =
+      byte_v2_tile_start(is_value, kv_head, dim_tile, k_dim_tiles, v_dim_tiles);
+  const int base = static_cast<int>(page[tile_start]);
+  const int low = static_cast<int>(page[tile_start + 2 + elem]);
+  const int packed =
+      static_cast<int>(page[tile_start + 2 + kByteV2TileElems + elem / 2]);
+  const int code = (elem & 1) ? ((packed >> 4) & 0x0f) : (packed & 0x0f);
+  const int low_exp_lsb = low >> 7;
+  const int delta_hi = code & 0x07;
+  const int exp_hi =
+      (base >> 1) + delta_hi + ((base & 1) & (low_exp_lsb ^ 1));
+  const int high = ((code & 0x08) << 4) | exp_hi;
+  return static_cast<uint16_t>((high << 8) | low);
+}
+
+__device__ __forceinline__ uint16_t byte_v2_make_bf16_bits_from_fast_code(
+    const int base, const int low, const int code) {
+  const int low_exp_lsb = low >> 7;
+  const int delta_hi = code & 0x07;
+  const int exp_hi =
+      (base >> 1) + delta_hi + ((base & 1) & (low_exp_lsb ^ 1));
+  const int high = ((code & 0x08) << 4) | exp_hi;
+  return static_cast<uint16_t>((high << 8) | low);
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_compressed_bits(
+    const uint8_t* __restrict__ page, const bool is_value, const int row,
+    const int kv_head, const int dim, const int k_dim_tiles,
+    const int v_dim_tiles, const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_tile_ids, const int physical_block,
+    const int total_tiles) {
+  const int dim_tile = dim / kByteV2TileSize;
+  const int dim_in_tile = dim % kByteV2TileSize;
+  const int tile_start =
+      byte_v2_tile_start(is_value, kv_head, dim_tile, k_dim_tiles, v_dim_tiles);
+  const uint8_t fallback = page[tile_start + 1];
+  if (fallback != 0) {
+    if (fallback_pool != nullptr && fallback_tile_ids != nullptr) {
+      const int tile_idx = byte_v2_tile_index(is_value, kv_head, dim_tile,
+                                              k_dim_tiles, v_dim_tiles);
+      const int tile_slot =
+          fallback_tile_ids[physical_block * total_tiles + tile_idx];
+      if (tile_slot >= 0) {
+        return byte_v2_load_raw_bits_from_tile_pool(
+            fallback_pool, tile_slot, row, dim_in_tile);
+      }
+    }
+    return 0;
+  }
+
+  return byte_v2_load_compressed_bits(page, is_value, row, kv_head, dim,
+                                      k_dim_tiles, v_dim_tiles);
+}
+
+#ifndef USE_ROCM
+__device__ __forceinline__ void
+byte_v2_decode_k_transposed_tile_to_shared_no_fallback(
+    const uint8_t* __restrict__ page, __nv_bfloat16* __restrict__ k_shared,
+    const int tid, const int kv_head, const int dim_tile,
+    const int k_dim_tiles, const int v_dim_tiles, const int valid_rows) {
+  const int tile_start =
+      byte_v2_tile_start(false, kv_head, dim_tile, k_dim_tiles, v_dim_tiles);
+  const int base = static_cast<int>(page[tile_start]);
+  const int d0 = dim_tile * kByteV2TileSize;
+  const uint8_t* __restrict__ low_ptr = page + tile_start + 2;
+  const uint8_t* __restrict__ packed_ptr =
+      low_ptr + kByteV2TileElems;
+
+  for (int pair_idx = tid; pair_idx < kByteV2PackedTileElems;
+       pair_idx += blockDim.x) {
+    const int elem0 = pair_idx * 2;
+    const int dim_in_tile = elem0 / kByteV2TileSize;
+    const int row0 = elem0 % kByteV2TileSize;
+    const int shared_offset = (d0 + dim_in_tile) * kByteV2TileSize + row0;
+    const uint16_t low_pair = byte_v2_load_u16(low_ptr + elem0);
+    const int packed = static_cast<int>(packed_ptr[pair_idx]);
+
+    uint16_t bits0 = 0;
+    uint16_t bits1 = 0;
+    if (row0 < valid_rows) {
+      bits0 = byte_v2_make_bf16_bits_from_fast_code(
+          base, static_cast<int>(low_pair & 0xff), packed & 0x0f);
+    }
+    if (row0 + 1 < valid_rows) {
+      bits1 = byte_v2_make_bf16_bits_from_fast_code(
+          base, static_cast<int>(low_pair >> 8), (packed >> 4) & 0x0f);
+    }
+    k_shared[shared_offset] = byte_v2_bf16_bits_to_wmma(bits0);
+    k_shared[shared_offset + 1] = byte_v2_bf16_bits_to_wmma(bits1);
+  }
+}
+
+__device__ __forceinline__ void
+byte_v2_decode_v_rowmajor_tile_to_shared_no_fallback(
+    const uint8_t* __restrict__ page, __nv_bfloat16* __restrict__ v_shared,
+    const int tid, const int kv_head, const int dim_tile,
+    const int k_dim_tiles, const int v_dim_tiles, const int valid_rows,
+    const int head_size_v) {
+  const int tile_start =
+      byte_v2_tile_start(true, kv_head, dim_tile, k_dim_tiles, v_dim_tiles);
+  const int base = static_cast<int>(page[tile_start]);
+  const int d0 = dim_tile * kByteV2TileSize;
+  const uint8_t* __restrict__ low_ptr = page + tile_start + 2;
+  const uint8_t* __restrict__ packed_ptr =
+      low_ptr + kByteV2TileElems;
+
+  for (int pair_idx = tid; pair_idx < kByteV2PackedTileElems;
+       pair_idx += blockDim.x) {
+    const int elem0 = pair_idx * 2;
+    const int row = elem0 / kByteV2TileSize;
+    const int dim_in_tile = elem0 % kByteV2TileSize;
+    const int shared_offset = row * head_size_v + d0 + dim_in_tile;
+    const uint16_t low_pair = byte_v2_load_u16(low_ptr + elem0);
+    const int packed = static_cast<int>(packed_ptr[pair_idx]);
+
+    uint16_t bits0 = 0;
+    uint16_t bits1 = 0;
+    if (row < valid_rows) {
+      bits0 = byte_v2_make_bf16_bits_from_fast_code(
+          base, static_cast<int>(low_pair & 0xff), packed & 0x0f);
+      bits1 = byte_v2_make_bf16_bits_from_fast_code(
+          base, static_cast<int>(low_pair >> 8), (packed >> 4) & 0x0f);
+    }
+    v_shared[shared_offset] = byte_v2_bf16_bits_to_wmma(bits0);
+    v_shared[shared_offset + 1] = byte_v2_bf16_bits_to_wmma(bits1);
+  }
+}
+
+__device__ __forceinline__ void
+byte_v2_decode_k_transposed_tile_to_shared_tile_fallback(
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_tile_ids,
+    __nv_bfloat16* __restrict__ k_shared, const int tid,
+    const int physical_block, const int kv_head, const int dim_tile,
+    const int k_dim_tiles, const int v_dim_tiles, const int valid_rows,
+    const int total_tiles) {
+  const int tile_idx = byte_v2_tile_index(false, kv_head, dim_tile,
+                                          k_dim_tiles, v_dim_tiles);
+  const int tile_slot =
+      (fallback_pool != nullptr && fallback_tile_ids != nullptr)
+          ? fallback_tile_ids[physical_block * total_tiles + tile_idx]
+          : -1;
+  const int d0 = dim_tile * kByteV2TileSize;
+
+  for (int idx = tid; idx < kByteV2TileElems; idx += blockDim.x) {
+    const int dim_in_tile = idx / kByteV2TileSize;
+    const int row = idx % kByteV2TileSize;
+    uint16_t bits = 0;
+    if (row < valid_rows && tile_slot >= 0) {
+      bits = byte_v2_load_raw_bits_from_tile_pool(fallback_pool, tile_slot,
+                                                  row, dim_in_tile);
+    }
+    k_shared[(d0 + dim_in_tile) * kByteV2TileSize + row] =
+        byte_v2_bf16_bits_to_wmma(bits);
+  }
+}
+
+__device__ __forceinline__ void
+byte_v2_decode_v_rowmajor_tile_to_shared_tile_fallback(
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_tile_ids,
+    __nv_bfloat16* __restrict__ v_shared, const int tid,
+    const int physical_block, const int kv_head, const int dim_tile,
+    const int k_dim_tiles, const int v_dim_tiles, const int valid_rows,
+    const int head_size_v, const int total_tiles) {
+  const int tile_idx = byte_v2_tile_index(true, kv_head, dim_tile, k_dim_tiles,
+                                          v_dim_tiles);
+  const int tile_slot =
+      (fallback_pool != nullptr && fallback_tile_ids != nullptr)
+          ? fallback_tile_ids[physical_block * total_tiles + tile_idx]
+          : -1;
+  const int d0 = dim_tile * kByteV2TileSize;
+
+  for (int idx = tid; idx < kByteV2TileElems; idx += blockDim.x) {
+    const int row = idx / kByteV2TileSize;
+    const int dim_in_tile = idx % kByteV2TileSize;
+    uint16_t bits = 0;
+    if (row < valid_rows && tile_slot >= 0) {
+      bits = byte_v2_load_raw_bits_from_tile_pool(fallback_pool, tile_slot,
+                                                  row, dim_in_tile);
+    }
+    v_shared[row * head_size_v + d0 + dim_in_tile] =
+        byte_v2_bf16_bits_to_wmma(bits);
+  }
+}
+
+#endif
+
+__device__ __forceinline__ uint16_t byte_v2_load_kv_bits(
+    const uint8_t* __restrict__ page,
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_block_ids,
+    const int32_t* __restrict__ fallback_tile_ids, const int physical_block,
+    const int raw_block_bytes, const bool is_value, const int row,
+    const int kv_head, const int dim, const int num_kv_heads,
+    const int head_size, const int head_size_v) {
+  const uint8_t status = page[kByteV2PageStatusOffset];
+  if (status == kByteV2PageStatusRawFallback) {
+    if (fallback_pool != nullptr && fallback_block_ids != nullptr) {
+      const int fallback_slot = fallback_block_ids[physical_block];
+      if (fallback_slot >= 0) {
+        return byte_v2_load_raw_bits_from_block(
+            fallback_pool + fallback_slot * raw_block_bytes, is_value, row,
+            kv_head, dim, num_kv_heads, head_size, head_size_v);
+      }
+    }
+    return byte_v2_load_raw_bits_from_page(page, is_value, row, kv_head, dim,
+                                           num_kv_heads, head_size,
+                                           head_size_v);
+  }
+  if (status == kByteV2PageStatusCompressed) {
+    const int k_dim_tiles = head_size / kByteV2TileSize;
+    const int v_dim_tiles = head_size_v / kByteV2TileSize;
+    const int total_tiles =
+        byte_v2_total_tiles(num_kv_heads, head_size, head_size_v);
+    return byte_v2_load_compressed_bits(
+        page, is_value, row, kv_head, dim, k_dim_tiles, v_dim_tiles,
+        fallback_pool, fallback_tile_ids, physical_block, total_tiles);
+  }
+  return 0;
+}
+
+__device__ int byte_v2_best_window_base_from_hist(
+    const int* __restrict__ hist, int* __restrict__ covered_out) {
+  int window = 0;
+  for (int i = 0; i < 16; ++i) {
+    window += hist[i];
+  }
+  int best = window;
+  int best_start = 0;
+  for (int start = 1; start <= 240; ++start) {
+    window += hist[start + 15] - hist[start - 1];
+    if (window > best) {
+      best = window;
+      best_start = start;
+    }
+  }
+  *covered_out = best;
+  return best_start;
+}
+
+__device__ int byte_v2_best_window_base_from_raw_tile(
+    const uint8_t* __restrict__ raw_block, const bool is_value,
+    const int kv_head, const int dim_tile, const int num_kv_heads,
+    const int head_size, const int head_size_v, const int valid_rows,
+    int* __restrict__ covered_out) {
+  int hist[256];
+#pragma unroll
+  for (int i = 0; i < 256; ++i) {
+    hist[i] = 0;
+  }
+
+  const int d0 = dim_tile * kByteV2TileSize;
+  for (int row = 0; row < valid_rows; ++row) {
+    for (int d = 0; d < kByteV2TileSize; ++d) {
+      const uint16_t bits = byte_v2_load_raw_bits_from_block(
+          raw_block, is_value, row, kv_head, d0 + d, num_kv_heads, head_size,
+          head_size_v);
+      const int exp = (bits >> 7) & 0xff;
+      hist[exp] += 1;
+    }
+  }
+
+  return byte_v2_best_window_base_from_hist(hist, covered_out);
+}
+
+__device__ __forceinline__ int byte_v2_clamp_exp_to_window(
+    const int exp, const int base) {
+  return min(max(exp, base), base + 15);
+}
+
+__device__ bool byte_v2_raw_block_is_compressible(
+    const uint8_t* __restrict__ raw_block, const int num_kv_heads,
+    const int head_size, const int head_size_v, const int valid_rows,
+    const int lossy_max_misses_per_tile) {
+  const int k_dim_tiles = head_size / kByteV2TileSize;
+  const int v_dim_tiles = head_size_v / kByteV2TileSize;
+  const int required_covered = valid_rows * kByteV2TileSize;
+  int covered = 0;
+  for (int kv_head = 0; kv_head < num_kv_heads; ++kv_head) {
+    for (int dim_tile = 0; dim_tile < k_dim_tiles; ++dim_tile) {
+      byte_v2_best_window_base_from_raw_tile(
+          raw_block, false, kv_head, dim_tile, num_kv_heads, head_size,
+          head_size_v, valid_rows, &covered);
+      if (required_covered - covered > lossy_max_misses_per_tile) {
+        return false;
+      }
+    }
+    for (int dim_tile = 0; dim_tile < v_dim_tiles; ++dim_tile) {
+      byte_v2_best_window_base_from_raw_tile(
+          raw_block, true, kv_head, dim_tile, num_kv_heads, head_size,
+          head_size_v, valid_rows, &covered);
+      if (required_covered - covered > lossy_max_misses_per_tile) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+__device__ void byte_v2_store_compressed_tile(
+    const uint8_t* __restrict__ raw_block, uint8_t* __restrict__ page,
+    const bool is_value, const int kv_head, const int dim_tile,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int valid_rows, const int lossy_max_misses_per_tile) {
+  int covered = 0;
+  const int base = byte_v2_best_window_base_from_raw_tile(
+      raw_block, is_value, kv_head, dim_tile, num_kv_heads, head_size,
+      head_size_v, valid_rows, &covered);
+  const int tile_start =
+      byte_v2_tile_start(is_value, kv_head, dim_tile,
+                         head_size / kByteV2TileSize,
+                         head_size_v / kByteV2TileSize);
+  page[tile_start] = static_cast<uint8_t>(base);
+  page[tile_start + 1] = 0;
+
+  const int d0 = dim_tile * kByteV2TileSize;
+  for (int elem = 0; elem < kByteV2TileElems; ++elem) {
+    const int row =
+        is_value ? elem / kByteV2TileSize : elem % kByteV2TileSize;
+    const int d =
+        is_value ? elem % kByteV2TileSize : elem / kByteV2TileSize;
+    const uint16_t bits =
+        row < valid_rows ? byte_v2_load_raw_bits_from_block(
+                               raw_block, is_value, row, kv_head, d0 + d,
+                               num_kv_heads, head_size, head_size_v)
+                         : 0;
+    int low = 0;
+    if (row < valid_rows) {
+      const int exp = (bits >> 7) & 0xff;
+      const int stored_exp =
+          lossy_max_misses_per_tile > 0
+              ? byte_v2_clamp_exp_to_window(exp, base)
+              : exp;
+      low = (bits & 0x7f) | ((stored_exp & 1) << 7);
+    }
+    page[tile_start + 2 + elem] = static_cast<uint8_t>(low);
+  }
+  for (int packed_idx = 0; packed_idx < kByteV2PackedTileElems;
+       ++packed_idx) {
+    uint8_t packed = 0;
+    for (int lane = 0; lane < 2; ++lane) {
+      const int elem = packed_idx * 2 + lane;
+      const int row =
+          is_value ? elem / kByteV2TileSize : elem % kByteV2TileSize;
+      const int d =
+          is_value ? elem % kByteV2TileSize : elem / kByteV2TileSize;
+      if (row < valid_rows) {
+        const uint16_t bits = byte_v2_load_raw_bits_from_block(
+            raw_block, is_value, row, kv_head, d0 + d, num_kv_heads, head_size,
+            head_size_v);
+        const int exp = (bits >> 7) & 0xff;
+        const int stored_exp =
+            lossy_max_misses_per_tile > 0
+                ? byte_v2_clamp_exp_to_window(exp, base)
+                : exp;
+        const int delta = stored_exp - base;
+        const int sign = (bits >> 15) & 1;
+        const int delta_hi = delta >> 1;
+        const uint8_t code =
+            static_cast<uint8_t>((sign << 3) | (delta_hi & 0x07));
+        packed |= static_cast<uint8_t>(code << (lane * 4));
+      }
+    }
+    page[tile_start + 2 + kByteV2TileElems + packed_idx] = packed;
+  }
+}
+
+__device__ void byte_v2_store_compressed_block(
+    const uint8_t* __restrict__ raw_block, uint8_t* __restrict__ page,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int valid_rows, const int lossy_max_misses_per_tile) {
+  const int k_dim_tiles = head_size / kByteV2TileSize;
+  const int v_dim_tiles = head_size_v / kByteV2TileSize;
+  for (int kv_head = 0; kv_head < num_kv_heads; ++kv_head) {
+    for (int dim_tile = 0; dim_tile < k_dim_tiles; ++dim_tile) {
+      byte_v2_store_compressed_tile(raw_block, page, false, kv_head, dim_tile,
+                                    num_kv_heads, head_size, head_size_v,
+                                    valid_rows, lossy_max_misses_per_tile);
+    }
+    for (int dim_tile = 0; dim_tile < v_dim_tiles; ++dim_tile) {
+      byte_v2_store_compressed_tile(raw_block, page, true, kv_head, dim_tile,
+                                    num_kv_heads, head_size, head_size_v,
+                                    valid_rows, lossy_max_misses_per_tile);
+    }
+  }
+}
+
+__device__ void byte_v2_store_raw_tile_from_block(
+    const uint8_t* __restrict__ raw_block, uint8_t* __restrict__ fallback_pool,
+    const int tile_slot, const bool is_value, const int kv_head,
+    const int dim_tile, const int num_kv_heads, const int head_size,
+    const int head_size_v, const int valid_rows) {
+  const int d0 = dim_tile * kByteV2TileSize;
+  for (int elem = 0; elem < kByteV2TileElems; ++elem) {
+    const int row = elem / kByteV2TileSize;
+    const int dim_in_tile = elem % kByteV2TileSize;
+    const uint16_t bits =
+        row < valid_rows ? byte_v2_load_raw_bits_from_block(
+                               raw_block, is_value, row, kv_head,
+                               d0 + dim_in_tile, num_kv_heads, head_size,
+                               head_size_v)
+                         : 0;
+    byte_v2_store_raw_bits_to_tile_pool(fallback_pool, tile_slot, row,
+                                        dim_in_tile, bits);
+  }
+}
+
+__device__ bool byte_v2_store_compressed_or_tile_fallback_block(
+    const uint8_t* __restrict__ raw_block, uint8_t* __restrict__ page,
+    uint8_t* __restrict__ fallback_pool,
+    int32_t* __restrict__ fallback_tile_ids,
+    int32_t* __restrict__ fallback_tile_next_slot,
+    int32_t* __restrict__ error, const int block_id, const int num_kv_heads,
+    const int head_size, const int head_size_v, const int valid_rows,
+    const int raw_block_bytes, const int fallback_pool_blocks,
+    const int lossy_max_misses_per_tile) {
+  const int k_dim_tiles = head_size / kByteV2TileSize;
+  const int v_dim_tiles = head_size_v / kByteV2TileSize;
+  const int tiles_per_head = k_dim_tiles + v_dim_tiles;
+  const int total_tiles = num_kv_heads * tiles_per_head;
+  const int required_covered = valid_rows * kByteV2TileSize;
+  const int64_t tile_capacity =
+      byte_v2_tile_fallback_capacity(fallback_pool_blocks, raw_block_bytes);
+
+  for (int kv_head = 0; kv_head < num_kv_heads; ++kv_head) {
+    for (int tile_in_head = 0; tile_in_head < tiles_per_head; ++tile_in_head) {
+      const bool is_value = tile_in_head >= k_dim_tiles;
+      const int dim_tile =
+          is_value ? tile_in_head - k_dim_tiles : tile_in_head;
+      const int tile_idx = byte_v2_tile_index(is_value, kv_head, dim_tile,
+                                              k_dim_tiles, v_dim_tiles);
+      int covered = 0;
+      byte_v2_best_window_base_from_raw_tile(
+          raw_block, is_value, kv_head, dim_tile, num_kv_heads, head_size,
+          head_size_v, valid_rows, &covered);
+      const bool use_tile_fallback =
+          required_covered - covered > lossy_max_misses_per_tile;
+
+      if (use_tile_fallback) {
+        if (fallback_pool == nullptr || fallback_tile_ids == nullptr ||
+            fallback_tile_next_slot == nullptr) {
+          byte_v2_record_cache_update_error(
+              error, kByteV2CacheUpdateErrorFallbackPoolMissing);
+          return false;
+        }
+        if (tile_capacity <= 0) {
+          byte_v2_record_cache_update_error(
+              error, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+          return false;
+        }
+        const int tile_slot = byte_v2_allocate_tile_fallback_slot(
+            fallback_tile_next_slot, tile_capacity);
+        if (tile_slot < 0) {
+          byte_v2_record_cache_update_error(
+              error, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+          return false;
+        }
+        fallback_tile_ids[block_id * total_tiles + tile_idx] = tile_slot;
+        byte_v2_store_raw_tile_from_block(raw_block, fallback_pool, tile_slot,
+                                          is_value, kv_head, dim_tile,
+                                          num_kv_heads, head_size, head_size_v,
+                                          valid_rows);
+        const int tile_start =
+            byte_v2_tile_start(is_value, kv_head, dim_tile, k_dim_tiles,
+                               v_dim_tiles);
+        page[tile_start] = 0;
+        page[tile_start + 1] = 1;
+      } else {
+        if (fallback_tile_ids != nullptr) {
+          fallback_tile_ids[block_id * total_tiles + tile_idx] = -1;
+        }
+        byte_v2_store_compressed_tile(raw_block, page, is_value, kv_head,
+                                      dim_tile, num_kv_heads, head_size,
+                                      head_size_v, valid_rows,
+                                      lossy_max_misses_per_tile);
+      }
+    }
+  }
+  page[kByteV2PageStatusOffset] = kByteV2PageStatusCompressed;
+  page[kByteV2PageValidRowsOffset] = static_cast<uint8_t>(valid_rows);
+  return true;
+}
+
+__device__ bool byte_v2_finalize_raw_block_parallel(
+    const uint8_t* __restrict__ raw_block, uint8_t* __restrict__ page,
+    uint8_t* __restrict__ fallback_pool,
+    int32_t* __restrict__ fallback_block_ids,
+    int32_t* __restrict__ fallback_tile_ids,
+    int32_t* __restrict__ fallback_tile_next_slot,
+    int32_t* __restrict__ result, const int block_id,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int raw_block_bytes, const int fallback_pool_blocks,
+    const int lossy_max_misses_per_tile,
+    uint8_t* __restrict__ tile_bases,
+    uint8_t* __restrict__ tile_needs_fallback,
+    int* __restrict__ tile_slots, int* __restrict__ tile_hist,
+    int* __restrict__ block_compressible) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid / 32;
+  const int lane = tid & 31;
+  const int num_warps = blockDim.x / 32;
+  const int k_dim_tiles = head_size / kByteV2TileSize;
+  const int v_dim_tiles = head_size_v / kByteV2TileSize;
+  const int tiles_per_head = k_dim_tiles + v_dim_tiles;
+  const int total_tiles = num_kv_heads * tiles_per_head;
+  const bool has_tile_fallback =
+      fallback_pool != nullptr && fallback_tile_ids != nullptr &&
+      fallback_tile_next_slot != nullptr;
+  const int64_t tile_capacity =
+      byte_v2_tile_fallback_capacity(fallback_pool_blocks, raw_block_bytes);
+
+  if (tid == 0) {
+    *block_compressible = 1;
+  }
+  __syncthreads();
+
+  if (total_tiles > kByteV2MaxTilesPerBlock) {
+    if (tid == 0) {
+      byte_v2_record_cache_update_error(
+          result, kByteV2CacheUpdateErrorInvalidSlot);
+      page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+      page[kByteV2PageValidRowsOffset] = kByteV2TileSize;
+    }
+    return false;
+  }
+
+  for (int tile_idx = warp_id; tile_idx < total_tiles;
+       tile_idx += num_warps) {
+    const int kv_head = tile_idx / tiles_per_head;
+    const int tile_in_head = tile_idx % tiles_per_head;
+    const bool is_value = tile_in_head >= k_dim_tiles;
+    const int dim_tile =
+        is_value ? tile_in_head - k_dim_tiles : tile_in_head;
+    const int d0 = dim_tile * kByteV2TileSize;
+
+    if (lossy_max_misses_per_tile > 0) {
+      int* hist = tile_hist + warp_id * 256;
+      for (int exp = lane; exp < 256; exp += 32) {
+        hist[exp] = 0;
+      }
+      __syncwarp();
+      for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+        const int row = elem / kByteV2TileSize;
+        const int dim_in_tile = elem % kByteV2TileSize;
+        const uint16_t bits = byte_v2_load_raw_bits_from_block(
+            raw_block, is_value, row, kv_head, d0 + dim_in_tile,
+            num_kv_heads, head_size, head_size_v);
+        const int exp = (bits >> 7) & 0xff;
+        atomicAdd(hist + exp, 1);
+      }
+      __syncwarp();
+      if (lane == 0) {
+        int covered = 0;
+        const int base = byte_v2_best_window_base_from_hist(hist, &covered);
+        const bool needs_fallback =
+            kByteV2TileElems - covered > lossy_max_misses_per_tile;
+        tile_bases[tile_idx] = static_cast<uint8_t>(base);
+        tile_needs_fallback[tile_idx] = needs_fallback ? 1 : 0;
+        tile_slots[tile_idx] = -1;
+        if (needs_fallback) {
+          atomicExch(block_compressible, 0);
+        }
+      }
+    } else {
+      int local_min = 255;
+      int local_max = 0;
+      for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+        const int row = elem / kByteV2TileSize;
+        const int dim_in_tile = elem % kByteV2TileSize;
+        const uint16_t bits = byte_v2_load_raw_bits_from_block(
+            raw_block, is_value, row, kv_head, d0 + dim_in_tile,
+            num_kv_heads, head_size, head_size_v);
+        const int exp = (bits >> 7) & 0xff;
+        local_min = min(local_min, exp);
+        local_max = max(local_max, exp);
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = min(local_min,
+                        __shfl_down_sync(0xffffffff, local_min, offset));
+        local_max = max(local_max,
+                        __shfl_down_sync(0xffffffff, local_max, offset));
+      }
+      if (lane == 0) {
+        const bool needs_fallback = local_max - local_min > 15;
+        tile_bases[tile_idx] = static_cast<uint8_t>(local_min);
+        tile_needs_fallback[tile_idx] = needs_fallback ? 1 : 0;
+        tile_slots[tile_idx] = -1;
+        if (needs_fallback) {
+          atomicExch(block_compressible, 0);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (*block_compressible == 0 && !has_tile_fallback) {
+    if (tid == 0) {
+      page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+      page[kByteV2PageValidRowsOffset] = kByteV2TileSize;
+    }
+    return false;
+  }
+
+  for (int tile_idx = warp_id; tile_idx < total_tiles;
+       tile_idx += num_warps) {
+    const int kv_head = tile_idx / tiles_per_head;
+    const int tile_in_head = tile_idx % tiles_per_head;
+    const bool is_value = tile_in_head >= k_dim_tiles;
+    const int dim_tile =
+        is_value ? tile_in_head - k_dim_tiles : tile_in_head;
+    const int d0 = dim_tile * kByteV2TileSize;
+    const int tile_start =
+        byte_v2_tile_start(is_value, kv_head, dim_tile, k_dim_tiles,
+                           v_dim_tiles);
+
+    if (tile_needs_fallback[tile_idx] != 0) {
+      if (lane == 0) {
+        if (tile_capacity <= 0) {
+          byte_v2_record_cache_update_error(
+              result, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+        } else {
+          const int tile_slot = byte_v2_allocate_tile_fallback_slot(
+              fallback_tile_next_slot, tile_capacity);
+          if (tile_slot < 0) {
+            byte_v2_record_cache_update_error(
+                result, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+          } else {
+            tile_slots[tile_idx] = tile_slot;
+            fallback_tile_ids[block_id * total_tiles + tile_idx] = tile_slot;
+            page[tile_start] = 0;
+            page[tile_start + 1] = 1;
+          }
+        }
+      }
+      __syncwarp();
+      const int tile_slot = tile_slots[tile_idx];
+      if (tile_slot >= 0) {
+        for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+          const int row = elem / kByteV2TileSize;
+          const int dim_in_tile = elem % kByteV2TileSize;
+          const uint16_t bits = byte_v2_load_raw_bits_from_block(
+              raw_block, is_value, row, kv_head, d0 + dim_in_tile,
+              num_kv_heads, head_size, head_size_v);
+          byte_v2_store_raw_bits_to_tile_pool(fallback_pool, tile_slot, row,
+                                              dim_in_tile, bits);
+        }
+      }
+      continue;
+    }
+
+    const int base = static_cast<int>(tile_bases[tile_idx]);
+    if (lane == 0) {
+      if (fallback_tile_ids != nullptr) {
+        fallback_tile_ids[block_id * total_tiles + tile_idx] = -1;
+      }
+      page[tile_start] = static_cast<uint8_t>(base);
+      page[tile_start + 1] = 0;
+    }
+
+    for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+      const int row =
+          is_value ? elem / kByteV2TileSize : elem % kByteV2TileSize;
+      const int dim_in_tile =
+          is_value ? elem % kByteV2TileSize : elem / kByteV2TileSize;
+      const uint16_t bits = byte_v2_load_raw_bits_from_block(
+          raw_block, is_value, row, kv_head, d0 + dim_in_tile, num_kv_heads,
+          head_size, head_size_v);
+      const int exp = (bits >> 7) & 0xff;
+      const int stored_exp =
+          lossy_max_misses_per_tile > 0
+              ? byte_v2_clamp_exp_to_window(exp, base)
+              : exp;
+      page[tile_start + 2 + elem] =
+          static_cast<uint8_t>((bits & 0x7f) | ((stored_exp & 1) << 7));
+    }
+    for (int packed_idx = lane; packed_idx < kByteV2PackedTileElems;
+         packed_idx += 32) {
+      uint8_t packed = 0;
+      for (int packed_lane = 0; packed_lane < 2; ++packed_lane) {
+        const int elem = packed_idx * 2 + packed_lane;
+        const int row =
+            is_value ? elem / kByteV2TileSize : elem % kByteV2TileSize;
+        const int dim_in_tile =
+            is_value ? elem % kByteV2TileSize : elem / kByteV2TileSize;
+        const uint16_t bits = byte_v2_load_raw_bits_from_block(
+            raw_block, is_value, row, kv_head, d0 + dim_in_tile, num_kv_heads,
+            head_size, head_size_v);
+        const int exp = (bits >> 7) & 0xff;
+        const int stored_exp =
+            lossy_max_misses_per_tile > 0
+                ? byte_v2_clamp_exp_to_window(exp, base)
+                : exp;
+        const int delta = stored_exp - base;
+        const int sign = (bits >> 15) & 1;
+        const int delta_hi = delta >> 1;
+        const uint8_t code =
+            static_cast<uint8_t>((sign << 3) | (delta_hi & 0x07));
+        packed |= static_cast<uint8_t>(code << (packed_lane * 4));
+      }
+      page[tile_start + 2 + kByteV2TileElems + packed_idx] = packed;
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    page[kByteV2PageStatusOffset] = kByteV2PageStatusCompressed;
+    page[kByteV2PageValidRowsOffset] = kByteV2TileSize;
+    if (fallback_block_ids != nullptr) {
+      fallback_block_ids[block_id] = -1;
+    }
+  }
+  return true;
+}
+
+__global__ void byte_v2_init_cache_update_kernel(
+    const uint8_t* __restrict__ kv_cache, int32_t* __restrict__ valid_rows,
+    uint8_t* __restrict__ touched_flags, uint8_t* __restrict__ packed_flags,
+    int32_t* __restrict__ error, const int num_blocks,
+    const int page_size_bytes) {
+  const int block_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (block_id >= num_blocks) {
+    return;
+  }
+  const uint8_t* page = kv_cache + block_id * page_size_bytes;
+  const uint8_t status = page[kByteV2PageStatusOffset];
+  const uint8_t page_valid_rows = page[kByteV2PageValidRowsOffset];
+  if (status == kByteV2PageStatusEmpty) {
+    valid_rows[block_id] = 0;
+  } else if (status == kByteV2PageStatusRawFallback) {
+    valid_rows[block_id] = static_cast<int32_t>(page_valid_rows);
+  } else if (status == kByteV2PageStatusCompressed) {
+    if (page_valid_rows == 0 || page_valid_rows > kByteV2TileSize) {
+      valid_rows[block_id] = 0;
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorInvalidValidRows);
+    } else {
+      valid_rows[block_id] = static_cast<int32_t>(page_valid_rows);
+    }
+  } else {
+    valid_rows[block_id] = 0;
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorInvalidPageState);
+  }
+  touched_flags[block_id] = 0;
+  packed_flags[block_id] = 0;
+}
+
+__global__ void byte_v2_write_raw_tokens_kernel(
+    const uint8_t* __restrict__ key, const uint8_t* __restrict__ value,
+    uint8_t* __restrict__ kv_cache, const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ valid_rows, uint8_t* __restrict__ touched_flags,
+    int32_t* __restrict__ error, const int num_tokens, const int num_blocks,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int page_size_bytes, const int64_t key_stride0,
+    const int64_t key_stride1, const int64_t key_stride2,
+    const int64_t value_stride0, const int64_t value_stride1,
+    const int64_t value_stride2) {
+  const int token_idx = blockIdx.x;
+  if (token_idx >= num_tokens) {
+    return;
+  }
+  const int64_t slot = slot_mapping[token_idx];
+  if (slot < 0) {
+    return;
+  }
+  const int block_id = static_cast<int>(slot / kByteV2TileSize);
+  const int block_offset = static_cast<int>(slot % kByteV2TileSize);
+  if (block_id < 0 || block_id >= num_blocks) {
+    if (threadIdx.x == 0) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorInvalidSlot);
+    }
+    return;
+  }
+
+  uint8_t* page = kv_cache + block_id * page_size_bytes;
+  __shared__ int skip_block;
+  if (threadIdx.x == 0) {
+    skip_block = 0;
+    const uint8_t status = page[kByteV2PageStatusOffset];
+    if (status == kByteV2PageStatusCompressed) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFinalizedBlockUpdate);
+      skip_block = 1;
+    } else {
+      page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+      touched_flags[block_id] = 1;
+      atomicMax(valid_rows + block_id, block_offset + 1);
+    }
+  }
+  __syncthreads();
+  if (skip_block) {
+    return;
+  }
+
+  const int key_elems = num_kv_heads * head_size;
+  const int value_elems = num_kv_heads * head_size_v;
+  const int raw_key_bytes = byte_v2_raw_key_bytes(num_kv_heads, head_size);
+  for (int elem = threadIdx.x; elem < key_elems; elem += blockDim.x) {
+    const int kv_head = elem / head_size;
+    const int dim = elem % head_size;
+    const int raw_elem =
+        ((block_offset * num_kv_heads + kv_head) * head_size + dim) * 2;
+    const int64_t src_elem =
+        (token_idx * key_stride0 + kv_head * key_stride1 + dim * key_stride2) *
+        2;
+    page[kByteV2PageHeaderBytes + raw_elem] = key[src_elem];
+    page[kByteV2PageHeaderBytes + raw_elem + 1] = key[src_elem + 1];
+  }
+  for (int elem = threadIdx.x; elem < value_elems; elem += blockDim.x) {
+    const int kv_head = elem / head_size_v;
+    const int dim = elem % head_size_v;
+    const int raw_elem =
+        raw_key_bytes +
+        ((block_offset * num_kv_heads + kv_head) * head_size_v + dim) * 2;
+    const int64_t src_elem = (token_idx * value_stride0 +
+                              kv_head * value_stride1 + dim * value_stride2) *
+                             2;
+    page[kByteV2PageHeaderBytes + raw_elem] = value[src_elem];
+    page[kByteV2PageHeaderBytes + raw_elem + 1] = value[src_elem + 1];
+  }
+}
+
+__global__ void byte_v2_finalize_partial_pages_kernel(
+    uint8_t* __restrict__ kv_cache, const int32_t* __restrict__ valid_rows,
+    const uint8_t* __restrict__ touched_flags, const int num_blocks,
+    const int page_size_bytes) {
+  const int block_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (block_id >= num_blocks || touched_flags[block_id] == 0) {
+    return;
+  }
+  const int valid = valid_rows[block_id];
+  if (valid > 0 && valid < kByteV2TileSize) {
+    uint8_t* page = kv_cache + block_id * page_size_bytes;
+    page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+    page[kByteV2PageValidRowsOffset] = static_cast<uint8_t>(valid);
+  }
+}
+
+__global__ void byte_v2_compress_full_pages_kernel(
+    uint8_t* __restrict__ kv_cache, const int64_t* __restrict__ slot_mapping,
+    const int32_t* __restrict__ valid_rows,
+    const uint8_t* __restrict__ touched_flags, uint8_t* __restrict__ packed_flags,
+    uint8_t* __restrict__ raw_staging, const int num_tokens,
+    const int num_blocks, const int num_kv_heads, const int head_size,
+    const int head_size_v, const int page_size_bytes,
+    const int raw_block_bytes, const int lossy_max_misses_per_tile) {
+  const int token_idx = blockIdx.x;
+  if (token_idx >= num_tokens) {
+    return;
+  }
+  const int64_t slot = slot_mapping[token_idx];
+  if (slot < 0 || (slot % kByteV2TileSize) != (kByteV2TileSize - 1)) {
+    return;
+  }
+  const int block_id = static_cast<int>(slot / kByteV2TileSize);
+  if (block_id < 0 || block_id >= num_blocks || touched_flags[block_id] == 0 ||
+      valid_rows[block_id] != kByteV2TileSize) {
+    return;
+  }
+
+  uint8_t* page = kv_cache + block_id * page_size_bytes;
+  uint8_t* raw_block = raw_staging + token_idx * raw_block_bytes;
+  for (int byte_idx = threadIdx.x; byte_idx < raw_block_bytes;
+       byte_idx += blockDim.x) {
+    raw_block[byte_idx] = page[kByteV2PageHeaderBytes + byte_idx];
+  }
+  __syncthreads();
+
+  if (threadIdx.x != 0) {
+    return;
+  }
+  if (!byte_v2_raw_block_is_compressible(raw_block, num_kv_heads, head_size,
+                                         head_size_v, kByteV2TileSize,
+                                         lossy_max_misses_per_tile)) {
+    page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+    page[kByteV2PageValidRowsOffset] = kByteV2TileSize;
+    return;
+  }
+
+  byte_v2_store_compressed_block(raw_block, page, num_kv_heads, head_size,
+                                 head_size_v, kByteV2TileSize,
+                                 lossy_max_misses_per_tile);
+  page[kByteV2PageStatusOffset] = kByteV2PageStatusCompressed;
+  page[kByteV2PageValidRowsOffset] = kByteV2TileSize;
+  packed_flags[block_id] = 1;
+}
+
+__global__ void byte_v2_mark_touched_tokens_kernel(
+    const uint8_t* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ valid_rows, uint8_t* __restrict__ touched_flags,
+    uint8_t* __restrict__ overwrite_flags,
+    int32_t* __restrict__ block_token_indices, int32_t* __restrict__ error,
+    const int num_tokens, const int num_blocks, const int page_size_bytes) {
+  const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (token_idx >= num_tokens) {
+    return;
+  }
+  const int64_t slot = slot_mapping[token_idx];
+  if (slot < 0) {
+    return;
+  }
+  const int block_id = static_cast<int>(slot / kByteV2TileSize);
+  const int block_offset = static_cast<int>(slot % kByteV2TileSize);
+  if (block_id < 0 || block_id >= num_blocks) {
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorInvalidSlot);
+    return;
+  }
+  const uint8_t* page = kv_cache + block_id * page_size_bytes;
+  const uint8_t status = page[kByteV2PageStatusOffset];
+  if (status != kByteV2PageStatusEmpty &&
+      status != kByteV2PageStatusCompressed &&
+      status != kByteV2PageStatusRawFallback) {
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorInvalidPageState);
+    return;
+  }
+  touched_flags[block_id] = 1;
+  if (block_offset == 0) {
+    overwrite_flags[block_id] = 1;
+  }
+  atomicMax(valid_rows + block_id, block_offset + 1);
+  int32_t* token_slot =
+      block_token_indices + block_id * kByteV2TileSize + block_offset;
+  const int32_t old = atomicCAS(token_slot, -1, token_idx);
+  if (old != -1) {
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorDuplicateSlot);
+  }
+}
+
+__device__ void byte_v2_decompress_page_to_raw_block(
+    const uint8_t* __restrict__ page, uint8_t* __restrict__ raw_block,
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_tile_ids, const int physical_block,
+    const int valid_rows, const int num_kv_heads, const int head_size,
+    const int head_size_v) {
+  const int key_elems = kByteV2TileSize * num_kv_heads * head_size;
+  const int value_elems = kByteV2TileSize * num_kv_heads * head_size_v;
+  const int total_tiles =
+      byte_v2_total_tiles(num_kv_heads, head_size, head_size_v);
+  for (int elem = threadIdx.x; elem < key_elems; elem += blockDim.x) {
+    const int row = elem / (num_kv_heads * head_size);
+    const int rem = elem % (num_kv_heads * head_size);
+    const int kv_head = rem / head_size;
+    const int dim = rem % head_size;
+    const uint16_t bits =
+        row < valid_rows ? byte_v2_load_compressed_bits(
+                               page, false, row, kv_head, dim,
+                               head_size / kByteV2TileSize,
+                               head_size_v / kByteV2TileSize, fallback_pool,
+                               fallback_tile_ids, physical_block, total_tiles)
+                         : 0;
+    byte_v2_store_raw_bits_to_block(raw_block, false, row, kv_head, dim,
+                                    num_kv_heads, head_size, head_size_v, bits);
+  }
+  for (int elem = threadIdx.x; elem < value_elems; elem += blockDim.x) {
+    const int row = elem / (num_kv_heads * head_size_v);
+    const int rem = elem % (num_kv_heads * head_size_v);
+    const int kv_head = rem / head_size_v;
+    const int dim = rem % head_size_v;
+    const uint16_t bits =
+        row < valid_rows ? byte_v2_load_compressed_bits(
+                               page, true, row, kv_head, dim,
+                               head_size / kByteV2TileSize,
+                               head_size_v / kByteV2TileSize, fallback_pool,
+                               fallback_tile_ids, physical_block, total_tiles)
+                         : 0;
+    byte_v2_store_raw_bits_to_block(raw_block, true, row, kv_head, dim,
+                                    num_kv_heads, head_size, head_size_v, bits);
+  }
+}
+
+__device__ void byte_v2_decompress_page_to_raw_block(
+    const uint8_t* __restrict__ page, uint8_t* __restrict__ raw_block,
+    const int valid_rows, const int num_kv_heads, const int head_size,
+    const int head_size_v) {
+  byte_v2_decompress_page_to_raw_block(
+      page, raw_block, nullptr, nullptr, 0, valid_rows, num_kv_heads,
+      head_size, head_size_v);
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_prefill_direct_bits(
+    const uint8_t* __restrict__ key, const uint8_t* __restrict__ value,
+    const bool is_value, const int token_idx, const int kv_head, const int dim,
+    const int64_t key_stride0, const int64_t key_stride1,
+    const int64_t key_stride2, const int64_t value_stride0,
+    const int64_t value_stride1, const int64_t value_stride2);
+
+__global__ void byte_v2_decode_append_cache_kernel(
+    const uint8_t* __restrict__ key, const uint8_t* __restrict__ value,
+    uint8_t* __restrict__ kv_cache, const int64_t* __restrict__ slot_mapping,
+    uint8_t* __restrict__ fallback_pool,
+    int32_t* __restrict__ fallback_block_ids,
+    int32_t* __restrict__ fallback_next_slot,
+    int32_t* __restrict__ fallback_tile_ids,
+    int32_t* __restrict__ fallback_tile_next_slot,
+    int32_t* __restrict__ result,
+    const int num_tokens, const int num_blocks, const int num_kv_heads,
+    const int head_size, const int head_size_v, const int page_size_bytes,
+    const int raw_block_bytes, const int fallback_pool_blocks,
+    const int lossy_max_misses_per_tile,
+    const int64_t key_stride0, const int64_t key_stride1,
+    const int64_t key_stride2, const int64_t value_stride0,
+    const int64_t value_stride1, const int64_t value_stride2) {
+  const int token_idx = blockIdx.x;
+  if (token_idx >= num_tokens) {
+    return;
+  }
+  const int tid = threadIdx.x;
+
+  __shared__ int block_id;
+  __shared__ int block_offset;
+  __shared__ int fallback_slot;
+  __shared__ int existing_valid_rows;
+  __shared__ int page_status;
+  __shared__ int skip;
+  __shared__ int zero_raw_block;
+  __shared__ int decompress_existing;
+  __shared__ uint8_t tile_bases[kByteV2MaxTilesPerBlock];
+  __shared__ uint8_t tile_needs_fallback[kByteV2MaxTilesPerBlock];
+  __shared__ int tile_slots[kByteV2MaxTilesPerBlock];
+  __shared__ int tile_hist[kByteV2MaxPrefillDirectWarps][256];
+  __shared__ int block_compressible;
+
+  if (num_tokens == 1 && tid == 0) {
+    result[0] = 0;
+    result[1] = -1;
+    result[2] = -1;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    skip = 0;
+    zero_raw_block = 0;
+    decompress_existing = 0;
+    fallback_slot = -1;
+
+    const int64_t slot = slot_mapping[token_idx];
+    if (slot < 0) {
+      skip = 1;
+    } else {
+      block_id = static_cast<int>(slot / kByteV2TileSize);
+      block_offset = static_cast<int>(slot % kByteV2TileSize);
+      if (block_id < 0 || block_id >= num_blocks) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorInvalidSlot, token_idx);
+        skip = 1;
+      } else {
+        for (int other = 0; other < num_tokens; ++other) {
+          if (other == token_idx) {
+            continue;
+          }
+          const int64_t other_slot = slot_mapping[other];
+          if (other_slot < 0) {
+            continue;
+          }
+          const int other_block =
+              static_cast<int>(other_slot / kByteV2TileSize);
+          if (other_block == block_id) {
+            byte_v2_record_cache_update_error_detail(
+                result, kByteV2CacheUpdateErrorDuplicateSlot, block_id);
+            skip = 1;
+            break;
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+  if (skip) {
+    return;
+  }
+
+  uint8_t* page = kv_cache + block_id * page_size_bytes;
+  if (tid == 0) {
+    page_status = static_cast<int>(page[kByteV2PageStatusOffset]);
+    existing_valid_rows =
+        static_cast<int>(page[kByteV2PageValidRowsOffset]);
+    const bool overwrite_block = block_offset == 0;
+
+    if (page_status == kByteV2PageStatusEmpty) {
+      existing_valid_rows = 0;
+      if (!overwrite_block) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorInvalidValidRows, block_id);
+        skip = 1;
+      } else {
+        zero_raw_block = 1;
+      }
+    } else if (page_status == kByteV2PageStatusCompressed ||
+               page_status == kByteV2PageStatusRawFallback) {
+      if (existing_valid_rows <= 0 ||
+          existing_valid_rows > kByteV2TileSize) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorInvalidValidRows, block_id);
+        skip = 1;
+      } else if (!overwrite_block &&
+                 existing_valid_rows == kByteV2TileSize) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorFinalizedBlockUpdate, block_id);
+        skip = 1;
+      } else if (!overwrite_block &&
+                 existing_valid_rows != block_offset) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorInvalidValidRows, block_id);
+        skip = 1;
+      } else if (overwrite_block) {
+        zero_raw_block = 1;
+      } else if (page_status == kByteV2PageStatusCompressed) {
+        decompress_existing = 1;
+      }
+    } else {
+      byte_v2_record_cache_update_error_detail(
+          result, kByteV2CacheUpdateErrorInvalidPageState, block_id);
+      skip = 1;
+    }
+
+    if (!skip) {
+      if (fallback_block_ids == nullptr || fallback_next_slot == nullptr) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorFallbackPoolMissing, block_id);
+        skip = 1;
+      } else if (fallback_pool_blocks <= 0) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorFallbackPoolExhausted, block_id);
+        skip = 1;
+      } else if (fallback_pool == nullptr) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorFallbackPoolMissing, block_id);
+        skip = 1;
+      }
+    }
+
+    if (!skip) {
+      fallback_slot = fallback_block_ids[block_id];
+      if (page_status != kByteV2PageStatusRawFallback || overwrite_block) {
+        fallback_slot = -1;
+      }
+      if (fallback_slot < 0) {
+        fallback_slot = atomicAdd(fallback_next_slot, 1);
+        if (fallback_slot >= fallback_pool_blocks) {
+          fallback_block_ids[block_id] = -1;
+          byte_v2_record_cache_update_error_detail(
+              result, kByteV2CacheUpdateErrorFallbackPoolExhausted, block_id);
+          skip = 1;
+        } else {
+          fallback_block_ids[block_id] = fallback_slot;
+        }
+      } else if (fallback_slot >= fallback_pool_blocks) {
+        byte_v2_record_cache_update_error_detail(
+            result, kByteV2CacheUpdateErrorFallbackPoolInvalidSlot, block_id);
+        skip = 1;
+      }
+    }
+  }
+  __syncthreads();
+  if (skip) {
+    return;
+  }
+
+  uint8_t* raw_block = fallback_pool + fallback_slot * raw_block_bytes;
+  if (zero_raw_block) {
+    for (int byte_idx = tid; byte_idx < raw_block_bytes;
+         byte_idx += blockDim.x) {
+      raw_block[byte_idx] = 0;
+    }
+  }
+  __syncthreads();
+
+  if (decompress_existing) {
+    byte_v2_decompress_page_to_raw_block(
+        page, raw_block, fallback_pool, fallback_tile_ids, block_id,
+        existing_valid_rows, num_kv_heads, head_size, head_size_v);
+  }
+  __syncthreads();
+
+  const int key_elems = num_kv_heads * head_size;
+  const int value_elems = num_kv_heads * head_size_v;
+  for (int elem = tid; elem < key_elems; elem += blockDim.x) {
+    const int kv_head = elem / head_size;
+    const int dim = elem % head_size;
+    const uint16_t bits = byte_v2_load_prefill_direct_bits(
+        key, value, false, token_idx, kv_head, dim, key_stride0, key_stride1,
+        key_stride2, value_stride0, value_stride1, value_stride2);
+    byte_v2_store_raw_bits_to_block(raw_block, false, block_offset, kv_head,
+                                    dim, num_kv_heads, head_size, head_size_v,
+                                    bits);
+  }
+  for (int elem = tid; elem < value_elems; elem += blockDim.x) {
+    const int kv_head = elem / head_size_v;
+    const int dim = elem % head_size_v;
+    const uint16_t bits = byte_v2_load_prefill_direct_bits(
+        key, value, true, token_idx, kv_head, dim, key_stride0, key_stride1,
+        key_stride2, value_stride0, value_stride1, value_stride2);
+    byte_v2_store_raw_bits_to_block(raw_block, true, block_offset, kv_head,
+                                    dim, num_kv_heads, head_size, head_size_v,
+                                    bits);
+  }
+  __syncthreads();
+
+  const int valid_rows = block_offset + 1;
+  if (valid_rows < kByteV2TileSize) {
+    if (tid == 0) {
+      page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+      page[kByteV2PageValidRowsOffset] = static_cast<uint8_t>(valid_rows);
+    }
+    return;
+  }
+
+  if (byte_v2_finalize_raw_block_parallel(
+          raw_block, page, fallback_pool, fallback_block_ids,
+          fallback_tile_ids, fallback_tile_next_slot, result, block_id,
+          num_kv_heads, head_size, head_size_v, raw_block_bytes,
+          fallback_pool_blocks, lossy_max_misses_per_tile, tile_bases,
+          tile_needs_fallback, tile_slots, &tile_hist[0][0],
+          &block_compressible)) {
+    if (tid == 0) {
+      result[2 + token_idx] = block_id;
+    }
+  } else if (tid == 0 && result[0] != 0) {
+    atomicCAS(reinterpret_cast<int*>(result + 1), -1, block_id);
+  }
+}
+
+__global__ void byte_v2_init_decode_append_result_kernel(
+    int32_t* __restrict__ result, const int num_tokens) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx == 0) {
+    result[0] = 0;
+  }
+  if (idx < num_tokens + 1) {
+    result[idx + 1] = -1;
+  }
+}
+
+__global__ void byte_v2_record_deferred_cache_update_error_kernel(
+    const int32_t* __restrict__ result,
+    const int32_t* __restrict__ fallback_next_slot,
+    int32_t* __restrict__ deferred_error,
+    const int fallback_pool_blocks) {
+  const int code = result[0];
+  if (code == 0) {
+    return;
+  }
+  const int old =
+      atomicCAS(reinterpret_cast<int*>(deferred_error), 0, code);
+  if (old == 0) {
+    deferred_error[1] = result[1];
+    deferred_error[2] =
+        fallback_next_slot == nullptr ? -1 : fallback_next_slot[0];
+    deferred_error[3] = fallback_pool_blocks;
+  }
+}
+
+__global__ void byte_v2_validate_prefill_direct_blocks_kernel(
+    const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ group_block_ids, int32_t* __restrict__ block_claims,
+    int32_t* __restrict__ error, const int num_groups, const int num_blocks) {
+  const int group_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (group_idx >= num_groups) {
+    return;
+  }
+
+  const int token_base = group_idx * kByteV2TileSize;
+  const int64_t first_slot = slot_mapping[token_base];
+  if (first_slot < 0 || (first_slot % kByteV2TileSize) != 0) {
+    group_block_ids[group_idx] = -1;
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorInvalidSlot);
+    return;
+  }
+  const int block_id = static_cast<int>(first_slot / kByteV2TileSize);
+  if (block_id < 0 || block_id >= num_blocks) {
+    group_block_ids[group_idx] = -1;
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorInvalidSlot);
+    return;
+  }
+
+  for (int row = 1; row < kByteV2TileSize; ++row) {
+    const int64_t slot = slot_mapping[token_base + row];
+    if (slot < 0 ||
+        static_cast<int>(slot / kByteV2TileSize) != block_id ||
+        static_cast<int>(slot % kByteV2TileSize) != row) {
+      group_block_ids[group_idx] = -1;
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorInvalidSlot);
+      return;
+    }
+  }
+  const int32_t old_claim = atomicCAS(block_claims + block_id, -1, group_idx);
+  if (old_claim != -1) {
+    group_block_ids[group_idx] = -1;
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorDuplicateSlot);
+    return;
+  }
+  group_block_ids[group_idx] = block_id;
+}
+
+__device__ __forceinline__ uint16_t byte_v2_load_prefill_direct_bits(
+    const uint8_t* __restrict__ key, const uint8_t* __restrict__ value,
+    const bool is_value, const int token_idx, const int kv_head, const int dim,
+    const int64_t key_stride0, const int64_t key_stride1,
+    const int64_t key_stride2, const int64_t value_stride0,
+    const int64_t value_stride1, const int64_t value_stride2) {
+  const uint8_t* src = is_value ? value : key;
+  const int64_t stride0 = is_value ? value_stride0 : key_stride0;
+  const int64_t stride1 = is_value ? value_stride1 : key_stride1;
+  const int64_t stride2 = is_value ? value_stride2 : key_stride2;
+  const int64_t src_elem =
+      (token_idx * stride0 + kv_head * stride1 + dim * stride2) * 2;
+  return byte_v2_load_u16(src + src_elem);
+}
+
+__global__ void byte_v2_prefill_direct_encode_blocks_kernel(
+    const uint8_t* __restrict__ key, const uint8_t* __restrict__ value,
+    uint8_t* __restrict__ kv_cache,
+    const int32_t* __restrict__ group_block_ids,
+    uint8_t* __restrict__ fallback_pool, int32_t* __restrict__ fallback_block_ids,
+    int32_t* __restrict__ fallback_next_slot,
+    int32_t* __restrict__ fallback_tile_ids,
+    int32_t* __restrict__ fallback_tile_next_slot,
+    int32_t* __restrict__ result,
+    const int num_groups, const int num_blocks, const int num_kv_heads,
+    const int head_size, const int head_size_v, const int page_size_bytes,
+    const int raw_block_bytes, const int fallback_pool_blocks,
+    const int lossy_max_misses_per_tile,
+    const int64_t key_stride0, const int64_t key_stride1,
+    const int64_t key_stride2, const int64_t value_stride0,
+    const int64_t value_stride1, const int64_t value_stride2) {
+  const int group_idx = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (group_idx >= num_groups) {
+    return;
+  }
+
+  const int block_id = group_block_ids[group_idx];
+  if (block_id < 0 || block_id >= num_blocks) {
+    if (tid == 0) {
+      result[group_idx + 1] = -1;
+      byte_v2_record_cache_update_error(
+          result, kByteV2CacheUpdateErrorInvalidSlot);
+    }
+    return;
+  }
+
+  uint8_t* page = kv_cache + block_id * page_size_bytes;
+  __shared__ uint8_t tile_bases[kByteV2MaxTilesPerBlock];
+  __shared__ uint8_t tile_needs_fallback[kByteV2MaxTilesPerBlock];
+  __shared__ int tile_slots[kByteV2MaxTilesPerBlock];
+  __shared__ int tile_hist[kByteV2MaxPrefillDirectWarps][256];
+  __shared__ int block_compressible;
+  __shared__ int block_skip;
+  __shared__ int fallback_slot_shared;
+
+  if (tid == 0) {
+    result[group_idx + 1] = -1;
+    block_compressible = 1;
+    block_skip = 0;
+    fallback_slot_shared = -1;
+    const uint8_t previous_status = page[kByteV2PageStatusOffset];
+    if (previous_status != kByteV2PageStatusEmpty &&
+        previous_status != kByteV2PageStatusCompressed &&
+        previous_status != kByteV2PageStatusRawFallback) {
+      byte_v2_record_cache_update_error(
+          result, kByteV2CacheUpdateErrorInvalidPageState);
+      block_skip = 1;
+    }
+  }
+  __syncthreads();
+  if (block_skip) {
+    return;
+  }
+
+  const int k_dim_tiles = head_size / kByteV2TileSize;
+  const int v_dim_tiles = head_size_v / kByteV2TileSize;
+  const int tiles_per_head = k_dim_tiles + v_dim_tiles;
+  const int total_tiles = num_kv_heads * tiles_per_head;
+  if (total_tiles > kByteV2MaxTilesPerBlock) {
+    if (tid == 0) {
+      byte_v2_record_cache_update_error(
+          result, kByteV2CacheUpdateErrorInvalidSlot);
+    }
+    return;
+  }
+
+  const int warp_id = tid / 32;
+  const int lane = tid & 31;
+  const int num_warps = blockDim.x / 32;
+  const int token_base = group_idx * kByteV2TileSize;
+  const bool has_tile_fallback =
+      fallback_pool != nullptr && fallback_tile_ids != nullptr &&
+      fallback_tile_next_slot != nullptr;
+  const int64_t tile_capacity =
+      byte_v2_tile_fallback_capacity(fallback_pool_blocks, raw_block_bytes);
+
+  for (int tile_idx = warp_id; tile_idx < total_tiles; tile_idx += num_warps) {
+    const int kv_head = tile_idx / tiles_per_head;
+    const int tile_in_head = tile_idx % tiles_per_head;
+    const bool is_value = tile_in_head >= k_dim_tiles;
+    const int dim_tile =
+        is_value ? tile_in_head - k_dim_tiles : tile_in_head;
+    const int d0 = dim_tile * kByteV2TileSize;
+
+    if (lossy_max_misses_per_tile > 0) {
+      int* hist = tile_hist[warp_id];
+      for (int exp = lane; exp < 256; exp += 32) {
+        hist[exp] = 0;
+      }
+      __syncwarp();
+	    for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+	      const int row =
+	          is_value ? elem / kByteV2TileSize : elem % kByteV2TileSize;
+	      const int dim_in_tile =
+	          is_value ? elem % kByteV2TileSize : elem / kByteV2TileSize;
+	      const int dim = d0 + dim_in_tile;
+	      const uint16_t bits = byte_v2_load_prefill_direct_bits(
+	          key, value, is_value, token_base + row, kv_head, dim, key_stride0,
+	          key_stride1, key_stride2, value_stride0, value_stride1,
+	          value_stride2);
+        const int exp = (bits >> 7) & 0xff;
+        atomicAdd(hist + exp, 1);
+      }
+      __syncwarp();
+      if (lane == 0) {
+        int covered = 0;
+        const int base = byte_v2_best_window_base_from_hist(hist, &covered);
+        tile_bases[tile_idx] = static_cast<uint8_t>(base);
+        const bool needs_fallback =
+            kByteV2TileElems - covered > lossy_max_misses_per_tile;
+        tile_needs_fallback[tile_idx] = needs_fallback ? 1 : 0;
+        tile_slots[tile_idx] = -1;
+        if (needs_fallback) {
+          atomicExch(&block_compressible, 0);
+        }
+      }
+    } else {
+      int local_min = 255;
+      int local_max = 0;
+      for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+        const int row = elem / kByteV2TileSize;
+        const int dim = d0 + (elem % kByteV2TileSize);
+        const uint16_t bits = byte_v2_load_prefill_direct_bits(
+            key, value, is_value, token_base + row, kv_head, dim, key_stride0,
+            key_stride1, key_stride2, value_stride0, value_stride1,
+            value_stride2);
+        const int exp = (bits >> 7) & 0xff;
+        local_min = min(local_min, exp);
+        local_max = max(local_max, exp);
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        local_min = min(local_min,
+                        __shfl_down_sync(0xffffffff, local_min, offset));
+        local_max = max(local_max,
+                        __shfl_down_sync(0xffffffff, local_max, offset));
+      }
+      if (lane == 0) {
+        tile_bases[tile_idx] = static_cast<uint8_t>(local_min);
+        const bool needs_fallback = local_max - local_min > 15;
+        tile_needs_fallback[tile_idx] = needs_fallback ? 1 : 0;
+        tile_slots[tile_idx] = -1;
+        if (needs_fallback) {
+          atomicExch(&block_compressible, 0);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (!block_compressible && !has_tile_fallback) {
+    if (tid == 0) {
+      if (fallback_block_ids == nullptr || fallback_next_slot == nullptr) {
+        byte_v2_record_cache_update_error(
+            result, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      } else if (fallback_pool_blocks <= 0) {
+        byte_v2_record_cache_update_error(
+            result, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+      } else if (fallback_pool == nullptr) {
+        byte_v2_record_cache_update_error(
+            result, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      } else {
+        int fallback_slot = fallback_block_ids[block_id];
+        if (fallback_slot < 0) {
+          fallback_slot = atomicAdd(fallback_next_slot, 1);
+          if (fallback_slot >= fallback_pool_blocks) {
+            fallback_block_ids[block_id] = -1;
+            byte_v2_record_cache_update_error(
+                result, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+            fallback_slot = -1;
+          } else {
+            fallback_block_ids[block_id] = fallback_slot;
+          }
+        }
+        if (fallback_slot >= fallback_pool_blocks) {
+          byte_v2_record_cache_update_error(
+              result, kByteV2CacheUpdateErrorFallbackPoolInvalidSlot);
+          fallback_slot = -1;
+        }
+        fallback_slot_shared = fallback_slot;
+      }
+    }
+    __syncthreads();
+    if (fallback_slot_shared < 0) {
+      return;
+    }
+
+    uint8_t* fallback_block =
+        fallback_pool + fallback_slot_shared * raw_block_bytes;
+    const int key_elems = kByteV2TileSize * num_kv_heads * head_size;
+    const int value_elems = kByteV2TileSize * num_kv_heads * head_size_v;
+    for (int elem = tid; elem < key_elems; elem += blockDim.x) {
+      const int row = elem / (num_kv_heads * head_size);
+      const int rem = elem % (num_kv_heads * head_size);
+      const int kv_head = rem / head_size;
+      const int dim = rem % head_size;
+      const uint16_t bits = byte_v2_load_prefill_direct_bits(
+          key, value, false, token_base + row, kv_head, dim, key_stride0,
+          key_stride1, key_stride2, value_stride0, value_stride1,
+          value_stride2);
+      byte_v2_store_raw_bits_to_block(fallback_block, false, row, kv_head, dim,
+                                      num_kv_heads, head_size, head_size_v,
+                                      bits);
+    }
+    for (int elem = tid; elem < value_elems; elem += blockDim.x) {
+      const int row = elem / (num_kv_heads * head_size_v);
+      const int rem = elem % (num_kv_heads * head_size_v);
+      const int kv_head = rem / head_size_v;
+      const int dim = rem % head_size_v;
+      const uint16_t bits = byte_v2_load_prefill_direct_bits(
+          key, value, true, token_base + row, kv_head, dim, key_stride0,
+          key_stride1, key_stride2, value_stride0, value_stride1,
+          value_stride2);
+      byte_v2_store_raw_bits_to_block(fallback_block, true, row, kv_head, dim,
+                                      num_kv_heads, head_size, head_size_v,
+                                      bits);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+      page[kByteV2PageValidRowsOffset] = kByteV2TileSize;
+    }
+    return;
+  }
+
+  for (int tile_idx = warp_id; tile_idx < total_tiles; tile_idx += num_warps) {
+    const int kv_head = tile_idx / tiles_per_head;
+    const int tile_in_head = tile_idx % tiles_per_head;
+    const bool is_value = tile_in_head >= k_dim_tiles;
+    const int dim_tile =
+        is_value ? tile_in_head - k_dim_tiles : tile_in_head;
+    const int d0 = dim_tile * kByteV2TileSize;
+    const int tile_start =
+        byte_v2_tile_start(is_value, kv_head, dim_tile, k_dim_tiles,
+                           v_dim_tiles);
+    if (tile_needs_fallback[tile_idx] != 0) {
+      if (lane == 0) {
+        if (tile_capacity <= 0) {
+          byte_v2_record_cache_update_error(
+              result, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+        } else {
+          const int tile_slot = byte_v2_allocate_tile_fallback_slot(
+              fallback_tile_next_slot, tile_capacity);
+          if (tile_slot < 0) {
+            byte_v2_record_cache_update_error(
+                result, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+          } else {
+            tile_slots[tile_idx] = tile_slot;
+            fallback_tile_ids[block_id * total_tiles + tile_idx] = tile_slot;
+            page[tile_start] = 0;
+            page[tile_start + 1] = 1;
+          }
+        }
+      }
+      __syncwarp();
+      const int tile_slot = tile_slots[tile_idx];
+      if (tile_slot >= 0) {
+        for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+          const int row = elem / kByteV2TileSize;
+          const int dim_in_tile = elem % kByteV2TileSize;
+          const uint16_t bits = byte_v2_load_prefill_direct_bits(
+              key, value, is_value, token_base + row, kv_head,
+              d0 + dim_in_tile, key_stride0, key_stride1, key_stride2,
+              value_stride0, value_stride1, value_stride2);
+          byte_v2_store_raw_bits_to_tile_pool(fallback_pool, tile_slot, row,
+                                              dim_in_tile, bits);
+        }
+      }
+      continue;
+    }
+    const int base = static_cast<int>(tile_bases[tile_idx]);
+    if (lane == 0) {
+      if (fallback_tile_ids != nullptr) {
+        fallback_tile_ids[block_id * total_tiles + tile_idx] = -1;
+      }
+      page[tile_start] = static_cast<uint8_t>(base);
+      page[tile_start + 1] = 0;
+    }
+
+	    for (int elem = lane; elem < kByteV2TileElems; elem += 32) {
+	      const int row =
+	          is_value ? elem / kByteV2TileSize : elem % kByteV2TileSize;
+	      const int dim_in_tile =
+	          is_value ? elem % kByteV2TileSize : elem / kByteV2TileSize;
+	      const int dim = d0 + dim_in_tile;
+	      const uint16_t bits = byte_v2_load_prefill_direct_bits(
+	          key, value, is_value, token_base + row, kv_head, dim, key_stride0,
+	          key_stride1, key_stride2, value_stride0, value_stride1,
+	          value_stride2);
+	      const int exp = (bits >> 7) & 0xff;
+	      const int stored_exp =
+	          lossy_max_misses_per_tile > 0
+	              ? byte_v2_clamp_exp_to_window(exp, base)
+	              : exp;
+	      page[tile_start + 2 + elem] =
+	          static_cast<uint8_t>((bits & 0x7f) | ((stored_exp & 1) << 7));
+	    }
+	    for (int packed_idx = lane; packed_idx < kByteV2PackedTileElems;
+	         packed_idx += 32) {
+	      uint8_t packed = 0;
+	      for (int packed_lane = 0; packed_lane < 2; ++packed_lane) {
+	        const int elem = packed_idx * 2 + packed_lane;
+	        const int row =
+	            is_value ? elem / kByteV2TileSize : elem % kByteV2TileSize;
+	        const int dim_in_tile =
+	            is_value ? elem % kByteV2TileSize : elem / kByteV2TileSize;
+	        const int dim = d0 + dim_in_tile;
+	        const uint16_t bits = byte_v2_load_prefill_direct_bits(
+	            key, value, is_value, token_base + row, kv_head, dim,
+	            key_stride0, key_stride1, key_stride2, value_stride0,
+	            value_stride1, value_stride2);
+        const int exp = (bits >> 7) & 0xff;
+        const int stored_exp =
+            lossy_max_misses_per_tile > 0
+                ? byte_v2_clamp_exp_to_window(exp, base)
+                : exp;
+        const int delta = stored_exp - base;
+        const int sign = (bits >> 15) & 1;
+        const int delta_hi = delta >> 1;
+        const uint8_t code =
+            static_cast<uint8_t>((sign << 3) | (delta_hi & 0x07));
+        packed |= static_cast<uint8_t>(code << (packed_lane * 4));
+      }
+      page[tile_start + 2 + kByteV2TileElems + packed_idx] = packed;
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    page[kByteV2PageStatusOffset] = kByteV2PageStatusCompressed;
+    page[kByteV2PageValidRowsOffset] = kByteV2TileSize;
+    if (fallback_block_ids != nullptr) {
+      fallback_block_ids[block_id] = -1;
+    }
+    result[group_idx + 1] = block_id;
+  }
+}
+
+__global__ void byte_v2_compress_touched_pages_kernel(
+    const uint8_t* __restrict__ key, const uint8_t* __restrict__ value,
+    uint8_t* __restrict__ kv_cache, const int64_t* __restrict__ slot_mapping,
+    const int32_t* __restrict__ valid_rows,
+    const uint8_t* __restrict__ touched_flags, uint8_t* __restrict__ packed_flags,
+    uint8_t* __restrict__ raw_staging, uint8_t* __restrict__ fallback_pool,
+    int32_t* __restrict__ fallback_block_ids,
+    int32_t* __restrict__ fallback_next_slot, int32_t* __restrict__ error,
+    const int num_tokens, const int num_blocks, const int num_kv_heads,
+    const int head_size, const int head_size_v, const int page_size_bytes,
+    const int raw_block_bytes, const int fallback_pool_blocks,
+    const int lossy_max_misses_per_tile,
+    const int64_t key_stride0, const int64_t key_stride1, const int64_t key_stride2,
+    const int64_t value_stride0, const int64_t value_stride1,
+    const int64_t value_stride2) {
+  const int token_idx = blockIdx.x;
+  if (token_idx >= num_tokens) {
+    return;
+  }
+  const int64_t slot = slot_mapping[token_idx];
+  if (slot < 0) {
+    return;
+  }
+  const int block_id = static_cast<int>(slot / kByteV2TileSize);
+  if (block_id < 0 || block_id >= num_blocks || touched_flags[block_id] == 0) {
+    return;
+  }
+  for (int prev = 0; prev < token_idx; ++prev) {
+    const int64_t prev_slot = slot_mapping[prev];
+    if (prev_slot >= 0 &&
+        static_cast<int>(prev_slot / kByteV2TileSize) == block_id) {
+      return;
+    }
+  }
+
+  uint8_t* page = kv_cache + block_id * page_size_bytes;
+  uint8_t* raw_block = raw_staging + token_idx * raw_block_bytes;
+  for (int byte_idx = threadIdx.x; byte_idx < raw_block_bytes;
+       byte_idx += blockDim.x) {
+    raw_block[byte_idx] = 0;
+  }
+  __syncthreads();
+
+  const uint8_t status = page[kByteV2PageStatusOffset];
+  const int existing_valid_rows =
+      static_cast<int>(page[kByteV2PageValidRowsOffset]);
+  if (status == kByteV2PageStatusCompressed) {
+    if (existing_valid_rows <= 0 || existing_valid_rows > kByteV2TileSize) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorInvalidValidRows);
+      }
+      return;
+    }
+    if (existing_valid_rows == kByteV2TileSize) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFinalizedBlockUpdate);
+      }
+      return;
+    }
+    byte_v2_decompress_page_to_raw_block(page, raw_block, existing_valid_rows,
+                                         num_kv_heads, head_size, head_size_v);
+  } else if (status == kByteV2PageStatusRawFallback) {
+    if (existing_valid_rows <= 0 || existing_valid_rows > kByteV2TileSize) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorInvalidValidRows);
+      }
+      return;
+    }
+    if (existing_valid_rows == kByteV2TileSize) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFinalizedBlockUpdate);
+      }
+      return;
+    }
+    if (fallback_pool == nullptr || fallback_block_ids == nullptr) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      }
+      return;
+    }
+    const int fallback_slot = fallback_block_ids[block_id];
+    if (fallback_slot < 0 || fallback_slot >= fallback_pool_blocks) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFallbackPoolInvalidSlot);
+      }
+      return;
+    }
+    const uint8_t* fallback_block =
+        fallback_pool + fallback_slot * raw_block_bytes;
+    for (int byte_idx = threadIdx.x; byte_idx < raw_block_bytes;
+         byte_idx += blockDim.x) {
+      raw_block[byte_idx] = fallback_block[byte_idx];
+    }
+  } else if (status != kByteV2PageStatusEmpty) {
+    if (threadIdx.x == 0) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorInvalidPageState);
+    }
+    return;
+  }
+  __syncthreads();
+
+  const int key_elems = num_kv_heads * head_size;
+  const int value_elems = num_kv_heads * head_size_v;
+  for (int src_idx = 0; src_idx < num_tokens; ++src_idx) {
+    const int64_t src_slot = slot_mapping[src_idx];
+    if (src_slot < 0 ||
+        static_cast<int>(src_slot / kByteV2TileSize) != block_id) {
+      continue;
+    }
+    const int block_offset = static_cast<int>(src_slot % kByteV2TileSize);
+    for (int elem = threadIdx.x; elem < key_elems; elem += blockDim.x) {
+      const int kv_head = elem / head_size;
+      const int dim = elem % head_size;
+      const int64_t src_elem =
+          (src_idx * key_stride0 + kv_head * key_stride1 + dim * key_stride2) *
+          2;
+      const uint16_t bits = byte_v2_load_u16(key + src_elem);
+      byte_v2_store_raw_bits_to_block(raw_block, false, block_offset, kv_head,
+                                      dim, num_kv_heads, head_size,
+                                      head_size_v, bits);
+    }
+    for (int elem = threadIdx.x; elem < value_elems; elem += blockDim.x) {
+      const int kv_head = elem / head_size_v;
+      const int dim = elem % head_size_v;
+      const int64_t src_elem =
+          (src_idx * value_stride0 + kv_head * value_stride1 +
+           dim * value_stride2) *
+          2;
+      const uint16_t bits = byte_v2_load_u16(value + src_elem);
+      byte_v2_store_raw_bits_to_block(raw_block, true, block_offset, kv_head,
+                                      dim, num_kv_heads, head_size,
+                                      head_size_v, bits);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x != 0) {
+    return;
+  }
+  const int valid = valid_rows[block_id];
+  if (valid <= 0 || valid > kByteV2TileSize) {
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorInvalidValidRows);
+    return;
+  }
+  if (!byte_v2_raw_block_is_compressible(raw_block, num_kv_heads, head_size,
+                                         head_size_v, valid,
+                                         lossy_max_misses_per_tile)) {
+    if (fallback_block_ids == nullptr || fallback_next_slot == nullptr) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      return;
+    }
+    if (fallback_pool_blocks <= 0) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+      return;
+    }
+    if (fallback_pool == nullptr) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      return;
+    }
+    int fallback_slot = fallback_block_ids[block_id];
+    if (fallback_slot < 0) {
+      fallback_slot = atomicAdd(fallback_next_slot, 1);
+      if (fallback_slot >= fallback_pool_blocks) {
+        fallback_block_ids[block_id] = -1;
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+        return;
+      }
+      fallback_block_ids[block_id] = fallback_slot;
+    }
+    if (fallback_slot >= fallback_pool_blocks) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolInvalidSlot);
+      return;
+    }
+    uint8_t* fallback_block = fallback_pool + fallback_slot * raw_block_bytes;
+    for (int byte_idx = 0; byte_idx < raw_block_bytes; ++byte_idx) {
+      fallback_block[byte_idx] = raw_block[byte_idx];
+    }
+    page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+    page[kByteV2PageValidRowsOffset] = static_cast<uint8_t>(valid);
+    return;
+  }
+  byte_v2_store_compressed_block(raw_block, page, num_kv_heads, head_size,
+                                 head_size_v, valid,
+                                 lossy_max_misses_per_tile);
+  page[kByteV2PageStatusOffset] = kByteV2PageStatusCompressed;
+  page[kByteV2PageValidRowsOffset] = static_cast<uint8_t>(valid);
+  if (fallback_block_ids != nullptr) {
+    fallback_block_ids[block_id] = -1;
+  }
+  if (valid == kByteV2TileSize) {
+    packed_flags[block_id] = 1;
+  }
+}
+
+__global__ void byte_v2_compress_touched_blocks_kernel(
+    const uint8_t* __restrict__ key, const uint8_t* __restrict__ value,
+    uint8_t* __restrict__ kv_cache,
+    const int32_t* __restrict__ block_token_indices,
+    const int32_t* __restrict__ valid_rows,
+    const uint8_t* __restrict__ touched_flags,
+    const uint8_t* __restrict__ overwrite_flags,
+    uint8_t* __restrict__ packed_flags,
+    uint8_t* __restrict__ raw_staging, uint8_t* __restrict__ fallback_pool,
+    int32_t* __restrict__ fallback_block_ids,
+    int32_t* __restrict__ fallback_next_slot,
+    int32_t* __restrict__ fallback_tile_ids,
+    int32_t* __restrict__ fallback_tile_next_slot,
+    int32_t* __restrict__ error,
+    const int num_tokens, const int num_blocks, const int num_kv_heads,
+    const int head_size, const int head_size_v, const int page_size_bytes,
+    const int raw_block_bytes, const int fallback_pool_blocks,
+    const int lossy_max_misses_per_tile,
+    const int64_t key_stride0, const int64_t key_stride1, const int64_t key_stride2,
+    const int64_t value_stride0, const int64_t value_stride1,
+    const int64_t value_stride2) {
+  const int block_id = blockIdx.x;
+  if (block_id >= num_blocks || touched_flags[block_id] == 0) {
+    return;
+  }
+
+  const int32_t* block_tokens =
+      block_token_indices + block_id * kByteV2TileSize;
+  int first_token_idx = -1;
+  int max_touched_rows = 0;
+  for (int offset = 0; offset < kByteV2TileSize; ++offset) {
+    const int token_idx = block_tokens[offset];
+    if (token_idx >= 0) {
+      max_touched_rows = offset + 1;
+      first_token_idx = token_idx;
+      break;
+    }
+  }
+  for (int offset = max_touched_rows; offset < kByteV2TileSize; ++offset) {
+    if (block_tokens[offset] >= 0) {
+      max_touched_rows = offset + 1;
+    }
+  }
+  if (first_token_idx < 0 || first_token_idx >= num_tokens) {
+    if (threadIdx.x == 0) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorNoTouchedToken);
+    }
+    return;
+  }
+
+  uint8_t* page = kv_cache + block_id * page_size_bytes;
+  uint8_t* raw_block = raw_staging + first_token_idx * raw_block_bytes;
+  for (int byte_idx = threadIdx.x; byte_idx < raw_block_bytes;
+       byte_idx += blockDim.x) {
+    raw_block[byte_idx] = 0;
+  }
+  __syncthreads();
+
+  const uint8_t status = page[kByteV2PageStatusOffset];
+  const int existing_valid_rows =
+      static_cast<int>(page[kByteV2PageValidRowsOffset]);
+  const bool overwrite_block = overwrite_flags[block_id] != 0;
+  if (status == kByteV2PageStatusCompressed) {
+    if (!overwrite_block &&
+        (existing_valid_rows <= 0 || existing_valid_rows > kByteV2TileSize)) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorInvalidValidRows);
+      }
+      return;
+    }
+    if (!overwrite_block && existing_valid_rows == kByteV2TileSize) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFinalizedBlockUpdate);
+      }
+      return;
+    }
+    if (!overwrite_block) {
+      byte_v2_decompress_page_to_raw_block(
+          page, raw_block, fallback_pool, fallback_tile_ids, block_id,
+          existing_valid_rows, num_kv_heads, head_size, head_size_v);
+    }
+  } else if (status == kByteV2PageStatusRawFallback) {
+    if (!overwrite_block &&
+        (existing_valid_rows <= 0 || existing_valid_rows > kByteV2TileSize)) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorInvalidValidRows);
+      }
+      return;
+    }
+    if (!overwrite_block && existing_valid_rows == kByteV2TileSize) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFinalizedBlockUpdate);
+      }
+      return;
+    }
+    if (!overwrite_block &&
+        (fallback_pool == nullptr || fallback_block_ids == nullptr)) {
+      if (threadIdx.x == 0) {
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      }
+      return;
+    }
+    if (!overwrite_block) {
+      const int fallback_slot = fallback_block_ids[block_id];
+      if (fallback_slot < 0 || fallback_slot >= fallback_pool_blocks) {
+        if (threadIdx.x == 0) {
+          byte_v2_record_cache_update_error(
+              error, kByteV2CacheUpdateErrorFallbackPoolInvalidSlot);
+        }
+        return;
+      }
+      const uint8_t* fallback_block =
+          fallback_pool + fallback_slot * raw_block_bytes;
+      for (int byte_idx = threadIdx.x; byte_idx < raw_block_bytes;
+           byte_idx += blockDim.x) {
+        raw_block[byte_idx] = fallback_block[byte_idx];
+      }
+    }
+  } else if (status != kByteV2PageStatusEmpty) {
+    if (threadIdx.x == 0) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorInvalidPageState);
+    }
+    return;
+  }
+  __syncthreads();
+
+  const int key_elems = num_kv_heads * head_size;
+  const int value_elems = num_kv_heads * head_size_v;
+  for (int block_offset = 0; block_offset < kByteV2TileSize; ++block_offset) {
+    const int token_idx = block_tokens[block_offset];
+    if (token_idx < 0) {
+      continue;
+    }
+    for (int elem = threadIdx.x; elem < key_elems; elem += blockDim.x) {
+      const int kv_head = elem / head_size;
+      const int dim = elem % head_size;
+      const int64_t src_elem =
+          (token_idx * key_stride0 + kv_head * key_stride1 + dim * key_stride2) *
+          2;
+      const uint16_t bits = byte_v2_load_u16(key + src_elem);
+      byte_v2_store_raw_bits_to_block(raw_block, false, block_offset, kv_head,
+                                      dim, num_kv_heads, head_size,
+                                      head_size_v, bits);
+    }
+    for (int elem = threadIdx.x; elem < value_elems; elem += blockDim.x) {
+      const int kv_head = elem / head_size_v;
+      const int dim = elem % head_size_v;
+      const int64_t src_elem =
+          (token_idx * value_stride0 + kv_head * value_stride1 +
+           dim * value_stride2) *
+          2;
+      const uint16_t bits = byte_v2_load_u16(value + src_elem);
+      byte_v2_store_raw_bits_to_block(raw_block, true, block_offset, kv_head,
+                                      dim, num_kv_heads, head_size,
+                                      head_size_v, bits);
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x != 0) {
+    return;
+  }
+  const int valid = overwrite_block ? max_touched_rows : valid_rows[block_id];
+  if (valid <= 0 || valid > kByteV2TileSize) {
+    byte_v2_record_cache_update_error(
+        error, kByteV2CacheUpdateErrorInvalidValidRows);
+    return;
+  }
+  if (!byte_v2_raw_block_is_compressible(raw_block, num_kv_heads, head_size,
+                                         head_size_v, valid,
+                                         lossy_max_misses_per_tile)) {
+    if (fallback_tile_ids != nullptr && fallback_tile_next_slot != nullptr) {
+      if (byte_v2_store_compressed_or_tile_fallback_block(
+              raw_block, page, fallback_pool, fallback_tile_ids,
+              fallback_tile_next_slot, error, block_id, num_kv_heads,
+              head_size, head_size_v, valid, raw_block_bytes,
+              fallback_pool_blocks, lossy_max_misses_per_tile)) {
+        if (fallback_block_ids != nullptr) {
+          fallback_block_ids[block_id] = -1;
+        }
+        if (valid == kByteV2TileSize) {
+          packed_flags[block_id] = 1;
+        }
+      }
+      return;
+    }
+    if (fallback_block_ids == nullptr || fallback_next_slot == nullptr) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      return;
+    }
+    if (fallback_pool_blocks <= 0) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+      return;
+    }
+    if (fallback_pool == nullptr) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolMissing);
+      return;
+    }
+    int fallback_slot = fallback_block_ids[block_id];
+    if (fallback_slot < 0) {
+      fallback_slot = atomicAdd(fallback_next_slot, 1);
+      if (fallback_slot >= fallback_pool_blocks) {
+        fallback_block_ids[block_id] = -1;
+        byte_v2_record_cache_update_error(
+            error, kByteV2CacheUpdateErrorFallbackPoolExhausted);
+        return;
+      }
+      fallback_block_ids[block_id] = fallback_slot;
+    }
+    if (fallback_slot >= fallback_pool_blocks) {
+      byte_v2_record_cache_update_error(
+          error, kByteV2CacheUpdateErrorFallbackPoolInvalidSlot);
+      return;
+    }
+    uint8_t* fallback_block = fallback_pool + fallback_slot * raw_block_bytes;
+    for (int byte_idx = 0; byte_idx < raw_block_bytes; ++byte_idx) {
+      fallback_block[byte_idx] = raw_block[byte_idx];
+    }
+    page[kByteV2PageStatusOffset] = kByteV2PageStatusRawFallback;
+    page[kByteV2PageValidRowsOffset] = static_cast<uint8_t>(valid);
+    return;
+  }
+  if (fallback_tile_ids != nullptr) {
+    if (!byte_v2_store_compressed_or_tile_fallback_block(
+            raw_block, page, fallback_pool, fallback_tile_ids,
+            fallback_tile_next_slot, error, block_id, num_kv_heads, head_size,
+            head_size_v, valid, raw_block_bytes, fallback_pool_blocks,
+            lossy_max_misses_per_tile)) {
+      return;
+    }
+  } else {
+    byte_v2_store_compressed_block(raw_block, page, num_kv_heads, head_size,
+                                   head_size_v, valid,
+                                   lossy_max_misses_per_tile);
+    page[kByteV2PageStatusOffset] = kByteV2PageStatusCompressed;
+    page[kByteV2PageValidRowsOffset] = static_cast<uint8_t>(valid);
+  }
+  if (fallback_block_ids != nullptr) {
+    fallback_block_ids[block_id] = -1;
+  }
+  if (valid == kByteV2TileSize) {
+    packed_flags[block_id] = 1;
+  }
+}
+
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_kernel(
+    const uint16_t* __restrict__ query, const uint8_t* __restrict__ kv_cache,
+    const block_table_t* __restrict__ block_table,
+    const seq_lens_t* __restrict__ seq_lens, uint16_t* __restrict__ output,
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_block_ids,
+    const int32_t* __restrict__ fallback_tile_ids,
+    const float scale, const int num_decode_tokens, const int num_heads,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int page_size_bytes, const int raw_block_bytes,
+    const int64_t block_table_stride0, const int64_t block_table_stride1,
+    const int64_t seq_lens_stride0) {
+  const int req_idx = blockIdx.x;
+  const int q_head = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (req_idx >= num_decode_tokens || q_head >= num_heads) {
+    return;
+  }
+
+  __shared__ float score_sums[128];
+  __shared__ float softmax_factor;
+  __shared__ float softmax_weight;
+  __shared__ float inv_denom;
+
+  float acc = 0.0f;
+  const int seq_len = static_cast<int>(seq_lens[req_idx * seq_lens_stride0]);
+  if (seq_len <= 0) {
+    for (int d = tid; d < head_size_v; d += blockDim.x) {
+      output[(req_idx * num_heads + q_head) * head_size_v + d] =
+          byte_v2_float_to_bf16_bits(0.0f);
+    }
+    return;
+  }
+
+  const int q_per_kv = num_heads / num_kv_heads;
+  const int kv_head = q_head / q_per_kv;
+  float running_max = -FLT_MAX;
+  float denom = 0.0f;
+
+  for (int token = 0; token < seq_len; ++token) {
+    const int logical_block = token / kByteV2TileSize;
+    const int row = token % kByteV2TileSize;
+    const int physical_block = static_cast<int>(
+        block_table[req_idx * block_table_stride0 +
+                    logical_block * block_table_stride1]);
+    const uint8_t* page = kv_cache + physical_block * page_size_bytes;
+    if (row >= static_cast<int>(page[kByteV2PageValidRowsOffset])) {
+      continue;
+    }
+
+    float score_part = 0.0f;
+    for (int d = tid; d < head_size; d += blockDim.x) {
+      const uint16_t q_bits =
+          query[(req_idx * num_heads + q_head) * head_size + d];
+      const uint16_t k_bits = byte_v2_load_kv_bits(
+          page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+          physical_block,
+          raw_block_bytes, false, row, kv_head, d, num_kv_heads, head_size,
+          head_size_v);
+      score_part +=
+          byte_v2_bf16_bits_to_float(q_bits) * byte_v2_bf16_bits_to_float(k_bits);
+    }
+    score_sums[tid] = score_part;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        score_sums[tid] += score_sums[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const float score = score_sums[0] * scale;
+      float factor = 1.0f;
+      if (score > running_max) {
+        factor = expf(running_max - score);
+        denom *= factor;
+        running_max = score;
+      }
+      softmax_factor = factor;
+      softmax_weight = expf(score - running_max);
+      denom += softmax_weight;
+    }
+    __syncthreads();
+
+    if (tid < head_size_v) {
+      const uint16_t v_bits = byte_v2_load_kv_bits(
+          page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+          physical_block,
+          raw_block_bytes, true, row, kv_head, tid, num_kv_heads, head_size,
+          head_size_v);
+      acc = acc * softmax_factor +
+            softmax_weight * byte_v2_bf16_bits_to_float(v_bits);
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    inv_denom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+  }
+  __syncthreads();
+  if (tid < head_size_v) {
+    output[(req_idx * num_heads + q_head) * head_size_v + tid] =
+        byte_v2_float_to_bf16_bits(acc * inv_denom);
+  }
+}
+
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_gqa_shared_kernel(
+    const uint16_t* __restrict__ query, const uint8_t* __restrict__ kv_cache,
+    const block_table_t* __restrict__ block_table,
+    const seq_lens_t* __restrict__ seq_lens, uint16_t* __restrict__ output,
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_block_ids,
+    const int32_t* __restrict__ fallback_tile_ids,
+    const float scale, const int num_decode_tokens, const int num_heads,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int page_size_bytes, const int raw_block_bytes,
+    const int64_t block_table_stride0, const int64_t block_table_stride1,
+    const int64_t seq_lens_stride0) {
+  const int req_idx = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (req_idx >= num_decode_tokens || kv_head >= num_kv_heads) {
+    return;
+  }
+
+  const int q_per_kv = num_heads / num_kv_heads;
+  if (q_per_kv <= 0 || q_per_kv > kByteV2MaxQPerKv) {
+    return;
+  }
+
+  __shared__ float k_shared[kByteV2MaxHeadSize];
+  __shared__ float v_shared[kByteV2MaxHeadSize];
+  __shared__ float score_sums[kByteV2MaxQPerKv][128];
+  __shared__ float softmax_factor[kByteV2MaxQPerKv];
+  __shared__ float softmax_weight[kByteV2MaxQPerKv];
+  __shared__ float inv_denom[kByteV2MaxQPerKv];
+
+  float acc[kByteV2MaxQPerKv];
+#pragma unroll
+  for (int q = 0; q < kByteV2MaxQPerKv; ++q) {
+    acc[q] = 0.0f;
+  }
+
+  const int seq_len = static_cast<int>(seq_lens[req_idx * seq_lens_stride0]);
+  const int first_q_head = kv_head * q_per_kv;
+  if (seq_len <= 0) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head >= num_heads) {
+        continue;
+      }
+      for (int d = tid; d < head_size_v; d += blockDim.x) {
+        output[(req_idx * num_heads + q_head) * head_size_v + d] =
+            byte_v2_float_to_bf16_bits(0.0f);
+      }
+    }
+    return;
+  }
+
+  float running_max[kByteV2MaxQPerKv];
+  float denom[kByteV2MaxQPerKv];
+#pragma unroll
+  for (int q = 0; q < kByteV2MaxQPerKv; ++q) {
+    running_max[q] = -FLT_MAX;
+    denom[q] = 0.0f;
+  }
+
+  for (int token = 0; token < seq_len; ++token) {
+    const int logical_block = token / kByteV2TileSize;
+    const int row = token % kByteV2TileSize;
+    const int physical_block = static_cast<int>(
+        block_table[req_idx * block_table_stride0 +
+                    logical_block * block_table_stride1]);
+    const uint8_t* page = kv_cache + physical_block * page_size_bytes;
+    if (row >= static_cast<int>(page[kByteV2PageValidRowsOffset])) {
+      continue;
+    }
+
+    for (int d = tid; d < head_size; d += blockDim.x) {
+      const uint16_t k_bits = byte_v2_load_kv_bits(
+          page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+          physical_block,
+          raw_block_bytes, false, row, kv_head, d, num_kv_heads, head_size,
+          head_size_v);
+      k_shared[d] = byte_v2_bf16_bits_to_float(k_bits);
+    }
+    for (int d = tid; d < head_size_v; d += blockDim.x) {
+      const uint16_t v_bits = byte_v2_load_kv_bits(
+          page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+          physical_block,
+          raw_block_bytes, true, row, kv_head, d, num_kv_heads, head_size,
+          head_size_v);
+      v_shared[d] = byte_v2_bf16_bits_to_float(v_bits);
+    }
+    __syncthreads();
+
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      float score_part = 0.0f;
+      if (q_head < num_heads) {
+        for (int d = tid; d < head_size; d += blockDim.x) {
+          const uint16_t q_bits =
+              query[(req_idx * num_heads + q_head) * head_size + d];
+          score_part += byte_v2_bf16_bits_to_float(q_bits) * k_shared[d];
+        }
+      }
+      score_sums[q][tid] = score_part;
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        for (int q = 0; q < q_per_kv; ++q) {
+          score_sums[q][tid] += score_sums[q][tid + stride];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      for (int q = 0; q < q_per_kv; ++q) {
+        const float score = score_sums[q][0] * scale;
+        float factor = 1.0f;
+        if (score > running_max[q]) {
+          factor = expf(running_max[q] - score);
+          denom[q] *= factor;
+          running_max[q] = score;
+        }
+        softmax_factor[q] = factor;
+        softmax_weight[q] = expf(score - running_max[q]);
+        denom[q] += softmax_weight[q];
+      }
+    }
+    __syncthreads();
+
+    if (tid < head_size_v) {
+      const float v = v_shared[tid];
+      for (int q = 0; q < q_per_kv; ++q) {
+        acc[q] = acc[q] * softmax_factor[q] + softmax_weight[q] * v;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      inv_denom[q] = denom[q] > 0.0f ? (1.0f / denom[q]) : 0.0f;
+    }
+  }
+  __syncthreads();
+
+  if (tid < head_size_v) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head < num_heads) {
+        output[(req_idx * num_heads + q_head) * head_size_v + tid] =
+            byte_v2_float_to_bf16_bits(acc[q] * inv_denom[q]);
+      }
+    }
+  }
+}
+
+#ifndef USE_ROCM
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_gqa_wmma_kernel(
+    const uint16_t* __restrict__ query, const uint8_t* __restrict__ kv_cache,
+    const block_table_t* __restrict__ block_table,
+    const seq_lens_t* __restrict__ seq_lens, uint16_t* __restrict__ output,
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_block_ids,
+    const int32_t* __restrict__ fallback_tile_ids,
+    const float scale, const int num_decode_tokens, const int num_heads,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int page_size_bytes, const int raw_block_bytes,
+    const int64_t block_table_stride0, const int64_t block_table_stride1,
+    const int64_t seq_lens_stride0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const int req_idx = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (req_idx >= num_decode_tokens || kv_head >= num_kv_heads) {
+    return;
+  }
+
+  const int q_per_kv = num_heads / num_kv_heads;
+  if (q_per_kv <= 0 || q_per_kv > kByteV2MaxQPerKv) {
+    return;
+  }
+
+  __shared__ __align__(16) __nv_bfloat16 q_shared[kByteV2TileSize *
+                                                  kByteV2MaxHeadSize];
+  __shared__ __align__(16) __nv_bfloat16 k_shared[kByteV2MaxHeadSize *
+                                                  kByteV2TileSize];
+  __shared__ __align__(16) __nv_bfloat16 v_shared[kByteV2TileSize *
+                                                  kByteV2MaxHeadSize];
+  __shared__ __align__(16) __nv_bfloat16 p_shared[kByteV2TileSize *
+                                                  kByteV2TileSize];
+  __shared__ float scores[kByteV2TileSize * kByteV2TileSize];
+  __shared__ float pv_shared[kByteV2TileSize * kByteV2TileSize];
+  __shared__ float tile_acc_factor[kByteV2MaxQPerKv];
+  __shared__ float inv_denom[kByteV2MaxQPerKv];
+
+  const int seq_len = static_cast<int>(seq_lens[req_idx * seq_lens_stride0]);
+  const int first_q_head = kv_head * q_per_kv;
+
+  float acc[kByteV2MaxQPerKv];
+  float running_max[kByteV2MaxQPerKv];
+  float denom[kByteV2MaxQPerKv];
+#pragma unroll
+  for (int q = 0; q < kByteV2MaxQPerKv; ++q) {
+    acc[q] = 0.0f;
+    running_max[q] = -FLT_MAX;
+    denom[q] = 0.0f;
+  }
+
+  if (seq_len <= 0) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head >= num_heads) {
+        continue;
+      }
+      for (int d = tid; d < head_size_v; d += blockDim.x) {
+        output[(req_idx * num_heads + q_head) * head_size_v + d] =
+            byte_v2_float_to_bf16_bits(0.0f);
+      }
+    }
+    return;
+  }
+
+  for (int idx = tid; idx < kByteV2TileSize * head_size; idx += blockDim.x) {
+    const int q_row = idx / head_size;
+    const int dim = idx % head_size;
+    uint16_t q_bits = 0;
+    if (q_row < q_per_kv) {
+      const int q_head = first_q_head + q_row;
+      if (q_head < num_heads) {
+        q_bits = query[(req_idx * num_heads + q_head) * head_size + dim];
+      }
+    }
+    q_shared[idx] = byte_v2_bf16_bits_to_wmma(q_bits);
+  }
+  __syncthreads();
+
+  for (int token_base = 0; token_base < seq_len;
+       token_base += kByteV2TileSize) {
+    const int logical_block = token_base / kByteV2TileSize;
+    const int physical_block = static_cast<int>(
+        block_table[req_idx * block_table_stride0 +
+                    logical_block * block_table_stride1]);
+    const uint8_t* page = kv_cache + physical_block * page_size_bytes;
+    const int page_valid_rows =
+        static_cast<int>(page[kByteV2PageValidRowsOffset]);
+    const int seq_rows = min(kByteV2TileSize, seq_len - token_base);
+    const int valid_rows = min(seq_rows, page_valid_rows);
+    if (valid_rows <= 0) {
+      continue;
+    }
+
+    for (int idx = tid; idx < head_size * kByteV2TileSize;
+         idx += blockDim.x) {
+      const int dim = idx / kByteV2TileSize;
+      const int row = idx % kByteV2TileSize;
+      uint16_t k_bits = 0;
+      if (row < valid_rows) {
+        k_bits = byte_v2_load_kv_bits(
+            page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+            physical_block,
+            raw_block_bytes, false, row, kv_head, dim, num_kv_heads, head_size,
+            head_size_v);
+      }
+      k_shared[idx] = byte_v2_bf16_bits_to_wmma(k_bits);
+    }
+
+    for (int idx = tid; idx < kByteV2TileSize * head_size_v;
+         idx += blockDim.x) {
+      const int row = idx / head_size_v;
+      const int dim = idx % head_size_v;
+      uint16_t v_bits = 0;
+      if (row < valid_rows) {
+        v_bits = byte_v2_load_kv_bits(
+            page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+            physical_block,
+            raw_block_bytes, true, row, kv_head, dim, num_kv_heads, head_size,
+            head_size_v);
+      }
+      v_shared[idx] = byte_v2_bf16_bits_to_wmma(v_bits);
+    }
+    __syncthreads();
+
+    if (tid < warpSize) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          a_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          b_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+          c_frag;
+      nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+      for (int dim_base = 0; dim_base < head_size;
+           dim_base += kByteV2TileSize) {
+        nvcuda::wmma::load_matrix_sync(a_frag, q_shared + dim_base,
+                                       head_size);
+        nvcuda::wmma::load_matrix_sync(
+            b_frag, k_shared + dim_base * kByteV2TileSize, kByteV2TileSize);
+        nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      }
+      nvcuda::wmma::store_matrix_sync(scores, c_frag, kByteV2TileSize,
+                                      nvcuda::wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const __nv_bfloat16 zero = byte_v2_bf16_bits_to_wmma(0);
+      for (int idx = 0; idx < kByteV2TileSize * kByteV2TileSize; ++idx) {
+        p_shared[idx] = zero;
+      }
+      for (int q = 0; q < q_per_kv; ++q) {
+        float tile_max = -FLT_MAX;
+        for (int row = 0; row < valid_rows; ++row) {
+          tile_max =
+              max(tile_max, scores[q * kByteV2TileSize + row] * scale);
+        }
+        const float new_max = max(running_max[q], tile_max);
+        const float old_scale = expf(running_max[q] - new_max);
+        float new_denom = denom[q] * old_scale;
+        for (int row = 0; row < valid_rows; ++row) {
+          const float weight =
+              expf(scores[q * kByteV2TileSize + row] * scale - new_max);
+          p_shared[q * kByteV2TileSize + row] =
+              byte_v2_bf16_bits_to_wmma(byte_v2_float_to_bf16_bits(weight));
+          new_denom += weight;
+        }
+        tile_acc_factor[q] = old_scale;
+        running_max[q] = new_max;
+        denom[q] = new_denom;
+      }
+    }
+    __syncthreads();
+
+    if (tid < head_size_v) {
+      for (int q = 0; q < q_per_kv; ++q) {
+        acc[q] *= tile_acc_factor[q];
+      }
+    }
+    __syncthreads();
+
+    for (int dim_base = 0; dim_base < head_size_v;
+         dim_base += kByteV2TileSize) {
+      if (tid < warpSize) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            p_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            v_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+            pv_frag;
+        nvcuda::wmma::fill_fragment(pv_frag, 0.0f);
+        nvcuda::wmma::load_matrix_sync(p_frag, p_shared, kByteV2TileSize);
+        nvcuda::wmma::load_matrix_sync(v_frag, v_shared + dim_base,
+                                       head_size_v);
+        nvcuda::wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+        nvcuda::wmma::store_matrix_sync(pv_shared, pv_frag, kByteV2TileSize,
+                                        nvcuda::wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      if (tid >= dim_base && tid < dim_base + kByteV2TileSize &&
+          tid < head_size_v) {
+        const int dim_in_tile = tid - dim_base;
+        for (int q = 0; q < q_per_kv; ++q) {
+          acc[q] += pv_shared[q * kByteV2TileSize + dim_in_tile];
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (tid == 0) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      inv_denom[q] = denom[q] > 0.0f ? (1.0f / denom[q]) : 0.0f;
+    }
+  }
+  __syncthreads();
+
+  if (tid < head_size_v) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head < num_heads) {
+        output[(req_idx * num_heads + q_head) * head_size_v + tid] =
+            byte_v2_float_to_bf16_bits(acc[q] * inv_denom[q]);
+      }
+    }
+  }
+#endif
+}
+
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_gqa_wmma_split_stage1_kernel(
+    const uint16_t* __restrict__ query, const uint8_t* __restrict__ kv_cache,
+    const block_table_t* __restrict__ block_table,
+    const seq_lens_t* __restrict__ seq_lens, float* __restrict__ partial_output,
+    const uint8_t* __restrict__ fallback_pool,
+    const int32_t* __restrict__ fallback_block_ids,
+    const int32_t* __restrict__ fallback_tile_ids,
+    const float scale, const int num_decode_tokens, const int num_heads,
+    const int num_kv_heads, const int head_size, const int head_size_v,
+    const int page_size_bytes, const int raw_block_bytes,
+    const int num_kv_splits, const int64_t block_table_stride0,
+    const int64_t block_table_stride1, const int64_t seq_lens_stride0,
+    const bool use_page_fastpath, const bool use_tile_fastpath) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const int req_idx = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int split_idx = blockIdx.z;
+  const int tid = threadIdx.x;
+  if (req_idx >= num_decode_tokens || kv_head >= num_kv_heads ||
+      split_idx >= num_kv_splits) {
+    return;
+  }
+
+  const int q_per_kv = num_heads / num_kv_heads;
+  if (q_per_kv <= 0 || q_per_kv > kByteV2MaxQPerKv) {
+    return;
+  }
+
+  __shared__ __align__(16) __nv_bfloat16 q_shared[kByteV2TileSize *
+                                                  kByteV2MaxHeadSize];
+  __shared__ __align__(16) __nv_bfloat16 k_shared[kByteV2MaxHeadSize *
+                                                  kByteV2TileSize];
+  __shared__ __align__(16) __nv_bfloat16 v_shared[kByteV2TileSize *
+                                                  kByteV2MaxHeadSize];
+  __shared__ __align__(16) __nv_bfloat16 p_shared[kByteV2TileSize *
+                                                  kByteV2TileSize];
+  __shared__ float scores[kByteV2TileSize * kByteV2TileSize];
+  __shared__ float pv_shared[kByteV2TileSize * kByteV2TileSize];
+  __shared__ float tile_acc_factor[kByteV2MaxQPerKv];
+  __shared__ float lse_shared[kByteV2MaxQPerKv];
+  __shared__ float inv_denom[kByteV2MaxQPerKv];
+
+  const int seq_len = static_cast<int>(seq_lens[req_idx * seq_lens_stride0]);
+  const int first_q_head = kv_head * q_per_kv;
+
+  float acc[kByteV2MaxQPerKv];
+  float running_max[kByteV2MaxQPerKv];
+  float denom[kByteV2MaxQPerKv];
+#pragma unroll
+  for (int q = 0; q < kByteV2MaxQPerKv; ++q) {
+    acc[q] = 0.0f;
+    running_max[q] = -FLT_MAX;
+    denom[q] = 0.0f;
+  }
+
+  const int partial_stride = head_size_v + 1;
+  if (seq_len <= 0) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head >= num_heads) {
+        continue;
+      }
+      float* partial =
+          partial_output +
+          (((req_idx * num_heads + q_head) * num_kv_splits + split_idx) *
+           partial_stride);
+      for (int d = tid; d < head_size_v; d += blockDim.x) {
+        partial[d] = 0.0f;
+      }
+      if (tid == 0) {
+        partial[head_size_v] = -FLT_MAX;
+      }
+    }
+    return;
+  }
+
+  const int logical_blocks =
+      (seq_len + kByteV2TileSize - 1) / kByteV2TileSize;
+  const int blocks_per_split =
+      (logical_blocks + num_kv_splits - 1) / num_kv_splits;
+  const int start_block = split_idx * blocks_per_split;
+  const int end_block = min(logical_blocks, start_block + blocks_per_split);
+  if (start_block >= end_block) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head >= num_heads) {
+        continue;
+      }
+      float* partial =
+          partial_output +
+          (((req_idx * num_heads + q_head) * num_kv_splits + split_idx) *
+           partial_stride);
+      for (int d = tid; d < head_size_v; d += blockDim.x) {
+        partial[d] = 0.0f;
+      }
+      if (tid == 0) {
+        partial[head_size_v] = -FLT_MAX;
+      }
+    }
+    return;
+  }
+
+  for (int idx = tid; idx < kByteV2TileSize * head_size; idx += blockDim.x) {
+    const int q_row = idx / head_size;
+    const int dim = idx % head_size;
+    uint16_t q_bits = 0;
+    if (q_row < q_per_kv) {
+      const int q_head = first_q_head + q_row;
+      if (q_head < num_heads) {
+        q_bits = query[(req_idx * num_heads + q_head) * head_size + dim];
+      }
+    }
+    q_shared[idx] = byte_v2_bf16_bits_to_wmma(q_bits);
+  }
+  __syncthreads();
+
+  const int k_dim_tiles = head_size / kByteV2TileSize;
+  const int v_dim_tiles = head_size_v / kByteV2TileSize;
+  const int total_tiles = num_kv_heads * (k_dim_tiles + v_dim_tiles);
+
+  for (int logical_block = start_block; logical_block < end_block;
+       ++logical_block) {
+    const int token_base = logical_block * kByteV2TileSize;
+    const int physical_block = static_cast<int>(
+        block_table[req_idx * block_table_stride0 +
+                    logical_block * block_table_stride1]);
+    const uint8_t* page = kv_cache + physical_block * page_size_bytes;
+    const int page_valid_rows =
+        static_cast<int>(page[kByteV2PageValidRowsOffset]);
+    const int seq_rows = min(kByteV2TileSize, seq_len - token_base);
+    const int valid_rows = min(seq_rows, page_valid_rows);
+    if (valid_rows <= 0) {
+      continue;
+    }
+
+    const uint8_t page_status = page[kByteV2PageStatusOffset];
+    const bool compressed_fastpath =
+        use_page_fastpath && page_status == kByteV2PageStatusCompressed;
+    const bool compressed_no_fallback_fastpath =
+        compressed_fastpath && fallback_pool == nullptr &&
+        fallback_tile_ids == nullptr;
+    const bool raw_fallback_fastpath = false;
+
+    if (compressed_no_fallback_fastpath) {
+      for (int dim_tile = 0; dim_tile < k_dim_tiles; ++dim_tile) {
+        byte_v2_decode_k_transposed_tile_to_shared_no_fallback(
+            page, k_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+            valid_rows);
+      }
+      for (int dim_tile = 0; dim_tile < v_dim_tiles; ++dim_tile) {
+        byte_v2_decode_v_rowmajor_tile_to_shared_no_fallback(
+            page, v_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+            valid_rows, head_size_v);
+      }
+    } else if (compressed_fastpath && use_tile_fastpath) {
+      for (int dim_tile = 0; dim_tile < k_dim_tiles; ++dim_tile) {
+        const int tile_start =
+            byte_v2_tile_start(false, kv_head, dim_tile, k_dim_tiles,
+                               v_dim_tiles);
+        if (page[tile_start + 1] == 0) {
+          byte_v2_decode_k_transposed_tile_to_shared_no_fallback(
+              page, k_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+              valid_rows);
+        } else {
+          byte_v2_decode_k_transposed_tile_to_shared_tile_fallback(
+              fallback_pool, fallback_tile_ids, k_shared, tid, physical_block,
+              kv_head, dim_tile, k_dim_tiles, v_dim_tiles, valid_rows,
+              total_tiles);
+        }
+      }
+      for (int dim_tile = 0; dim_tile < v_dim_tiles; ++dim_tile) {
+        const int tile_start =
+            byte_v2_tile_start(true, kv_head, dim_tile, k_dim_tiles,
+                               v_dim_tiles);
+        if (page[tile_start + 1] == 0) {
+          byte_v2_decode_v_rowmajor_tile_to_shared_no_fallback(
+              page, v_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+              valid_rows, head_size_v);
+        } else {
+          byte_v2_decode_v_rowmajor_tile_to_shared_tile_fallback(
+              fallback_pool, fallback_tile_ids, v_shared, tid, physical_block,
+              kv_head, dim_tile, k_dim_tiles, v_dim_tiles, valid_rows,
+              head_size_v, total_tiles);
+        }
+      }
+    } else if (compressed_fastpath) {
+      for (int idx = tid; idx < head_size * kByteV2TileSize;
+           idx += blockDim.x) {
+        const int dim = idx / kByteV2TileSize;
+        const int row = idx % kByteV2TileSize;
+        uint16_t k_bits = 0;
+        if (row < valid_rows) {
+          k_bits = byte_v2_load_compressed_bits(
+              page, false, row, kv_head, dim, k_dim_tiles, v_dim_tiles,
+              fallback_pool, fallback_tile_ids, physical_block, total_tiles);
+        }
+	        k_shared[idx] = byte_v2_bf16_bits_to_wmma(k_bits);
+      }
+
+      for (int idx = tid; idx < kByteV2TileSize * head_size_v;
+           idx += blockDim.x) {
+        const int row = idx / head_size_v;
+        const int dim = idx % head_size_v;
+        uint16_t v_bits = 0;
+        if (row < valid_rows) {
+          v_bits = byte_v2_load_compressed_bits(
+              page, true, row, kv_head, dim, k_dim_tiles, v_dim_tiles,
+              fallback_pool, fallback_tile_ids, physical_block, total_tiles);
+        }
+        v_shared[idx] = byte_v2_bf16_bits_to_wmma(v_bits);
+      }
+    } else if (raw_fallback_fastpath) {
+      const uint8_t* raw_block = page + kByteV2PageHeaderBytes;
+      if (fallback_pool != nullptr && fallback_block_ids != nullptr) {
+        const int fallback_slot = fallback_block_ids[physical_block];
+        if (fallback_slot >= 0) {
+          raw_block = fallback_pool + fallback_slot * raw_block_bytes;
+        }
+      }
+
+      for (int idx = tid; idx < head_size * kByteV2TileSize;
+           idx += blockDim.x) {
+        const int dim = idx / kByteV2TileSize;
+        const int row = idx % kByteV2TileSize;
+        uint16_t k_bits = 0;
+        if (row < valid_rows) {
+          k_bits = byte_v2_load_raw_bits_from_block(
+              raw_block, false, row, kv_head, dim, num_kv_heads, head_size,
+              head_size_v);
+        }
+	        k_shared[idx] = byte_v2_bf16_bits_to_wmma(k_bits);
+      }
+
+      for (int idx = tid; idx < kByteV2TileSize * head_size_v;
+           idx += blockDim.x) {
+        const int row = idx / head_size_v;
+        const int dim = idx % head_size_v;
+        uint16_t v_bits = 0;
+        if (row < valid_rows) {
+          v_bits = byte_v2_load_raw_bits_from_block(
+              raw_block, true, row, kv_head, dim, num_kv_heads, head_size,
+              head_size_v);
+        }
+        v_shared[idx] = byte_v2_bf16_bits_to_wmma(v_bits);
+      }
+    } else {
+      for (int idx = tid; idx < head_size * kByteV2TileSize;
+           idx += blockDim.x) {
+        const int dim = idx / kByteV2TileSize;
+        const int row = idx % kByteV2TileSize;
+        uint16_t k_bits = 0;
+        if (row < valid_rows) {
+          k_bits = byte_v2_load_kv_bits(
+              page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+              physical_block,
+              raw_block_bytes, false, row, kv_head, dim, num_kv_heads,
+              head_size, head_size_v);
+        }
+	        k_shared[idx] = byte_v2_bf16_bits_to_wmma(k_bits);
+      }
+
+      for (int idx = tid; idx < kByteV2TileSize * head_size_v;
+           idx += blockDim.x) {
+        const int row = idx / head_size_v;
+        const int dim = idx % head_size_v;
+        uint16_t v_bits = 0;
+        if (row < valid_rows) {
+          v_bits = byte_v2_load_kv_bits(
+              page, fallback_pool, fallback_block_ids, fallback_tile_ids,
+              physical_block,
+              raw_block_bytes, true, row, kv_head, dim, num_kv_heads,
+              head_size, head_size_v);
+        }
+        v_shared[idx] = byte_v2_bf16_bits_to_wmma(v_bits);
+      }
+    }
+    __syncthreads();
+
+    if (tid < warpSize) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          a_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          b_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+          c_frag;
+      nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+      for (int dim_base = 0; dim_base < head_size;
+           dim_base += kByteV2TileSize) {
+        nvcuda::wmma::load_matrix_sync(a_frag, q_shared + dim_base,
+                                       head_size);
+        nvcuda::wmma::load_matrix_sync(
+            b_frag, k_shared + dim_base * kByteV2TileSize, kByteV2TileSize);
+        nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      }
+      nvcuda::wmma::store_matrix_sync(scores, c_frag, kByteV2TileSize,
+                                      nvcuda::wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      const __nv_bfloat16 zero = byte_v2_bf16_bits_to_wmma(0);
+      for (int idx = 0; idx < kByteV2TileSize * kByteV2TileSize; ++idx) {
+        p_shared[idx] = zero;
+      }
+      for (int q = 0; q < q_per_kv; ++q) {
+        float tile_max = -FLT_MAX;
+        for (int row = 0; row < valid_rows; ++row) {
+          tile_max =
+              max(tile_max, scores[q * kByteV2TileSize + row] * scale);
+        }
+        const float new_max = max(running_max[q], tile_max);
+        const float old_scale = expf(running_max[q] - new_max);
+        float new_denom = denom[q] * old_scale;
+        for (int row = 0; row < valid_rows; ++row) {
+          const float weight =
+              expf(scores[q * kByteV2TileSize + row] * scale - new_max);
+          p_shared[q * kByteV2TileSize + row] =
+              byte_v2_bf16_bits_to_wmma(byte_v2_float_to_bf16_bits(weight));
+          new_denom += weight;
+        }
+        tile_acc_factor[q] = old_scale;
+        running_max[q] = new_max;
+        denom[q] = new_denom;
+      }
+    }
+    __syncthreads();
+
+    if (tid < head_size_v) {
+      for (int q = 0; q < q_per_kv; ++q) {
+        acc[q] *= tile_acc_factor[q];
+      }
+    }
+    __syncthreads();
+
+    for (int dim_base = 0; dim_base < head_size_v;
+         dim_base += kByteV2TileSize) {
+      if (tid < warpSize) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            p_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            v_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+            pv_frag;
+        nvcuda::wmma::fill_fragment(pv_frag, 0.0f);
+        nvcuda::wmma::load_matrix_sync(p_frag, p_shared, kByteV2TileSize);
+        nvcuda::wmma::load_matrix_sync(v_frag, v_shared + dim_base,
+                                       head_size_v);
+        nvcuda::wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+        nvcuda::wmma::store_matrix_sync(pv_shared, pv_frag, kByteV2TileSize,
+                                        nvcuda::wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      if (tid >= dim_base && tid < dim_base + kByteV2TileSize &&
+          tid < head_size_v) {
+        const int dim_in_tile = tid - dim_base;
+        for (int q = 0; q < q_per_kv; ++q) {
+          acc[q] += pv_shared[q * kByteV2TileSize + dim_in_tile];
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (tid == 0) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      inv_denom[q] = denom[q] > 0.0f ? (1.0f / denom[q]) : 0.0f;
+      lse_shared[q] =
+          denom[q] > 0.0f ? running_max[q] + logf(denom[q]) : -FLT_MAX;
+    }
+  }
+  __syncthreads();
+
+  for (int q = 0; q < q_per_kv; ++q) {
+    const int q_head = first_q_head + q;
+    if (q_head >= num_heads) {
+      continue;
+    }
+    float* partial =
+        partial_output +
+        (((req_idx * num_heads + q_head) * num_kv_splits + split_idx) *
+         partial_stride);
+    if (tid < head_size_v) {
+      partial[tid] = acc[q] * inv_denom[q];
+    }
+    if (tid == 0) {
+      partial[head_size_v] = lse_shared[q];
+    }
+  }
+#endif
+}
+
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel(
+    const uint16_t* __restrict__ query, const uint8_t* __restrict__ kv_cache,
+    const block_table_t* __restrict__ block_table,
+    const seq_lens_t* __restrict__ seq_lens, float* __restrict__ partial_output,
+    const float scale, const int num_decode_tokens, const int num_heads,
+    const int num_kv_heads, const int page_size_bytes,
+    const int num_kv_splits, const int64_t block_table_stride0,
+    const int64_t block_table_stride1, const int64_t seq_lens_stride0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int head_size = kByteV2MaxHeadSize;
+  constexpr int head_size_v = kByteV2MaxHeadSize;
+  constexpr int q_per_kv = 4;
+  constexpr int k_dim_tiles = head_size / kByteV2TileSize;
+  constexpr int v_dim_tiles = head_size_v / kByteV2TileSize;
+
+  const int req_idx = blockIdx.x;
+  const int kv_head = blockIdx.y;
+  const int split_idx = blockIdx.z;
+  const int tid = threadIdx.x;
+  if (req_idx >= num_decode_tokens || kv_head >= num_kv_heads ||
+      split_idx >= num_kv_splits) {
+    return;
+  }
+
+  __shared__ __align__(16) __nv_bfloat16 q_shared[kByteV2TileSize *
+                                                  head_size];
+  __shared__ __align__(16) __nv_bfloat16 k_shared[head_size *
+                                                  kByteV2TileSize];
+  __shared__ __align__(16) __nv_bfloat16 v_shared[kByteV2TileSize *
+                                                  head_size_v];
+  __shared__ __align__(16) __nv_bfloat16 p_shared[kByteV2TileSize *
+                                                  kByteV2TileSize];
+  __shared__ float scores[kByteV2TileSize * kByteV2TileSize];
+  __shared__ float pv_shared[kByteV2TileSize * kByteV2TileSize];
+  __shared__ float tile_acc_factor[q_per_kv];
+  __shared__ float lse_shared[q_per_kv];
+  __shared__ float inv_denom[q_per_kv];
+  __shared__ float running_max_shared[q_per_kv];
+  __shared__ float denom_shared[q_per_kv];
+
+  const int seq_len = static_cast<int>(seq_lens[req_idx * seq_lens_stride0]);
+  const int first_q_head = kv_head * q_per_kv;
+  const int partial_stride = head_size_v + 1;
+
+  float acc[q_per_kv];
+#pragma unroll
+  for (int q = 0; q < q_per_kv; ++q) {
+    acc[q] = 0.0f;
+  }
+
+  if (seq_len <= 0) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head >= num_heads) {
+        continue;
+      }
+      float* partial =
+          partial_output +
+          (((req_idx * num_heads + q_head) * num_kv_splits + split_idx) *
+           partial_stride);
+      for (int d = tid; d < head_size_v; d += blockDim.x) {
+        partial[d] = 0.0f;
+      }
+      if (tid == 0) {
+        partial[head_size_v] = -FLT_MAX;
+      }
+    }
+    return;
+  }
+
+  const int logical_blocks =
+      (seq_len + kByteV2TileSize - 1) / kByteV2TileSize;
+  const int blocks_per_split =
+      (logical_blocks + num_kv_splits - 1) / num_kv_splits;
+  const int start_block = split_idx * blocks_per_split;
+  const int end_block = min(logical_blocks, start_block + blocks_per_split);
+  if (start_block >= end_block) {
+    for (int q = 0; q < q_per_kv; ++q) {
+      const int q_head = first_q_head + q;
+      if (q_head >= num_heads) {
+        continue;
+      }
+      float* partial =
+          partial_output +
+          (((req_idx * num_heads + q_head) * num_kv_splits + split_idx) *
+           partial_stride);
+      for (int d = tid; d < head_size_v; d += blockDim.x) {
+        partial[d] = 0.0f;
+      }
+      if (tid == 0) {
+        partial[head_size_v] = -FLT_MAX;
+      }
+    }
+    return;
+  }
+
+  if (tid < q_per_kv) {
+    running_max_shared[tid] = -FLT_MAX;
+    denom_shared[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < kByteV2TileSize * head_size; idx += blockDim.x) {
+    const int q_row = idx / head_size;
+    const int dim = idx % head_size;
+    uint16_t q_bits = 0;
+    if (q_row < q_per_kv) {
+      const int q_head = first_q_head + q_row;
+      if (q_head < num_heads) {
+        q_bits = query[(req_idx * num_heads + q_head) * head_size + dim];
+      }
+    }
+    q_shared[idx] = byte_v2_bf16_bits_to_wmma(q_bits);
+  }
+  __syncthreads();
+
+  for (int logical_block = start_block; logical_block < end_block;
+       ++logical_block) {
+    const int token_base = logical_block * kByteV2TileSize;
+    const int physical_block = static_cast<int>(
+        block_table[req_idx * block_table_stride0 +
+                    logical_block * block_table_stride1]);
+    const uint8_t* page = kv_cache + physical_block * page_size_bytes;
+    const int page_valid_rows =
+        static_cast<int>(page[kByteV2PageValidRowsOffset]);
+    const int seq_rows = min(kByteV2TileSize, seq_len - token_base);
+    const int valid_rows = min(seq_rows, page_valid_rows);
+    if (valid_rows <= 0 ||
+        page[kByteV2PageStatusOffset] != kByteV2PageStatusCompressed) {
+      continue;
+    }
+
+#pragma unroll
+    for (int dim_tile = 0; dim_tile < k_dim_tiles; ++dim_tile) {
+      byte_v2_decode_k_transposed_tile_to_shared_no_fallback(
+          page, k_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+          valid_rows);
+    }
+#pragma unroll
+    for (int dim_tile = 0; dim_tile < v_dim_tiles; ++dim_tile) {
+      byte_v2_decode_v_rowmajor_tile_to_shared_no_fallback(
+          page, v_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+          valid_rows, head_size_v);
+    }
+    __syncthreads();
+
+    if (tid < warpSize) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          a_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          b_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+          c_frag;
+      nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+#pragma unroll
+      for (int dim_base = 0; dim_base < head_size;
+           dim_base += kByteV2TileSize) {
+        nvcuda::wmma::load_matrix_sync(a_frag, q_shared + dim_base,
+                                       head_size);
+        nvcuda::wmma::load_matrix_sync(
+            b_frag, k_shared + dim_base * kByteV2TileSize, kByteV2TileSize);
+        nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      }
+      nvcuda::wmma::store_matrix_sync(scores, c_frag, kByteV2TileSize,
+                                      nvcuda::wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    const __nv_bfloat16 zero = byte_v2_bf16_bits_to_wmma(0);
+    for (int idx = tid; idx < kByteV2TileSize * kByteV2TileSize;
+         idx += blockDim.x) {
+      p_shared[idx] = zero;
+    }
+    __syncthreads();
+
+    const int warp_id = tid / warpSize;
+    const int lane_id = tid % warpSize;
+    if (warp_id < q_per_kv) {
+      const float score =
+          lane_id < valid_rows
+              ? scores[warp_id * kByteV2TileSize + lane_id] * scale
+              : -FLT_MAX;
+      const float tile_max = byte_v2_warp_reduce_max(score);
+      const float old_max = running_max_shared[warp_id];
+      const float new_max = max(old_max, tile_max);
+      const float old_scale = expf(old_max - new_max);
+      const float weight =
+          lane_id < valid_rows ? expf(score - new_max) : 0.0f;
+      const float tile_denom = byte_v2_warp_reduce_sum(weight);
+      if (lane_id < kByteV2TileSize) {
+        p_shared[warp_id * kByteV2TileSize + lane_id] =
+            lane_id < valid_rows
+                ? byte_v2_bf16_bits_to_wmma(
+                      byte_v2_float_to_bf16_bits(weight))
+                : zero;
+      }
+      if (lane_id == 0) {
+        tile_acc_factor[warp_id] = old_scale;
+        denom_shared[warp_id] = denom_shared[warp_id] * old_scale + tile_denom;
+        running_max_shared[warp_id] = new_max;
+      }
+    }
+    __syncthreads();
+
+    if (tid < head_size_v) {
+#pragma unroll
+      for (int q = 0; q < q_per_kv; ++q) {
+        acc[q] *= tile_acc_factor[q];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int dim_base = 0; dim_base < head_size_v;
+         dim_base += kByteV2TileSize) {
+      if (tid < warpSize) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            p_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            v_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+            pv_frag;
+        nvcuda::wmma::fill_fragment(pv_frag, 0.0f);
+        nvcuda::wmma::load_matrix_sync(p_frag, p_shared, kByteV2TileSize);
+        nvcuda::wmma::load_matrix_sync(v_frag, v_shared + dim_base,
+                                       head_size_v);
+        nvcuda::wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+        nvcuda::wmma::store_matrix_sync(pv_shared, pv_frag, kByteV2TileSize,
+                                        nvcuda::wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      if (tid >= dim_base && tid < dim_base + kByteV2TileSize &&
+          tid < head_size_v) {
+        const int dim_in_tile = tid - dim_base;
+#pragma unroll
+        for (int q = 0; q < q_per_kv; ++q) {
+          acc[q] += pv_shared[q * kByteV2TileSize + dim_in_tile];
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (tid == 0) {
+#pragma unroll
+    for (int q = 0; q < q_per_kv; ++q) {
+      inv_denom[q] =
+          denom_shared[q] > 0.0f ? (1.0f / denom_shared[q]) : 0.0f;
+      lse_shared[q] = denom_shared[q] > 0.0f
+                          ? running_max_shared[q] + logf(denom_shared[q])
+                          : -FLT_MAX;
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int q = 0; q < q_per_kv; ++q) {
+    const int q_head = first_q_head + q;
+    if (q_head >= num_heads) {
+      continue;
+    }
+    float* partial =
+        partial_output +
+        (((req_idx * num_heads + q_head) * num_kv_splits + split_idx) *
+         partial_stride);
+    if (tid < head_size_v) {
+      partial[tid] = acc[q] * inv_denom[q];
+    }
+    if (tid == 0) {
+      partial[head_size_v] = lse_shared[q];
+    }
+  }
+#endif
+}
+
+
+__global__ void byte_v2_paged_decode_attention_split_reduce_kernel(
+    const float* __restrict__ partial_output, uint16_t* __restrict__ output,
+    const int num_decode_tokens, const int num_heads, const int head_size_v,
+    const int num_kv_splits) {
+  const int req_idx = blockIdx.x;
+  const int q_head = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (req_idx >= num_decode_tokens || q_head >= num_heads) {
+    return;
+  }
+
+  __shared__ float global_max;
+  __shared__ float global_denom;
+  const int partial_stride = head_size_v + 1;
+
+  if (tid == 0) {
+    float max_lse = -FLT_MAX;
+    for (int split = 0; split < num_kv_splits; ++split) {
+      const float* partial =
+          partial_output +
+          (((req_idx * num_heads + q_head) * num_kv_splits + split) *
+           partial_stride);
+      max_lse = max(max_lse, partial[head_size_v]);
+    }
+    float denom = 0.0f;
+    if (max_lse > -FLT_MAX) {
+      for (int split = 0; split < num_kv_splits; ++split) {
+        const float* partial =
+            partial_output +
+            (((req_idx * num_heads + q_head) * num_kv_splits + split) *
+             partial_stride);
+        const float lse = partial[head_size_v];
+        if (lse > -FLT_MAX) {
+          denom += expf(lse - max_lse);
+        }
+      }
+    }
+    global_max = max_lse;
+    global_denom = denom;
+  }
+  __syncthreads();
+
+  for (int d = tid; d < head_size_v; d += blockDim.x) {
+    float acc = 0.0f;
+    if (global_denom > 0.0f) {
+      for (int split = 0; split < num_kv_splits; ++split) {
+        const float* partial =
+            partial_output +
+            (((req_idx * num_heads + q_head) * num_kv_splits + split) *
+             partial_stride);
+        const float lse = partial[head_size_v];
+        if (lse > -FLT_MAX) {
+          acc += expf(lse - global_max) * partial[d];
+        }
+      }
+      acc /= global_denom;
+    }
+    output[(req_idx * num_heads + q_head) * head_size_v + d] =
+        byte_v2_float_to_bf16_bits(acc);
+  }
+}
+
+__global__ void byte_v2_paged_decode_attention_split_reduce_parallel_kernel(
+    const float* __restrict__ partial_output, uint16_t* __restrict__ output,
+    const int num_decode_tokens, const int num_heads, const int head_size_v,
+    const int num_kv_splits) {
+  const int req_idx = blockIdx.x;
+  const int q_head = blockIdx.y;
+  const int tid = threadIdx.x;
+  if (req_idx >= num_decode_tokens || q_head >= num_heads) {
+    return;
+  }
+
+  __shared__ float reduce_storage[kByteV2MaxHeadSize];
+  __shared__ float global_max;
+  __shared__ float global_denom;
+  const int partial_stride = head_size_v + 1;
+  const int64_t partial_base =
+      (static_cast<int64_t>(req_idx) * num_heads + q_head) * num_kv_splits *
+      partial_stride;
+
+  float local_max = -FLT_MAX;
+  for (int split = tid; split < num_kv_splits; split += blockDim.x) {
+    const float* partial =
+        partial_output + partial_base + split * partial_stride;
+    local_max = max(local_max, partial[head_size_v]);
+  }
+  reduce_storage[tid] = local_max;
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      reduce_storage[tid] =
+          max(reduce_storage[tid], reduce_storage[tid + offset]);
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    global_max = reduce_storage[0];
+  }
+  __syncthreads();
+
+  float local_denom = 0.0f;
+  if (global_max > -FLT_MAX) {
+    for (int split = tid; split < num_kv_splits; split += blockDim.x) {
+      const float* partial =
+          partial_output + partial_base + split * partial_stride;
+      const float lse = partial[head_size_v];
+      if (lse > -FLT_MAX) {
+        local_denom += expf(lse - global_max);
+      }
+    }
+  }
+  reduce_storage[tid] = local_denom;
+  __syncthreads();
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      reduce_storage[tid] += reduce_storage[tid + offset];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    global_denom = reduce_storage[0];
+  }
+  __syncthreads();
+
+  for (int d = tid; d < head_size_v; d += blockDim.x) {
+    float acc = 0.0f;
+    if (global_denom > 0.0f) {
+      for (int split = 0; split < num_kv_splits; ++split) {
+        const float* partial =
+            partial_output + partial_base + split * partial_stride;
+        const float lse = partial[head_size_v];
+        if (lse > -FLT_MAX) {
+          acc += expf(lse - global_max) * partial[d];
+        }
+      }
+      acc /= global_denom;
+    }
+    output[(req_idx * num_heads + q_head) * head_size_v + d] =
+        byte_v2_float_to_bf16_bits(acc);
+  }
+}
+
+__global__ void byte_v2_wmma_layout_microbench_kernel(
+    const uint16_t* __restrict__ query, const uint16_t* __restrict__ key,
+    const uint16_t* __restrict__ value, uint16_t* __restrict__ output,
+    const int num_tiles, const int repeat_count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int tile_size = kByteV2TileSize;
+  constexpr int head_size = kByteV2MaxHeadSize;
+  const int tile_idx = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (tile_idx >= num_tiles) {
+    return;
+  }
+
+  __shared__ __align__(16) __nv_bfloat16 q_shared[tile_size * head_size];
+  __shared__ __align__(16) __nv_bfloat16 k_shared[head_size * tile_size];
+  __shared__ __align__(16) __nv_bfloat16 v_shared[tile_size * head_size];
+  __shared__ __align__(16) __nv_bfloat16 p_shared[tile_size * tile_size];
+  __shared__ float scores[tile_size * tile_size];
+  __shared__ float pv_shared[tile_size * tile_size];
+
+  const int64_t tile_offset =
+      static_cast<int64_t>(tile_idx) * tile_size * head_size;
+  for (int idx = tid; idx < tile_size * head_size; idx += blockDim.x) {
+    const int row = idx / head_size;
+    const int dim = idx % head_size;
+    q_shared[idx] = byte_v2_bf16_bits_to_wmma(query[tile_offset + idx]);
+    k_shared[dim * tile_size + row] =
+        byte_v2_bf16_bits_to_wmma(key[tile_offset + idx]);
+    v_shared[idx] = byte_v2_bf16_bits_to_wmma(value[tile_offset + idx]);
+  }
+  __syncthreads();
+
+  for (int repeat = 0; repeat < repeat_count; ++repeat) {
+    if (tid < warpSize) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          a_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          b_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+          c_frag;
+      nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+      for (int dim_base = 0; dim_base < head_size; dim_base += tile_size) {
+        nvcuda::wmma::load_matrix_sync(a_frag, q_shared + dim_base,
+                                       head_size);
+        nvcuda::wmma::load_matrix_sync(b_frag,
+                                       k_shared + dim_base * tile_size,
+                                       tile_size);
+        nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      }
+      nvcuda::wmma::store_matrix_sync(scores, c_frag, tile_size,
+                                      nvcuda::wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < tile_size * tile_size; idx += blockDim.x) {
+      p_shared[idx] =
+          byte_v2_bf16_bits_to_wmma(byte_v2_float_to_bf16_bits(scores[idx]));
+    }
+    __syncthreads();
+
+    for (int dim_base = 0; dim_base < head_size; dim_base += tile_size) {
+      if (tid < warpSize) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            p_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            v_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+            pv_frag;
+        nvcuda::wmma::fill_fragment(pv_frag, 0.0f);
+        nvcuda::wmma::load_matrix_sync(p_frag, p_shared, tile_size);
+        nvcuda::wmma::load_matrix_sync(v_frag, v_shared + dim_base, head_size);
+        nvcuda::wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+        nvcuda::wmma::store_matrix_sync(pv_shared, pv_frag, tile_size,
+                                        nvcuda::wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      for (int idx = tid; idx < tile_size * tile_size; idx += blockDim.x) {
+        const int row = idx / tile_size;
+        const int dim = idx % tile_size;
+        output[tile_offset + row * head_size + dim_base + dim] =
+            byte_v2_float_to_bf16_bits(pv_shared[idx]);
+      }
+      __syncthreads();
+    }
+  }
+#endif
+}
+
+__global__ void byte_v2_decode_page_wmma_microbench_kernel(
+    const uint16_t* __restrict__ query, const uint8_t* __restrict__ kv_cache,
+    uint16_t* __restrict__ output, const int num_pages,
+    const int num_kv_heads, const int kv_head, const int page_size_bytes,
+    const int repeat_count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  constexpr int tile_size = kByteV2TileSize;
+  constexpr int head_size = kByteV2MaxHeadSize;
+  constexpr int head_size_v = kByteV2MaxHeadSize;
+  const int page_idx = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (page_idx >= num_pages) {
+    return;
+  }
+
+  __shared__ __align__(16) __nv_bfloat16 q_shared[tile_size * head_size];
+  __shared__ __align__(16) __nv_bfloat16 k_shared[head_size * tile_size];
+  __shared__ __align__(16) __nv_bfloat16 v_shared[tile_size * head_size_v];
+  __shared__ __align__(16) __nv_bfloat16 p_shared[tile_size * tile_size];
+  __shared__ float scores[tile_size * tile_size];
+  __shared__ float pv_shared[tile_size * tile_size];
+
+  const int64_t tile_offset =
+      static_cast<int64_t>(page_idx) * tile_size * head_size;
+  for (int idx = tid; idx < tile_size * head_size; idx += blockDim.x) {
+    q_shared[idx] = byte_v2_bf16_bits_to_wmma(query[tile_offset + idx]);
+  }
+  __syncthreads();
+
+  const uint8_t* page =
+      kv_cache + static_cast<int64_t>(page_idx) * page_size_bytes;
+  const uint8_t page_status = page[kByteV2PageStatusOffset];
+  const int page_valid_rows =
+      static_cast<int>(page[kByteV2PageValidRowsOffset]);
+  if (page_status != kByteV2PageStatusCompressed || page_valid_rows <= 0) {
+    for (int idx = tid; idx < tile_size * head_size_v; idx += blockDim.x) {
+      output[tile_offset + idx] = byte_v2_float_to_bf16_bits(0.0f);
+    }
+    return;
+  }
+
+  const int valid_rows = min(page_valid_rows, tile_size);
+  constexpr int k_dim_tiles = head_size / tile_size;
+  constexpr int v_dim_tiles = head_size_v / tile_size;
+  for (int repeat = 0; repeat < repeat_count; ++repeat) {
+    for (int dim_tile = 0; dim_tile < k_dim_tiles; ++dim_tile) {
+      byte_v2_decode_k_transposed_tile_to_shared_no_fallback(
+          page, k_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+          valid_rows);
+    }
+    for (int dim_tile = 0; dim_tile < v_dim_tiles; ++dim_tile) {
+      byte_v2_decode_v_rowmajor_tile_to_shared_no_fallback(
+          page, v_shared, tid, kv_head, dim_tile, k_dim_tiles, v_dim_tiles,
+          valid_rows, head_size_v);
+    }
+    __syncthreads();
+
+    if (tid < warpSize) {
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          a_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                             __nv_bfloat16, nvcuda::wmma::row_major>
+          b_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+          c_frag;
+      nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+      for (int dim_base = 0; dim_base < head_size; dim_base += tile_size) {
+        nvcuda::wmma::load_matrix_sync(a_frag, q_shared + dim_base,
+                                       head_size);
+        nvcuda::wmma::load_matrix_sync(b_frag,
+                                       k_shared + dim_base * tile_size,
+                                       tile_size);
+        nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+      }
+      nvcuda::wmma::store_matrix_sync(scores, c_frag, tile_size,
+                                      nvcuda::wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < tile_size * tile_size; idx += blockDim.x) {
+      p_shared[idx] =
+          byte_v2_bf16_bits_to_wmma(byte_v2_float_to_bf16_bits(scores[idx]));
+    }
+    __syncthreads();
+
+    for (int dim_base = 0; dim_base < head_size_v; dim_base += tile_size) {
+      if (tid < warpSize) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            p_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                               __nv_bfloat16, nvcuda::wmma::row_major>
+            v_frag;
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float>
+            pv_frag;
+        nvcuda::wmma::fill_fragment(pv_frag, 0.0f);
+        nvcuda::wmma::load_matrix_sync(p_frag, p_shared, tile_size);
+        nvcuda::wmma::load_matrix_sync(v_frag, v_shared + dim_base,
+                                       head_size_v);
+        nvcuda::wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+        nvcuda::wmma::store_matrix_sync(pv_shared, pv_frag, tile_size,
+                                        nvcuda::wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      for (int idx = tid; idx < tile_size * tile_size; idx += blockDim.x) {
+        const int row = idx / tile_size;
+        const int dim = idx % tile_size;
+        output[tile_offset + row * head_size_v + dim_base + dim] =
+            byte_v2_float_to_bf16_bits(pv_shared[idx]);
+      }
+      __syncthreads();
+    }
+  }
+#else
+  (void)num_kv_heads;
+#endif
+}
+
+#else
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_gqa_wmma_kernel(
+    const uint16_t* __restrict__, const uint8_t* __restrict__,
+    const block_table_t* __restrict__, const seq_lens_t* __restrict__,
+    uint16_t* __restrict__, const uint8_t* __restrict__,
+    const int32_t* __restrict__, const int32_t* __restrict__, const float,
+    const int, const int, const int, const int, const int, const int,
+    const int, const int64_t, const int64_t, const int64_t) {}
+
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_gqa_wmma_split_stage1_kernel(
+    const uint16_t* __restrict__, const uint8_t* __restrict__,
+    const block_table_t* __restrict__, const seq_lens_t* __restrict__,
+    float* __restrict__, const uint8_t* __restrict__,
+    const int32_t* __restrict__, const int32_t* __restrict__, const float,
+    const int, const int, const int, const int, const int, const int,
+    const int, const int, const int64_t, const int64_t, const int64_t,
+    const bool) {}
+
+template <typename block_table_t, typename seq_lens_t>
+__global__ void byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel(
+    const uint16_t* __restrict__, const uint8_t* __restrict__,
+    const block_table_t* __restrict__, const seq_lens_t* __restrict__,
+    float* __restrict__, const float, const int, const int, const int,
+    const int, const int, const int64_t, const int64_t, const int64_t) {}
+
+__global__ void byte_v2_paged_decode_attention_split_reduce_kernel(
+    const float* __restrict__, uint16_t* __restrict__, const int, const int,
+    const int, const int) {}
+
+__global__ void byte_v2_paged_decode_attention_split_reduce_parallel_kernel(
+    const float* __restrict__, uint16_t* __restrict__, const int, const int,
+    const int, const int) {}
+
+__global__ void byte_v2_wmma_layout_microbench_kernel(
+    const uint16_t* __restrict__, const uint16_t* __restrict__,
+    const uint16_t* __restrict__, uint16_t* __restrict__, const int,
+    const int) {}
+
+__global__ void byte_v2_decode_page_wmma_microbench_kernel(
+    const uint16_t* __restrict__, const uint8_t* __restrict__,
+    uint16_t* __restrict__, const int, const int, const int, const int,
+    const int) {}
+
+#endif
+
+}  // namespace
+}  // namespace vllm
+
+torch::stable::Tensor byte_v2_reshape_and_cache(
+    torch::stable::Tensor& key,    // [num_tokens, num_kv_heads, head_size]
+    torch::stable::Tensor& value,  // [num_tokens, num_kv_heads, head_size_v]
+    torch::stable::Tensor& kv_cache,      // [num_blocks, page_size_bytes]
+    torch::stable::Tensor& slot_mapping,  // [num_tokens]
+    int64_t block_size, int64_t num_kv_heads, int64_t head_size,
+    int64_t head_size_v, int64_t page_size_bytes,
+    std::optional<torch::stable::Tensor> fallback_pool,
+    std::optional<torch::stable::Tensor> fallback_block_ids,
+    std::optional<torch::stable::Tensor> fallback_next_slot,
+    std::optional<torch::stable::Tensor> fallback_tile_ids,
+    std::optional<torch::stable::Tensor> fallback_tile_next_slot,
+    std::optional<torch::stable::Tensor> deferred_error) {
+  STD_TORCH_CHECK(key.device().is_cuda() && value.device().is_cuda() &&
+                      kv_cache.device().is_cuda() &&
+                      slot_mapping.device().is_cuda(),
+                  "Byte-v2 cache update expects CUDA tensors");
+  STD_TORCH_CHECK(key.device().index() == kv_cache.device().index() &&
+                      value.device().index() == kv_cache.device().index() &&
+                      slot_mapping.device().index() == kv_cache.device().index(),
+                  "Byte-v2 cache update tensors must be on the same GPU");
+  STD_TORCH_CHECK(key.scalar_type() ==
+                      torch::headeronly::ScalarType::BFloat16 &&
+                      value.scalar_type() ==
+                          torch::headeronly::ScalarType::BFloat16,
+                  "Byte-v2 cache update expects BF16 key/value tensors");
+  STD_TORCH_CHECK(kv_cache.scalar_type() ==
+                      torch::headeronly::ScalarType::Byte,
+                  "Byte-v2 kv_cache must use uint8 storage");
+  STD_TORCH_CHECK(slot_mapping.scalar_type() ==
+                      torch::headeronly::ScalarType::Long,
+                  "Byte-v2 slot_mapping must be int64");
+  STD_TORCH_CHECK(kv_cache.is_contiguous() && slot_mapping.is_contiguous(),
+                  "Byte-v2 cache update expects contiguous kv_cache and "
+                  "slot_mapping tensors");
+  STD_TORCH_CHECK(block_size == vllm::kByteV2TileSize,
+                  "Byte-v2 cache update requires block_size=16");
+  STD_TORCH_CHECK(head_size > 0 && head_size <= vllm::kByteV2MaxHeadSize &&
+                      head_size_v > 0 &&
+                          head_size_v <= vllm::kByteV2MaxHeadSize,
+                  "Byte-v2 cache update requires head sizes in [1, 128]");
+  STD_TORCH_CHECK(head_size % vllm::kByteV2TileSize == 0 &&
+                      head_size_v % vllm::kByteV2TileSize == 0,
+                  "Byte-v2 cache update head sizes must be multiples of 16");
+  STD_TORCH_CHECK(key.dim() == 3 && value.dim() == 3 && kv_cache.dim() == 2 &&
+                      slot_mapping.dim() == 1,
+                  "Byte-v2 cache update tensor ranks are invalid");
+  STD_TORCH_CHECK(key.size(1) == num_kv_heads && value.size(1) == num_kv_heads &&
+                      key.size(2) == head_size &&
+                      value.size(2) == head_size_v,
+                  "Byte-v2 cache update tensor shapes do not match metadata");
+
+  const int64_t compressed_payload_bytes =
+      num_kv_heads * (head_size / vllm::kByteV2TileSize +
+                      head_size_v / vllm::kByteV2TileSize) *
+      vllm::kByteV2FastTilePayloadBytes;
+  const int64_t raw_block_bytes =
+      vllm::kByteV2TileSize * num_kv_heads * (head_size + head_size_v) * 2;
+  const int64_t compressed_page_size =
+      vllm::kByteV2PageHeaderBytes + compressed_payload_bytes;
+  const int64_t raw_overlay_page_size =
+      vllm::kByteV2PageHeaderBytes +
+      std::max(compressed_payload_bytes, raw_block_bytes);
+  const int64_t total_tiles64 =
+      num_kv_heads * (head_size / vllm::kByteV2TileSize +
+                      head_size_v / vllm::kByteV2TileSize);
+  const bool compressed_only_pages = page_size_bytes == compressed_page_size;
+  STD_TORCH_CHECK((compressed_only_pages ||
+                   page_size_bytes == raw_overlay_page_size) &&
+                      kv_cache.size(1) == page_size_bytes,
+                  "Byte-v2 cache update page size mismatch");
+  const bool has_sparse_fallback = fallback_pool.has_value() &&
+                                   fallback_block_ids.has_value() &&
+                                   fallback_next_slot.has_value();
+  STD_TORCH_CHECK(
+      has_sparse_fallback ||
+          (!fallback_pool.has_value() && !fallback_block_ids.has_value() &&
+           !fallback_next_slot.has_value()),
+	      "Byte-v2 sparse fallback pool arguments must be provided together");
+  const bool has_tile_fallback = fallback_pool.has_value() &&
+                                 fallback_tile_ids.has_value() &&
+                                 fallback_tile_next_slot.has_value();
+  STD_TORCH_CHECK(
+      has_tile_fallback ||
+          (!fallback_tile_ids.has_value() &&
+           !fallback_tile_next_slot.has_value()),
+      "Byte-v2 tile fallback arguments must be provided together with "
+      "fallback_pool");
+  int64_t fallback_pool_blocks64 = 0;
+  if (has_sparse_fallback) {
+    STD_TORCH_CHECK(fallback_pool->device().is_cuda() &&
+                        fallback_block_ids->device().is_cuda() &&
+                        fallback_next_slot->device().is_cuda(),
+                    "Byte-v2 sparse fallback tensors must be CUDA tensors");
+    STD_TORCH_CHECK(fallback_pool->device().index() == kv_cache.device().index() &&
+                        fallback_block_ids->device().index() ==
+                            kv_cache.device().index() &&
+                        fallback_next_slot->device().index() ==
+                            kv_cache.device().index(),
+                    "Byte-v2 sparse fallback tensors must be on the same GPU");
+    STD_TORCH_CHECK(fallback_pool->scalar_type() ==
+                            torch::headeronly::ScalarType::Byte &&
+                        fallback_block_ids->scalar_type() ==
+                            torch::headeronly::ScalarType::Int &&
+                        fallback_next_slot->scalar_type() ==
+                            torch::headeronly::ScalarType::Int,
+                    "Byte-v2 sparse fallback tensors have invalid dtypes");
+    STD_TORCH_CHECK(fallback_pool->is_contiguous() &&
+                        fallback_block_ids->is_contiguous() &&
+                        fallback_next_slot->is_contiguous(),
+                    "Byte-v2 sparse fallback tensors must be contiguous");
+    STD_TORCH_CHECK(fallback_pool->dim() == 2 &&
+                        fallback_pool->size(1) == raw_block_bytes,
+                    "Byte-v2 fallback_pool must have shape "
+                    "[pool_blocks, raw_block_bytes]");
+    STD_TORCH_CHECK(fallback_block_ids->dim() == 1 &&
+                        fallback_block_ids->size(0) == kv_cache.size(0),
+                    "Byte-v2 fallback_block_ids must have one entry per KV "
+                    "block");
+    STD_TORCH_CHECK(fallback_next_slot->numel() == 1,
+                    "Byte-v2 fallback_next_slot must be a scalar tensor");
+    fallback_pool_blocks64 = fallback_pool->size(0);
+    STD_TORCH_CHECK(fallback_pool_blocks64 <= INT_MAX,
+                    "Byte-v2 fallback pool supports at most INT_MAX slots");
+  }
+  if (has_tile_fallback) {
+    STD_TORCH_CHECK(fallback_tile_ids->device().is_cuda() &&
+                        fallback_tile_next_slot->device().is_cuda(),
+                    "Byte-v2 tile fallback tensors must be CUDA tensors");
+    STD_TORCH_CHECK(fallback_tile_ids->device().index() ==
+                            kv_cache.device().index() &&
+                        fallback_tile_next_slot->device().index() ==
+                            kv_cache.device().index(),
+                    "Byte-v2 tile fallback tensors must be on the same GPU");
+    STD_TORCH_CHECK(fallback_tile_ids->scalar_type() ==
+                            torch::headeronly::ScalarType::Int &&
+                        fallback_tile_next_slot->scalar_type() ==
+                            torch::headeronly::ScalarType::Int,
+                    "Byte-v2 tile fallback tensors have invalid dtypes");
+    STD_TORCH_CHECK(fallback_tile_ids->is_contiguous() &&
+                        fallback_tile_next_slot->is_contiguous(),
+                    "Byte-v2 tile fallback tensors must be contiguous");
+    STD_TORCH_CHECK(fallback_tile_ids->dim() == 2 &&
+                        fallback_tile_ids->size(0) == kv_cache.size(0) &&
+                        fallback_tile_ids->size(1) == total_tiles64,
+                    "Byte-v2 fallback_tile_ids must have shape "
+                    "[num_blocks, total_tiles_per_block]");
+    STD_TORCH_CHECK(fallback_tile_next_slot->numel() == 1,
+                    "Byte-v2 fallback_tile_next_slot must be a scalar tensor");
+  }
+  const bool has_deferred_error = deferred_error.has_value();
+  if (has_deferred_error) {
+    STD_TORCH_CHECK(deferred_error->device().is_cuda(),
+                    "Byte-v2 deferred_error must be a CUDA tensor");
+    STD_TORCH_CHECK(
+        deferred_error->device().index() == kv_cache.device().index(),
+        "Byte-v2 deferred_error must be on the same GPU");
+    STD_TORCH_CHECK(deferred_error->scalar_type() ==
+                        torch::headeronly::ScalarType::Int,
+                    "Byte-v2 deferred_error must use int32 dtype");
+    STD_TORCH_CHECK(deferred_error->is_contiguous(),
+                    "Byte-v2 deferred_error must be contiguous");
+    STD_TORCH_CHECK(deferred_error->numel() >= 4,
+                    "Byte-v2 deferred_error must have at least 4 elements");
+  }
+
+  const int64_t num_tokens64 = slot_mapping.size(0);
+  STD_TORCH_CHECK(key.size(0) >= num_tokens64 && value.size(0) >= num_tokens64,
+                  "Byte-v2 key/value must contain one row per slot");
+  const int64_t num_blocks64 = kv_cache.size(0);
+  STD_TORCH_CHECK(num_tokens64 <= INT_MAX && num_blocks64 <= INT_MAX,
+                  "Byte-v2 native cache update supports at most INT_MAX tokens "
+                  "and blocks");
+  const int num_tokens = static_cast<int>(num_tokens64);
+  const int num_blocks = static_cast<int>(num_blocks64);
+  const int fallback_pool_blocks = static_cast<int>(fallback_pool_blocks64);
+  uint8_t* fallback_pool_ptr =
+      has_sparse_fallback
+          ? reinterpret_cast<uint8_t*>(fallback_pool->mutable_data_ptr())
+          : nullptr;
+  int32_t* fallback_block_ids_ptr =
+      has_sparse_fallback
+          ? reinterpret_cast<int32_t*>(fallback_block_ids->mutable_data_ptr())
+          : nullptr;
+  int32_t* fallback_next_slot_ptr =
+      has_sparse_fallback
+          ? reinterpret_cast<int32_t*>(fallback_next_slot->mutable_data_ptr())
+          : nullptr;
+  int32_t* fallback_tile_ids_ptr =
+      has_tile_fallback
+          ? reinterpret_cast<int32_t*>(fallback_tile_ids->mutable_data_ptr())
+          : nullptr;
+  int32_t* fallback_tile_next_slot_ptr =
+      has_tile_fallback ? reinterpret_cast<int32_t*>(
+                              fallback_tile_next_slot->mutable_data_ptr())
+                        : nullptr;
+  int32_t* deferred_error_ptr =
+      has_deferred_error
+          ? reinterpret_cast<int32_t*>(deferred_error->mutable_data_ptr())
+          : nullptr;
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      key.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(key.get_device_index());
+  int lossy_max_misses_per_tile = 0;
+  if (const char* lossy_env =
+          std::getenv("VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE")) {
+    lossy_max_misses_per_tile = std::max(0, std::atoi(lossy_env));
+  }
+  if (num_tokens == 0) {
+    return torch::stable::empty({0}, torch::headeronly::ScalarType::Long,
+                                std::nullopt, slot_mapping.device());
+  }
+
+  cudaStreamCaptureStatus prefill_capture_status =
+      cudaStreamCaptureStatusNone;
+  BYTE_V2_CUDA_CHECK(cudaStreamIsCapturing(stream, &prefill_capture_status));
+  if (prefill_capture_status == cudaStreamCaptureStatusNone &&
+      compressed_only_pages && has_sparse_fallback &&
+      num_tokens >= vllm::kByteV2TileSize &&
+      (num_tokens % vllm::kByteV2TileSize) == 0 &&
+      total_tiles64 <= vllm::kByteV2MaxTilesPerBlock) {
+    const int num_groups = num_tokens / vllm::kByteV2TileSize;
+    auto validation_error =
+        torch::stable::empty({1}, torch::headeronly::ScalarType::Int,
+                             std::nullopt, kv_cache.device());
+    auto group_block_ids =
+        torch::stable::empty({num_groups}, torch::headeronly::ScalarType::Int,
+                             std::nullopt, kv_cache.device());
+    auto block_claims =
+        torch::stable::empty({num_blocks64}, torch::headeronly::ScalarType::Int,
+                             std::nullopt, kv_cache.device());
+    BYTE_V2_CUDA_CHECK(cudaMemsetAsync(validation_error.mutable_data_ptr(), 0,
+                                       sizeof(int32_t), stream));
+    BYTE_V2_CUDA_CHECK(cudaMemsetAsync(block_claims.mutable_data_ptr(), 0xFF,
+                                       num_blocks64 * sizeof(int32_t),
+                                       stream));
+
+    constexpr int validation_threads = 256;
+    const int validation_blocks =
+        (num_groups + validation_threads - 1) / validation_threads;
+    vllm::byte_v2_validate_prefill_direct_blocks_kernel<<<
+        validation_blocks, validation_threads, 0, stream>>>(
+        reinterpret_cast<const int64_t*>(slot_mapping.const_data_ptr()),
+        reinterpret_cast<int32_t*>(group_block_ids.mutable_data_ptr()),
+        reinterpret_cast<int32_t*>(block_claims.mutable_data_ptr()),
+        reinterpret_cast<int32_t*>(validation_error.mutable_data_ptr()),
+        num_groups, num_blocks);
+    BYTE_V2_CUDA_CHECK(cudaGetLastError());
+
+    const char* skip_validation_sync_env =
+        std::getenv("VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC");
+    const bool skip_validation_sync = skip_validation_sync_env != nullptr &&
+                                      std::atoi(skip_validation_sync_env) != 0;
+    int32_t host_validation_error = 0;
+    if (!skip_validation_sync) {
+      BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+          &host_validation_error, validation_error.const_data_ptr(),
+          sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+      BYTE_V2_CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    if (skip_validation_sync || host_validation_error == 0) {
+      auto direct_result =
+          torch::stable::empty({num_groups + 1},
+                               torch::headeronly::ScalarType::Int,
+                               std::nullopt, kv_cache.device());
+      BYTE_V2_CUDA_CHECK(cudaMemsetAsync(direct_result.mutable_data_ptr(), 0,
+                                         sizeof(int32_t), stream));
+
+      constexpr int update_threads = 256;
+      vllm::byte_v2_prefill_direct_encode_blocks_kernel<<<
+          num_groups, update_threads, 0, stream>>>(
+          reinterpret_cast<const uint8_t*>(key.const_data_ptr()),
+          reinterpret_cast<const uint8_t*>(value.const_data_ptr()),
+          reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+          reinterpret_cast<const int32_t*>(group_block_ids.const_data_ptr()),
+          fallback_pool_ptr, fallback_block_ids_ptr, fallback_next_slot_ptr,
+          fallback_tile_ids_ptr, fallback_tile_next_slot_ptr,
+          reinterpret_cast<int32_t*>(direct_result.mutable_data_ptr()),
+          num_groups, num_blocks, static_cast<int>(num_kv_heads),
+          static_cast<int>(head_size), static_cast<int>(head_size_v),
+          static_cast<int>(page_size_bytes), static_cast<int>(raw_block_bytes),
+          fallback_pool_blocks, lossy_max_misses_per_tile, key.stride(0),
+          key.stride(1), key.stride(2), value.stride(0), value.stride(1),
+          value.stride(2));
+      BYTE_V2_CUDA_CHECK(cudaGetLastError());
+
+      std::vector<int32_t> host_direct_result(num_groups + 1);
+      BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+          host_direct_result.data(), direct_result.const_data_ptr(),
+          host_direct_result.size() * sizeof(int32_t),
+          cudaMemcpyDeviceToHost, stream));
+      int32_t host_fallback_next_slot = 0;
+      BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+          &host_fallback_next_slot, fallback_next_slot->const_data_ptr(),
+          sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+      BYTE_V2_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+      if (host_direct_result[0] != 0) {
+        std::string message =
+            "Byte-v2 native prefill direct cache update failed: ";
+        message +=
+            vllm::byte_v2_cache_update_error_message(host_direct_result[0]);
+        message += " (error_code=" + std::to_string(host_direct_result[0]);
+        message += ", fallback_pool_used=" +
+                   std::to_string(host_fallback_next_slot);
+        message += ", fallback_pool_capacity=" +
+                   std::to_string(fallback_pool_blocks);
+        message += ")";
+        STD_TORCH_CHECK(false, message);
+      }
+
+      std::vector<int64_t> packed_block_ids;
+      packed_block_ids.reserve(num_groups);
+      for (int group_idx = 0; group_idx < num_groups; ++group_idx) {
+        const int32_t block_id = host_direct_result[group_idx + 1];
+        if (block_id >= 0) {
+          packed_block_ids.push_back(static_cast<int64_t>(block_id));
+        }
+      }
+      auto packed = torch::stable::empty(
+          {static_cast<int64_t>(packed_block_ids.size())},
+          torch::headeronly::ScalarType::Long, std::nullopt,
+          slot_mapping.device());
+      if (!packed_block_ids.empty()) {
+        BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+            packed.mutable_data_ptr(), packed_block_ids.data(),
+            packed_block_ids.size() * sizeof(int64_t),
+            cudaMemcpyHostToDevice, stream));
+      }
+      return packed;
+    }
+  }
+
+  const char* batch_decode_append_env =
+      std::getenv("VLLM_BYTE_V2_DECODE_APPEND_BATCH_FASTPATH");
+  const bool force_batch_decode_append =
+      batch_decode_append_env != nullptr &&
+      std::atoi(batch_decode_append_env) != 0;
+  const bool use_decode_append_fast_path =
+      compressed_only_pages && has_sparse_fallback &&
+      (num_tokens == 1 ||
+       (num_tokens > 1 &&
+        (prefill_capture_status != cudaStreamCaptureStatusNone ||
+         force_batch_decode_append)));
+  if (use_decode_append_fast_path) {
+    auto fast_result =
+        torch::stable::empty({num_tokens64 + 2},
+                             torch::headeronly::ScalarType::Int,
+                             std::nullopt, kv_cache.device());
+    constexpr int update_threads = 256;
+    if (num_tokens > 1) {
+      const int result_init_blocks =
+          (num_tokens + 1 + update_threads - 1) / update_threads;
+      vllm::byte_v2_init_decode_append_result_kernel<<<
+          result_init_blocks, update_threads, 0, stream>>>(
+          reinterpret_cast<int32_t*>(fast_result.mutable_data_ptr()),
+          num_tokens);
+    }
+    vllm::byte_v2_decode_append_cache_kernel<<<num_tokens, update_threads, 0,
+                                                stream>>>(
+        reinterpret_cast<const uint8_t*>(key.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(value.const_data_ptr()),
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        reinterpret_cast<const int64_t*>(slot_mapping.const_data_ptr()),
+        fallback_pool_ptr, fallback_block_ids_ptr, fallback_next_slot_ptr,
+        fallback_tile_ids_ptr, fallback_tile_next_slot_ptr,
+        reinterpret_cast<int32_t*>(fast_result.mutable_data_ptr()),
+        num_tokens, num_blocks, static_cast<int>(num_kv_heads),
+        static_cast<int>(head_size), static_cast<int>(head_size_v),
+        static_cast<int>(page_size_bytes), static_cast<int>(raw_block_bytes),
+        fallback_pool_blocks, lossy_max_misses_per_tile, key.stride(0),
+        key.stride(1), key.stride(2), value.stride(0), value.stride(1),
+        value.stride(2));
+    BYTE_V2_CUDA_CHECK(cudaGetLastError());
+
+    if (has_deferred_error) {
+      vllm::byte_v2_record_deferred_cache_update_error_kernel<<<1, 1, 0,
+                                                               stream>>>(
+          reinterpret_cast<const int32_t*>(fast_result.const_data_ptr()),
+          fallback_next_slot_ptr, deferred_error_ptr, fallback_pool_blocks);
+      BYTE_V2_CUDA_CHECK(cudaGetLastError());
+      return torch::stable::empty({0}, torch::headeronly::ScalarType::Long,
+                                  std::nullopt, slot_mapping.device());
+    }
+
+    const char* skip_decode_append_sync_env =
+        std::getenv("VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC");
+    const bool skip_decode_append_sync =
+        skip_decode_append_sync_env != nullptr &&
+        std::atoi(skip_decode_append_sync_env) != 0;
+    if (skip_decode_append_sync) {
+      return torch::stable::empty({0}, torch::headeronly::ScalarType::Long,
+                                  std::nullopt, slot_mapping.device());
+    }
+
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    BYTE_V2_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+      return torch::stable::empty({0}, torch::headeronly::ScalarType::Long,
+                                  std::nullopt, slot_mapping.device());
+    }
+
+    std::vector<int32_t> host_result(num_tokens + 2);
+    BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+        host_result.data(), fast_result.const_data_ptr(),
+        host_result.size() * sizeof(int32_t),
+        cudaMemcpyDeviceToHost, stream));
+    int32_t host_fallback_next_slot = 0;
+    BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+        &host_fallback_next_slot, fallback_next_slot->const_data_ptr(),
+        sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    BYTE_V2_CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (host_result[0] != 0) {
+      std::string message = "Byte-v2 native decode cache append failed: ";
+      message += vllm::byte_v2_cache_update_error_message(host_result[0]);
+      message += " (error_code=" + std::to_string(host_result[0]);
+      message += ", detail=" + std::to_string(host_result[1]);
+      message +=
+          ", fallback_pool_used=" + std::to_string(host_fallback_next_slot);
+      message +=
+          ", fallback_pool_capacity=" + std::to_string(fallback_pool_blocks);
+      message += ")";
+      STD_TORCH_CHECK(false, message);
+    }
+
+    std::vector<int64_t> packed_block_ids;
+    packed_block_ids.reserve(num_tokens);
+    for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+      const int32_t block_id = host_result[2 + token_idx];
+      if (block_id >= 0) {
+        packed_block_ids.push_back(static_cast<int64_t>(block_id));
+      }
+    }
+    if (packed_block_ids.empty()) {
+      return torch::stable::empty({0}, torch::headeronly::ScalarType::Long,
+                                  std::nullopt, slot_mapping.device());
+    }
+
+    auto packed = torch::stable::empty(
+        {static_cast<int64_t>(packed_block_ids.size())},
+        torch::headeronly::ScalarType::Long, std::nullopt,
+        slot_mapping.device());
+    BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+        packed.mutable_data_ptr(), packed_block_ids.data(),
+        packed_block_ids.size() * sizeof(int64_t),
+        cudaMemcpyHostToDevice, stream));
+    return packed;
+  }
+
+  auto valid_rows =
+      torch::stable::empty({num_blocks64}, torch::headeronly::ScalarType::Int,
+                           std::nullopt, kv_cache.device());
+  auto touched_flags =
+      torch::stable::empty({num_blocks64}, torch::headeronly::ScalarType::Byte,
+                           std::nullopt, kv_cache.device());
+  auto packed_flags =
+      torch::stable::empty({num_blocks64}, torch::headeronly::ScalarType::Byte,
+                           std::nullopt, kv_cache.device());
+  auto overwrite_flags =
+      torch::stable::empty({num_blocks64}, torch::headeronly::ScalarType::Byte,
+                           std::nullopt, kv_cache.device());
+  auto error =
+      torch::stable::empty({1}, torch::headeronly::ScalarType::Int,
+                           std::nullopt, kv_cache.device());
+  auto raw_staging = torch::stable::empty(
+      {num_tokens64 * raw_block_bytes}, torch::headeronly::ScalarType::Byte,
+      std::nullopt, kv_cache.device());
+  auto block_token_indices =
+      torch::stable::empty({num_blocks64 * vllm::kByteV2TileSize},
+                           torch::headeronly::ScalarType::Int, std::nullopt,
+                           kv_cache.device());
+  BYTE_V2_CUDA_CHECK(cudaMemsetAsync(error.mutable_data_ptr(), 0, sizeof(int32_t),
+                                 stream));
+  BYTE_V2_CUDA_CHECK(cudaMemsetAsync(block_token_indices.mutable_data_ptr(), 0xFF,
+                                 num_blocks64 * vllm::kByteV2TileSize *
+                                     sizeof(int32_t),
+                                 stream));
+  BYTE_V2_CUDA_CHECK(cudaMemsetAsync(overwrite_flags.mutable_data_ptr(), 0,
+                                 num_blocks64 * sizeof(uint8_t), stream));
+
+  constexpr int init_threads = 256;
+  const int init_blocks = (num_blocks + init_threads - 1) / init_threads;
+  vllm::byte_v2_init_cache_update_kernel<<<init_blocks, init_threads, 0,
+                                           stream>>>(
+      reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+      reinterpret_cast<int32_t*>(valid_rows.mutable_data_ptr()),
+      reinterpret_cast<uint8_t*>(touched_flags.mutable_data_ptr()),
+      reinterpret_cast<uint8_t*>(packed_flags.mutable_data_ptr()),
+      reinterpret_cast<int32_t*>(error.mutable_data_ptr()), num_blocks,
+      static_cast<int>(page_size_bytes));
+
+  constexpr int update_threads = 256;
+  if (compressed_only_pages) {
+    const int mark_blocks = (num_tokens + update_threads - 1) / update_threads;
+    vllm::byte_v2_mark_touched_tokens_kernel<<<mark_blocks, update_threads, 0,
+                                               stream>>>(
+        reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+        reinterpret_cast<const int64_t*>(slot_mapping.const_data_ptr()),
+        reinterpret_cast<int32_t*>(valid_rows.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(touched_flags.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(overwrite_flags.mutable_data_ptr()),
+        reinterpret_cast<int32_t*>(block_token_indices.mutable_data_ptr()),
+        reinterpret_cast<int32_t*>(error.mutable_data_ptr()), num_tokens,
+        num_blocks, static_cast<int>(page_size_bytes));
+
+    vllm::byte_v2_compress_touched_blocks_kernel<<<num_blocks, update_threads, 0,
+                                                   stream>>>(
+        reinterpret_cast<const uint8_t*>(key.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(value.const_data_ptr()),
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        reinterpret_cast<const int32_t*>(block_token_indices.const_data_ptr()),
+        reinterpret_cast<const int32_t*>(valid_rows.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(touched_flags.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(overwrite_flags.const_data_ptr()),
+        reinterpret_cast<uint8_t*>(packed_flags.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()),
+        fallback_pool_ptr, fallback_block_ids_ptr, fallback_next_slot_ptr,
+        fallback_tile_ids_ptr, fallback_tile_next_slot_ptr,
+        reinterpret_cast<int32_t*>(error.mutable_data_ptr()), num_tokens,
+        num_blocks, static_cast<int>(num_kv_heads), static_cast<int>(head_size),
+        static_cast<int>(head_size_v), static_cast<int>(page_size_bytes),
+        static_cast<int>(raw_block_bytes), fallback_pool_blocks,
+        lossy_max_misses_per_tile, key.stride(0), key.stride(1), key.stride(2),
+        value.stride(0), value.stride(1), value.stride(2));
+  } else {
+    vllm::byte_v2_write_raw_tokens_kernel<<<num_tokens, update_threads, 0,
+                                            stream>>>(
+        reinterpret_cast<const uint8_t*>(key.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(value.const_data_ptr()),
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        reinterpret_cast<const int64_t*>(slot_mapping.const_data_ptr()),
+        reinterpret_cast<int32_t*>(valid_rows.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(touched_flags.mutable_data_ptr()),
+        reinterpret_cast<int32_t*>(error.mutable_data_ptr()), num_tokens,
+        num_blocks, static_cast<int>(num_kv_heads), static_cast<int>(head_size),
+        static_cast<int>(head_size_v), static_cast<int>(page_size_bytes),
+        key.stride(0), key.stride(1), key.stride(2), value.stride(0),
+        value.stride(1), value.stride(2));
+
+    vllm::byte_v2_finalize_partial_pages_kernel<<<init_blocks, init_threads, 0,
+                                                  stream>>>(
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        reinterpret_cast<const int32_t*>(valid_rows.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(touched_flags.const_data_ptr()),
+        num_blocks, static_cast<int>(page_size_bytes));
+
+    vllm::byte_v2_compress_full_pages_kernel<<<num_tokens, update_threads, 0,
+                                               stream>>>(
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        reinterpret_cast<const int64_t*>(slot_mapping.const_data_ptr()),
+        reinterpret_cast<const int32_t*>(valid_rows.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(touched_flags.const_data_ptr()),
+        reinterpret_cast<uint8_t*>(packed_flags.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()), num_tokens,
+        num_blocks, static_cast<int>(num_kv_heads), static_cast<int>(head_size),
+        static_cast<int>(head_size_v), static_cast<int>(page_size_bytes),
+        static_cast<int>(raw_block_bytes), lossy_max_misses_per_tile);
+  }
+  BYTE_V2_CUDA_CHECK(cudaGetLastError());
+
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  BYTE_V2_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+  if (capture_status != cudaStreamCaptureStatusNone) {
+    return torch::stable::empty({0}, torch::headeronly::ScalarType::Long,
+                                std::nullopt, slot_mapping.device());
+  }
+
+  int32_t host_error = 0;
+  BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(&host_error, error.const_data_ptr(),
+                                 sizeof(int32_t), cudaMemcpyDeviceToHost,
+                                 stream));
+  int32_t host_fallback_next_slot = 0;
+  if (has_sparse_fallback) {
+    BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(
+        &host_fallback_next_slot, fallback_next_slot->const_data_ptr(),
+        sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+  }
+  std::vector<uint8_t> host_packed_flags(num_blocks);
+  BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(host_packed_flags.data(),
+                                 packed_flags.const_data_ptr(), num_blocks,
+                                 cudaMemcpyDeviceToHost, stream));
+  BYTE_V2_CUDA_CHECK(cudaStreamSynchronize(stream));
+  if (host_error != 0) {
+    std::string message = "Byte-v2 native cache update failed: ";
+    message += vllm::byte_v2_cache_update_error_message(host_error);
+    message += " (error_code=" + std::to_string(host_error);
+    if (has_sparse_fallback) {
+      message += ", fallback_pool_used=" +
+                 std::to_string(host_fallback_next_slot);
+      message += ", fallback_pool_capacity=" +
+                 std::to_string(fallback_pool_blocks);
+    }
+    message += ")";
+    STD_TORCH_CHECK(false, message);
+  }
+
+  std::vector<int64_t> packed_block_ids;
+  packed_block_ids.reserve(num_blocks);
+  for (int block_id = 0; block_id < num_blocks; ++block_id) {
+    if (host_packed_flags[block_id] != 0) {
+      packed_block_ids.push_back(block_id);
+    }
+  }
+
+  auto packed = torch::stable::empty(
+      {static_cast<int64_t>(packed_block_ids.size())},
+      torch::headeronly::ScalarType::Long, std::nullopt, slot_mapping.device());
+  if (!packed_block_ids.empty()) {
+    BYTE_V2_CUDA_CHECK(cudaMemcpyAsync(packed.mutable_data_ptr(),
+                                   packed_block_ids.data(),
+                                   packed_block_ids.size() * sizeof(int64_t),
+                                   cudaMemcpyHostToDevice, stream));
+  }
+  return packed;
+}
+
+torch::stable::Tensor byte_v2_paged_decode_attention(
+    torch::stable::Tensor& query,     // [num_decode_tokens, num_heads, D]
+    torch::stable::Tensor& kv_cache,  // [num_blocks, page_size_bytes]
+    torch::stable::Tensor& block_table,
+    torch::stable::Tensor& seq_lens, double scale, int64_t block_size,
+    int64_t num_kv_heads, int64_t head_size, int64_t head_size_v,
+    int64_t page_size_bytes,
+    std::optional<torch::stable::Tensor> fallback_pool,
+    std::optional<torch::stable::Tensor> fallback_block_ids,
+    std::optional<torch::stable::Tensor> fallback_tile_ids,
+    std::optional<torch::stable::Tensor> partial_workspace) {
+  STD_TORCH_CHECK(query.device().is_cuda() && kv_cache.device().is_cuda() &&
+                      block_table.device().is_cuda() &&
+                      seq_lens.device().is_cuda(),
+                  "Byte-v2 paged decode expects CUDA tensors");
+  STD_TORCH_CHECK(query.device().index() == kv_cache.device().index() &&
+                      block_table.device().index() == kv_cache.device().index() &&
+                      seq_lens.device().index() == kv_cache.device().index(),
+                  "Byte-v2 paged decode tensors must be on the same GPU");
+  STD_TORCH_CHECK(query.scalar_type() ==
+                      torch::headeronly::ScalarType::BFloat16,
+                  "Byte-v2 paged decode expects BF16 query");
+  STD_TORCH_CHECK(kv_cache.scalar_type() ==
+                      torch::headeronly::ScalarType::Byte,
+                  "Byte-v2 kv_cache must use uint8 storage");
+  STD_TORCH_CHECK(block_table.scalar_type() ==
+                          torch::headeronly::ScalarType::Int ||
+                      block_table.scalar_type() ==
+                          torch::headeronly::ScalarType::Long,
+                  "Byte-v2 block_table must be int32 or int64");
+  STD_TORCH_CHECK(seq_lens.scalar_type() ==
+                          torch::headeronly::ScalarType::Int ||
+                      seq_lens.scalar_type() ==
+                          torch::headeronly::ScalarType::Long,
+                  "Byte-v2 seq_lens must be int32 or int64");
+  STD_TORCH_CHECK(query.is_contiguous() && kv_cache.is_contiguous(),
+                  "Byte-v2 paged decode expects contiguous query/kv_cache");
+  STD_TORCH_CHECK(block_size == vllm::kByteV2TileSize,
+                  "Byte-v2 paged decode requires block_size=16");
+  STD_TORCH_CHECK(head_size > 0 && head_size <= vllm::kByteV2MaxHeadSize &&
+                      head_size_v > 0 &&
+                          head_size_v <= vllm::kByteV2MaxHeadSize,
+                  "Byte-v2 paged decode requires head sizes in [1, 128]");
+  STD_TORCH_CHECK(head_size % vllm::kByteV2TileSize == 0 &&
+                      head_size_v % vllm::kByteV2TileSize == 0,
+                  "Byte-v2 paged decode head sizes must be multiples of 16");
+  STD_TORCH_CHECK(query.dim() == 3 && kv_cache.dim() == 2 &&
+                      block_table.dim() == 2 && seq_lens.dim() == 1,
+                  "Byte-v2 paged decode tensor ranks are invalid");
+  STD_TORCH_CHECK(query.size(2) == head_size &&
+                      query.size(1) % num_kv_heads == 0,
+                  "Byte-v2 paged decode query shape does not match metadata");
+
+  const int64_t compressed_payload_bytes =
+      num_kv_heads * (head_size / vllm::kByteV2TileSize +
+                      head_size_v / vllm::kByteV2TileSize) *
+      vllm::kByteV2FastTilePayloadBytes;
+  const int64_t raw_block_bytes =
+      vllm::kByteV2TileSize * num_kv_heads * (head_size + head_size_v) * 2;
+  const int64_t compressed_page_size =
+      vllm::kByteV2PageHeaderBytes + compressed_payload_bytes;
+  const int64_t raw_overlay_page_size =
+      vllm::kByteV2PageHeaderBytes +
+      std::max(compressed_payload_bytes, raw_block_bytes);
+  const int64_t total_tiles64 =
+      num_kv_heads * (head_size / vllm::kByteV2TileSize +
+                      head_size_v / vllm::kByteV2TileSize);
+  STD_TORCH_CHECK((page_size_bytes == compressed_page_size ||
+                   page_size_bytes == raw_overlay_page_size) &&
+                      kv_cache.size(1) == page_size_bytes,
+                  "Byte-v2 paged decode page size mismatch");
+  const bool has_sparse_fallback =
+      fallback_pool.has_value() && fallback_block_ids.has_value();
+  STD_TORCH_CHECK(
+      has_sparse_fallback ||
+          (!fallback_pool.has_value() && !fallback_block_ids.has_value() &&
+           !fallback_tile_ids.has_value()),
+      "Byte-v2 sparse fallback decode arguments must be provided together");
+  const bool has_tile_fallback =
+      fallback_pool.has_value() && fallback_tile_ids.has_value();
+  if (has_sparse_fallback) {
+    STD_TORCH_CHECK(fallback_pool->device().is_cuda() &&
+                        fallback_block_ids->device().is_cuda(),
+                    "Byte-v2 sparse fallback decode tensors must be CUDA "
+                    "tensors");
+    STD_TORCH_CHECK(fallback_pool->device().index() ==
+                            kv_cache.device().index() &&
+                        fallback_block_ids->device().index() ==
+                            kv_cache.device().index(),
+                    "Byte-v2 sparse fallback decode tensors must be on the "
+                    "same GPU");
+    STD_TORCH_CHECK(fallback_pool->scalar_type() ==
+                            torch::headeronly::ScalarType::Byte &&
+                        fallback_block_ids->scalar_type() ==
+                            torch::headeronly::ScalarType::Int,
+                    "Byte-v2 sparse fallback decode tensors have invalid "
+                    "dtypes");
+    STD_TORCH_CHECK(fallback_pool->is_contiguous() &&
+                        fallback_block_ids->is_contiguous(),
+                    "Byte-v2 sparse fallback decode tensors must be "
+                    "contiguous");
+    STD_TORCH_CHECK(fallback_pool->dim() == 2 &&
+                        fallback_pool->size(1) == raw_block_bytes,
+                    "Byte-v2 fallback_pool must have shape "
+                    "[pool_blocks, raw_block_bytes]");
+	    STD_TORCH_CHECK(fallback_block_ids->dim() == 1 &&
+                        fallback_block_ids->size(0) == kv_cache.size(0),
+                    "Byte-v2 fallback_block_ids must have one entry per KV "
+                    "block");
+    if (has_tile_fallback) {
+      STD_TORCH_CHECK(fallback_tile_ids->device().is_cuda(),
+                      "Byte-v2 tile fallback decode tensor must be CUDA");
+      STD_TORCH_CHECK(fallback_tile_ids->device().index() ==
+                          kv_cache.device().index(),
+                      "Byte-v2 tile fallback decode tensor must be on the "
+                      "same GPU");
+      STD_TORCH_CHECK(fallback_tile_ids->scalar_type() ==
+                          torch::headeronly::ScalarType::Int,
+                      "Byte-v2 tile fallback decode tensor must be int32");
+      STD_TORCH_CHECK(fallback_tile_ids->is_contiguous(),
+                      "Byte-v2 tile fallback decode tensor must be contiguous");
+      STD_TORCH_CHECK(fallback_tile_ids->dim() == 2 &&
+                          fallback_tile_ids->size(0) == kv_cache.size(0) &&
+                          fallback_tile_ids->size(1) == total_tiles64,
+                      "Byte-v2 fallback_tile_ids must have shape "
+                      "[num_blocks, total_tiles_per_block]");
+    }
+  }
+
+  const int64_t num_decode_tokens64 = query.size(0);
+  const int64_t num_heads64 = query.size(1);
+  STD_TORCH_CHECK(num_decode_tokens64 <= INT_MAX && num_heads64 <= INT_MAX,
+                  "Byte-v2 native paged decode supports at most INT_MAX "
+                  "decode tokens and heads");
+  auto output =
+      torch::stable::empty({num_decode_tokens64, num_heads64, head_size_v},
+                           query.scalar_type(), std::nullopt, query.device());
+  if (num_decode_tokens64 == 0) {
+    return output;
+  }
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      query.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(query.get_device_index());
+  const int max_head_size = std::max(head_size, head_size_v);
+  const dim3 block(max_head_size <= 32 ? 32 : (max_head_size <= 64 ? 64 : 128));
+  const uint8_t* fallback_pool_ptr =
+      has_sparse_fallback
+          ? reinterpret_cast<const uint8_t*>(fallback_pool->const_data_ptr())
+          : nullptr;
+  const int32_t* fallback_block_ids_ptr =
+      has_sparse_fallback ? reinterpret_cast<const int32_t*>(
+                                fallback_block_ids->const_data_ptr())
+                          : nullptr;
+  const int32_t* fallback_tile_ids_ptr =
+      has_tile_fallback ? reinterpret_cast<const int32_t*>(
+                              fallback_tile_ids->const_data_ptr())
+                        : nullptr;
+  const int q_per_kv = static_cast<int>(num_heads64 / num_kv_heads);
+  bool device_supports_bf16_wmma = false;
+#ifndef USE_ROCM
+  cudaDeviceProp device_prop;
+  BYTE_V2_CUDA_CHECK(
+      cudaGetDeviceProperties(&device_prop, query.get_device_index()));
+  device_supports_bf16_wmma = device_prop.major >= 8;
+#endif
+  const bool use_gqa_wmma_kernel =
+      device_supports_bf16_wmma && q_per_kv > 1 &&
+      q_per_kv <= vllm::kByteV2MaxQPerKv;
+  const bool use_gqa_shared_kernel =
+      q_per_kv > 1 && q_per_kv <= vllm::kByteV2MaxQPerKv;
+  const int num_logical_pages = static_cast<int>(block_table.size(1));
+  const int active_head_groups =
+      static_cast<int>(num_decode_tokens64) * static_cast<int>(num_kv_heads);
+  int max_split_k = 1;
+  if (num_logical_pages >= 256) {
+    max_split_k = 128;
+  } else if (num_logical_pages >= 128) {
+    max_split_k = 64;
+  } else if (num_logical_pages >= 96) {
+    max_split_k = 32;
+  } else if (num_logical_pages >= 16) {
+    max_split_k = 16;
+  }
+  if (active_head_groups >= 64) {
+    max_split_k = std::min(max_split_k, 8);
+  } else if (active_head_groups >= 32) {
+    max_split_k = std::min(max_split_k, 16);
+  }
+  if (const char* split_env = std::getenv("VLLM_BYTE_V2_DECODE_SPLIT_K")) {
+    const int requested_split_k = std::atoi(split_env);
+    if (requested_split_k > 0) {
+      max_split_k = std::max(1, requested_split_k);
+    }
+  }
+  int num_kv_splits = 1;
+  if (use_gqa_wmma_kernel && max_split_k > 1 && num_logical_pages >= 16) {
+    num_kv_splits = std::min(max_split_k, num_logical_pages);
+  }
+  const bool use_gqa_wmma_split_kernel = num_kv_splits > 1;
+  bool use_decode_page_fastpath = false;
+  if (const char* page_fastpath_env =
+          std::getenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH")) {
+    use_decode_page_fastpath = std::atoi(page_fastpath_env) != 0;
+  }
+  bool use_decode_tile_fastpath = true;
+  if (const char* tile_fastpath_env =
+          std::getenv("VLLM_BYTE_V2_DECODE_TILE_FASTPATH")) {
+    use_decode_tile_fastpath = std::atoi(tile_fastpath_env) != 0;
+  }
+  bool use_cute_stage1_env = false;
+  if (const char* cute_stage1_env =
+          std::getenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1")) {
+    use_cute_stage1_env = std::atoi(cute_stage1_env) != 0;
+  }
+  const bool use_cute_stage1 =
+      use_cute_stage1_env && use_gqa_wmma_split_kernel &&
+      use_decode_page_fastpath && !has_sparse_fallback &&
+      page_size_bytes == compressed_page_size && head_size == 128 &&
+      head_size_v == 128 && num_kv_heads == 8 && num_heads64 == 32 &&
+      q_per_kv == 4;
+  bool use_parallel_reduce = num_kv_splits >= 64;
+  if (const char* parallel_reduce_env =
+          std::getenv("VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE")) {
+    use_parallel_reduce = std::atoi(parallel_reduce_env) != 0;
+  }
+  const int64_t partial_stride = head_size_v + 1;
+  const int64_t partial_numel =
+      use_gqa_wmma_split_kernel
+          ? num_decode_tokens64 * num_heads64 * num_kv_splits * partial_stride
+          : 0;
+  std::optional<torch::stable::Tensor> owned_split_partial_output;
+  torch::stable::Tensor* split_partial_output = nullptr;
+  if (use_gqa_wmma_split_kernel && partial_workspace.has_value()) {
+    auto& workspace = partial_workspace.value();
+    STD_TORCH_CHECK(workspace.device().is_cuda(),
+                    "Byte-v2 partial_workspace must be a CUDA tensor");
+    STD_TORCH_CHECK(workspace.device().index() == query.device().index(),
+                    "Byte-v2 partial_workspace must be on the same GPU");
+    STD_TORCH_CHECK(
+        workspace.scalar_type() == torch::headeronly::ScalarType::Float,
+        "Byte-v2 partial_workspace must be float32");
+    STD_TORCH_CHECK(workspace.is_contiguous(),
+                    "Byte-v2 partial_workspace must be contiguous");
+    STD_TORCH_CHECK(workspace.dim() == 1 &&
+                        workspace.size(0) >= partial_numel,
+                    "Byte-v2 partial_workspace is too small");
+    split_partial_output = &workspace;
+  } else {
+    owned_split_partial_output.emplace(torch::stable::empty(
+        {partial_numel}, torch::headeronly::ScalarType::Float, std::nullopt,
+        query.device()));
+    split_partial_output = &owned_split_partial_output.value();
+  }
+#define CALL_BYTE_V2_DECODE(BLOCK_T, SEQ_T)                                  \
+  do {                                                                        \
+    if (use_gqa_wmma_split_kernel) {                                          \
+      const dim3 split_grid(static_cast<unsigned int>(num_decode_tokens64),   \
+                            static_cast<unsigned int>(num_kv_heads),          \
+                            static_cast<unsigned int>(num_kv_splits));        \
+      if (use_cute_stage1) {                                                  \
+        vllm::byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel<   \
+            BLOCK_T, SEQ_T>                                                   \
+            <<<split_grid, block, 0, stream>>>(                               \
+                reinterpret_cast<const uint16_t*>(query.const_data_ptr()),    \
+                reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),  \
+                reinterpret_cast<const BLOCK_T*>(                             \
+                    block_table.const_data_ptr()),                            \
+                reinterpret_cast<const SEQ_T*>(seq_lens.const_data_ptr()),    \
+                reinterpret_cast<float*>(                                     \
+                    split_partial_output->mutable_data_ptr()),                \
+                static_cast<float>(scale),                                    \
+                static_cast<int>(num_decode_tokens64),                        \
+                static_cast<int>(num_heads64),                                \
+                static_cast<int>(num_kv_heads),                               \
+                static_cast<int>(page_size_bytes), num_kv_splits,             \
+                block_table.stride(0), block_table.stride(1),                 \
+                seq_lens.stride(0));                                          \
+      } else {                                                                \
+        vllm::byte_v2_paged_decode_attention_gqa_wmma_split_stage1_kernel<   \
+            BLOCK_T, SEQ_T>                                                   \
+            <<<split_grid, block, 0, stream>>>(                               \
+                reinterpret_cast<const uint16_t*>(query.const_data_ptr()),    \
+                reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),  \
+                reinterpret_cast<const BLOCK_T*>(                             \
+                    block_table.const_data_ptr()),                            \
+                reinterpret_cast<const SEQ_T*>(seq_lens.const_data_ptr()),    \
+                reinterpret_cast<float*>(                                     \
+                    split_partial_output->mutable_data_ptr()),                \
+                fallback_pool_ptr, fallback_block_ids_ptr,                    \
+                fallback_tile_ids_ptr,                                        \
+                static_cast<float>(scale),                                    \
+                static_cast<int>(num_decode_tokens64),                        \
+                static_cast<int>(num_heads64),                                \
+                static_cast<int>(num_kv_heads),                               \
+                static_cast<int>(head_size), static_cast<int>(head_size_v),   \
+                static_cast<int>(page_size_bytes),                            \
+                static_cast<int>(raw_block_bytes), num_kv_splits,             \
+                block_table.stride(0), block_table.stride(1),                 \
+                seq_lens.stride(0), use_decode_page_fastpath,                 \
+                use_decode_tile_fastpath);                                    \
+      }                                                                       \
+      const dim3 reduce_grid(static_cast<unsigned int>(num_decode_tokens64),  \
+                             static_cast<unsigned int>(num_heads64));         \
+      if (use_parallel_reduce) {                                              \
+        vllm::byte_v2_paged_decode_attention_split_reduce_parallel_kernel     \
+            <<<reduce_grid, block, 0, stream>>>(                              \
+                reinterpret_cast<const float*>(                               \
+                    split_partial_output->const_data_ptr()),                  \
+                reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),       \
+                static_cast<int>(num_decode_tokens64),                        \
+                static_cast<int>(num_heads64), static_cast<int>(head_size_v), \
+                num_kv_splits);                                               \
+      } else {                                                                \
+        vllm::byte_v2_paged_decode_attention_split_reduce_kernel              \
+            <<<reduce_grid, block, 0, stream>>>(                              \
+                reinterpret_cast<const float*>(                               \
+                    split_partial_output->const_data_ptr()),                  \
+                reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),       \
+                static_cast<int>(num_decode_tokens64),                        \
+                static_cast<int>(num_heads64), static_cast<int>(head_size_v), \
+                num_kv_splits);                                               \
+      }                                                                       \
+    } else if (use_gqa_wmma_kernel) {                                         \
+      const dim3 gqa_grid(static_cast<unsigned int>(num_decode_tokens64),     \
+                          static_cast<unsigned int>(num_kv_heads));           \
+      vllm::byte_v2_paged_decode_attention_gqa_wmma_kernel<BLOCK_T, SEQ_T>   \
+          <<<gqa_grid, block, 0, stream>>>(                                   \
+              reinterpret_cast<const uint16_t*>(query.const_data_ptr()),      \
+              reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),    \
+              reinterpret_cast<const BLOCK_T*>(block_table.const_data_ptr()), \
+              reinterpret_cast<const SEQ_T*>(seq_lens.const_data_ptr()),      \
+              reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),         \
+              fallback_pool_ptr, fallback_block_ids_ptr,                      \
+              fallback_tile_ids_ptr,                                          \
+              static_cast<float>(scale),                                      \
+              static_cast<int>(num_decode_tokens64),                          \
+              static_cast<int>(num_heads64), static_cast<int>(num_kv_heads),  \
+              static_cast<int>(head_size), static_cast<int>(head_size_v),     \
+              static_cast<int>(page_size_bytes),                              \
+              static_cast<int>(raw_block_bytes), block_table.stride(0),       \
+              block_table.stride(1), seq_lens.stride(0));                     \
+    } else if (use_gqa_shared_kernel) {                                       \
+      const dim3 gqa_grid(static_cast<unsigned int>(num_decode_tokens64),     \
+                          static_cast<unsigned int>(num_kv_heads));           \
+      vllm::byte_v2_paged_decode_attention_gqa_shared_kernel<BLOCK_T, SEQ_T> \
+          <<<gqa_grid, block, 0, stream>>>(                                   \
+              reinterpret_cast<const uint16_t*>(query.const_data_ptr()),      \
+              reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),    \
+              reinterpret_cast<const BLOCK_T*>(block_table.const_data_ptr()), \
+              reinterpret_cast<const SEQ_T*>(seq_lens.const_data_ptr()),      \
+              reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),         \
+              fallback_pool_ptr, fallback_block_ids_ptr,                      \
+              fallback_tile_ids_ptr,                                          \
+              static_cast<float>(scale),                                      \
+              static_cast<int>(num_decode_tokens64),                          \
+              static_cast<int>(num_heads64), static_cast<int>(num_kv_heads),  \
+              static_cast<int>(head_size), static_cast<int>(head_size_v),     \
+              static_cast<int>(page_size_bytes),                              \
+              static_cast<int>(raw_block_bytes), block_table.stride(0),       \
+              block_table.stride(1), seq_lens.stride(0));                     \
+    } else {                                                                  \
+      const dim3 grid(static_cast<unsigned int>(num_decode_tokens64),         \
+                      static_cast<unsigned int>(num_heads64));                \
+      vllm::byte_v2_paged_decode_attention_kernel<BLOCK_T, SEQ_T>            \
+          <<<grid, block, 0, stream>>>(                                       \
+              reinterpret_cast<const uint16_t*>(query.const_data_ptr()),      \
+              reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),    \
+              reinterpret_cast<const BLOCK_T*>(block_table.const_data_ptr()), \
+              reinterpret_cast<const SEQ_T*>(seq_lens.const_data_ptr()),      \
+              reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),         \
+              fallback_pool_ptr, fallback_block_ids_ptr,                      \
+              fallback_tile_ids_ptr,                                          \
+              static_cast<float>(scale),                                      \
+              static_cast<int>(num_decode_tokens64),                          \
+              static_cast<int>(num_heads64), static_cast<int>(num_kv_heads),  \
+              static_cast<int>(head_size), static_cast<int>(head_size_v),     \
+              static_cast<int>(page_size_bytes),                              \
+              static_cast<int>(raw_block_bytes), block_table.stride(0),       \
+              block_table.stride(1), seq_lens.stride(0));                     \
+    }                                                                         \
+  } while (0)
+
+  if (block_table.scalar_type() == torch::headeronly::ScalarType::Int &&
+      seq_lens.scalar_type() == torch::headeronly::ScalarType::Int) {
+    CALL_BYTE_V2_DECODE(int32_t, int32_t);
+  } else if (block_table.scalar_type() ==
+                 torch::headeronly::ScalarType::Int &&
+             seq_lens.scalar_type() == torch::headeronly::ScalarType::Long) {
+    CALL_BYTE_V2_DECODE(int32_t, int64_t);
+  } else if (block_table.scalar_type() ==
+                 torch::headeronly::ScalarType::Long &&
+             seq_lens.scalar_type() == torch::headeronly::ScalarType::Int) {
+    CALL_BYTE_V2_DECODE(int64_t, int32_t);
+  } else {
+    CALL_BYTE_V2_DECODE(int64_t, int64_t);
+  }
+#undef CALL_BYTE_V2_DECODE
+
+  BYTE_V2_CUDA_CHECK(cudaGetLastError());
+  return output;
+}
+
+torch::stable::Tensor byte_v2_wmma_layout_microbench(
+    torch::stable::Tensor& query, torch::stable::Tensor& key,
+    torch::stable::Tensor& value, int64_t variant, int64_t repeat_count) {
+  STD_TORCH_CHECK(query.device().is_cuda() && key.device().is_cuda() &&
+                      value.device().is_cuda(),
+                  "Byte-v2 WMMA microbench expects CUDA tensors");
+  STD_TORCH_CHECK(query.device().index() == key.device().index() &&
+                      query.device().index() == value.device().index(),
+                  "Byte-v2 WMMA microbench tensors must be on the same GPU");
+  STD_TORCH_CHECK(query.scalar_type() ==
+                          torch::headeronly::ScalarType::BFloat16 &&
+                      key.scalar_type() ==
+                          torch::headeronly::ScalarType::BFloat16 &&
+                      value.scalar_type() ==
+                          torch::headeronly::ScalarType::BFloat16,
+                  "Byte-v2 WMMA microbench expects BF16 tensors");
+  STD_TORCH_CHECK(query.is_contiguous() && key.is_contiguous() &&
+                      value.is_contiguous(),
+                  "Byte-v2 WMMA microbench expects contiguous tensors");
+  STD_TORCH_CHECK(query.dim() == 3 && key.dim() == 3 && value.dim() == 3,
+                  "Byte-v2 WMMA microbench expects rank-3 tensors");
+  STD_TORCH_CHECK(query.size(1) == vllm::kByteV2TileSize &&
+                      key.size(1) == vllm::kByteV2TileSize &&
+                      value.size(1) == vllm::kByteV2TileSize &&
+                      query.size(2) == vllm::kByteV2MaxHeadSize &&
+                      key.size(2) == vllm::kByteV2MaxHeadSize &&
+                      value.size(2) == vllm::kByteV2MaxHeadSize,
+                  "Byte-v2 WMMA microbench expects [num_tiles, 16, 128]");
+  STD_TORCH_CHECK(query.size(0) == key.size(0) &&
+                      query.size(0) == value.size(0),
+                  "Byte-v2 WMMA microbench tensors must have matching "
+                  "num_tiles");
+  STD_TORCH_CHECK(variant == 0,
+                  "Byte-v2 WMMA microbench currently supports variant=0");
+  STD_TORCH_CHECK(repeat_count > 0 && repeat_count <= INT_MAX,
+                  "Byte-v2 WMMA microbench repeat_count must fit in int32");
+  STD_TORCH_CHECK(query.size(0) <= INT_MAX,
+                  "Byte-v2 WMMA microbench num_tiles must fit in int32");
+
+  bool device_supports_bf16_wmma = false;
+#ifndef USE_ROCM
+  cudaDeviceProp device_prop;
+  BYTE_V2_CUDA_CHECK(
+      cudaGetDeviceProperties(&device_prop, query.get_device_index()));
+  device_supports_bf16_wmma = device_prop.major >= 8;
+#endif
+  STD_TORCH_CHECK(device_supports_bf16_wmma,
+                  "Byte-v2 WMMA microbench requires Ampere or newer");
+
+  auto output = torch::stable::empty(
+      {query.size(0), query.size(1), query.size(2)}, query.scalar_type(),
+      std::nullopt, query.device());
+  if (query.size(0) == 0) {
+    return output;
+  }
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      query.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(query.get_device_index());
+  constexpr int threads = 128;
+  vllm::byte_v2_wmma_layout_microbench_kernel<<<query.size(0), threads, 0,
+                                                stream>>>(
+      reinterpret_cast<const uint16_t*>(query.const_data_ptr()),
+      reinterpret_cast<const uint16_t*>(key.const_data_ptr()),
+      reinterpret_cast<const uint16_t*>(value.const_data_ptr()),
+      reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),
+      static_cast<int>(query.size(0)), static_cast<int>(repeat_count));
+  BYTE_V2_CUDA_CHECK(cudaGetLastError());
+  return output;
+}
+
+torch::stable::Tensor byte_v2_decode_page_wmma_microbench(
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    int64_t num_kv_heads, int64_t kv_head, int64_t page_size_bytes,
+    int64_t repeat_count) {
+  STD_TORCH_CHECK(query.device().is_cuda() && kv_cache.device().is_cuda(),
+                  "Byte-v2 decode page microbench expects CUDA tensors");
+  STD_TORCH_CHECK(query.device().index() == kv_cache.device().index(),
+                  "Byte-v2 decode page microbench tensors must be on the "
+                  "same GPU");
+  STD_TORCH_CHECK(query.scalar_type() ==
+                      torch::headeronly::ScalarType::BFloat16,
+                  "Byte-v2 decode page microbench expects BF16 query");
+  STD_TORCH_CHECK(kv_cache.scalar_type() ==
+                      torch::headeronly::ScalarType::Byte,
+                  "Byte-v2 decode page microbench expects uint8 kv_cache");
+  STD_TORCH_CHECK(query.is_contiguous() && kv_cache.is_contiguous(),
+                  "Byte-v2 decode page microbench expects contiguous tensors");
+  STD_TORCH_CHECK(query.dim() == 3 && kv_cache.dim() == 2,
+                  "Byte-v2 decode page microbench expects query rank 3 and "
+                  "kv_cache rank 2");
+  STD_TORCH_CHECK(query.size(1) == vllm::kByteV2TileSize &&
+                      query.size(2) == vllm::kByteV2MaxHeadSize,
+                  "Byte-v2 decode page microbench expects query shape "
+                  "[num_pages, 16, 128]");
+  STD_TORCH_CHECK(query.size(0) == kv_cache.size(0),
+                  "Byte-v2 decode page microbench expects one query tile per "
+                  "KV page");
+  STD_TORCH_CHECK(num_kv_heads > 0 && num_kv_heads <= INT_MAX &&
+                      kv_head >= 0 && kv_head < num_kv_heads,
+                  "Byte-v2 decode page microbench has invalid KV head");
+  STD_TORCH_CHECK(repeat_count > 0 && repeat_count <= INT_MAX,
+                  "Byte-v2 decode page microbench repeat_count must fit in "
+                  "int32");
+  STD_TORCH_CHECK(query.size(0) <= INT_MAX,
+                  "Byte-v2 decode page microbench num_pages must fit in "
+                  "int32");
+  const int64_t compressed_payload_bytes =
+      num_kv_heads * ((vllm::kByteV2MaxHeadSize / vllm::kByteV2TileSize) * 2) *
+      vllm::kByteV2FastTilePayloadBytes;
+  const int64_t compressed_page_size =
+      vllm::kByteV2PageHeaderBytes + compressed_payload_bytes;
+  STD_TORCH_CHECK(page_size_bytes == compressed_page_size &&
+                      kv_cache.size(1) == page_size_bytes,
+                  "Byte-v2 decode page microbench requires compressed-only "
+                  "page size for head_size=head_size_v=128");
+
+  bool device_supports_bf16_wmma = false;
+#ifndef USE_ROCM
+  cudaDeviceProp device_prop;
+  BYTE_V2_CUDA_CHECK(
+      cudaGetDeviceProperties(&device_prop, query.get_device_index()));
+  device_supports_bf16_wmma = device_prop.major >= 8;
+#endif
+  STD_TORCH_CHECK(device_supports_bf16_wmma,
+                  "Byte-v2 decode page microbench requires Ampere or newer");
+
+  auto output = torch::stable::empty(
+      {query.size(0), query.size(1), query.size(2)}, query.scalar_type(),
+      std::nullopt, query.device());
+  if (query.size(0) == 0) {
+    return output;
+  }
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      query.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(query.get_device_index());
+  constexpr int threads = 128;
+  vllm::byte_v2_decode_page_wmma_microbench_kernel<<<query.size(0), threads, 0,
+                                                     stream>>>(
+      reinterpret_cast<const uint16_t*>(query.const_data_ptr()),
+      reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+      reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),
+      static_cast<int>(query.size(0)), static_cast<int>(num_kv_heads),
+      static_cast<int>(kv_head), static_cast<int>(page_size_bytes),
+      static_cast<int>(repeat_count));
+  BYTE_V2_CUDA_CHECK(cudaGetLastError());
+  return output;
 }
 
 // KV_T is the data type of key and value tensors.

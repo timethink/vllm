@@ -477,6 +477,37 @@ void reshape_and_cache_flash(
     torch::stable::Tensor& slot_mapping, const std::string& kv_cache_dtype,
     torch::stable::Tensor& k_scale, torch::stable::Tensor& v_scale);
 
+torch::stable::Tensor byte_v2_reshape_and_cache(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor& slot_mapping,
+    int64_t block_size, int64_t num_kv_heads, int64_t head_size,
+    int64_t head_size_v, int64_t page_size_bytes,
+    std::optional<torch::stable::Tensor> fallback_pool = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_block_ids = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_next_slot = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_tile_ids = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_tile_next_slot = std::nullopt,
+    std::optional<torch::stable::Tensor> deferred_error = std::nullopt);
+
+torch::stable::Tensor byte_v2_paged_decode_attention(
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& block_table, torch::stable::Tensor& seq_lens,
+    double scale, int64_t block_size, int64_t num_kv_heads, int64_t head_size,
+    int64_t head_size_v, int64_t page_size_bytes,
+    std::optional<torch::stable::Tensor> fallback_pool = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_block_ids = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_tile_ids = std::nullopt,
+    std::optional<torch::stable::Tensor> partial_workspace = std::nullopt);
+
+torch::stable::Tensor byte_v2_wmma_layout_microbench(
+    torch::stable::Tensor& query, torch::stable::Tensor& key,
+    torch::stable::Tensor& value, int64_t variant, int64_t repeat_count);
+
+torch::stable::Tensor byte_v2_decode_page_wmma_microbench(
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    int64_t num_kv_heads, int64_t kv_head, int64_t page_size_bytes,
+    int64_t repeat_count);
+
 void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           torch::stable::Tensor& k_pe,
                           torch::stable::Tensor& kv_cache,

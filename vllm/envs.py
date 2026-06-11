@@ -109,6 +109,20 @@ if TYPE_CHECKING:
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
+    VLLM_BYTE_V2_USE_NATIVE_KERNELS: bool = True
+    VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE: bool = False
+    VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL: bool = True
+    VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO: float = 0.03
+    VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS: int = 512
+    VLLM_BYTE_V2_DECODE_SPLIT_K: int = 0
+    VLLM_BYTE_V2_DECODE_PAGE_FASTPATH: bool = False
+    VLLM_BYTE_V2_DECODE_TILE_FASTPATH: bool = True
+    VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE: int = -1
+    VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE: int = 0
+    VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC: bool = False
+    VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC: bool = False
+    VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK: bool = False
+    VLLM_BYTE_V2_PERSISTENT_PARTIAL_WORKSPACE: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
@@ -596,6 +610,89 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Use native Byte-v2 CUDA kernels instead of the PyTorch eager correctness
+    # fallback. Set to 0 to force the fallback path for debugging.
+    "VLLM_BYTE_V2_USE_NATIVE_KERNELS": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_USE_NATIVE_KERNELS", "1"))
+    ),
+    # Store Byte-v2 KV pages without per-page raw fallback/tail space. This
+    # reduces the main HBM KV allocation but currently requires native kernels.
+    "VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE", "0"))
+    ),
+    # Use a separate raw BF16 fallback pool for Byte-v2 compressed-only pages.
+    # Most pages stay compressed; only blocks that cannot be represented by the
+    # Byte-v2 exponent window consume raw pool slots.
+    "VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL", "1"))
+    ),
+    # Fallback pool capacity as a fraction of the number of physical KV blocks.
+    # The pool remains static and fail-closed when exhausted.
+    "VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO": lambda: float(
+        os.getenv("VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO", "0.03")
+    ),
+    # Minimum sparse fallback pool slots per KV-cache layer. This is a safety
+    # floor for normal prompts whose out-of-window blocks exceed a small ratio.
+    # Set to 0 to use only VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO.
+    "VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS": lambda: int(
+        os.getenv("VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS", "512")
+    ),
+    # Maximum number of page-parallel split-K chunks for native Byte-v2 GQA
+    # WMMA decode. Set to 1 to force the original single-CTA decode path.
+    # Set to 0 or leave unset to use the page-count heuristic.
+    "VLLM_BYTE_V2_DECODE_SPLIT_K": lambda: int(
+        os.getenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "0")
+    ),
+    # Experimental: use a page-status fast path in native Byte-v2 split decode
+    # for compressed pages. Raw fallback pages still use the generic loader.
+    "VLLM_BYTE_V2_DECODE_PAGE_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "0"))
+    ),
+    # Experimental: within the compressed-page fast path, branch once per
+    # Byte-v2 tile so non-fallback tiles avoid element-level fallback checks.
+    "VLLM_BYTE_V2_DECODE_TILE_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_TILE_FASTPATH", "1"))
+    ),
+    # Experimental: split-K reduce mode. -1 uses the native heuristic, 0 forces
+    # the serial-LSE reduce kernel, and 1 forces CTA-parallel LSE reduction.
+    "VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE": lambda: int(
+        os.getenv("VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE", "-1")
+    ),
+    # Experimental: allow Byte-v2 cache update to encode a tile even if up to N
+    # elements fall outside the best 16-exponent window. Outliers are saturated
+    # to the window boundary, so the default remains 0 for lossless encoding.
+    "VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE": lambda: int(
+        os.getenv("VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE", "0")
+    ),
+    # Experimental: skip the first Byte-v2 native prefill-direct D2H validation
+    # synchronization. The final direct_result is still checked on host, so cache
+    # update failures continue to fail closed.
+    "VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC", "0"))
+    ),
+    # Experimental: skip host-side decode-append cache-update validation and
+    # packed-block return. This removes a per-token D2H sync on the hot path;
+    # keep disabled unless the caller can tolerate deferred failure reporting.
+    "VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC", "0"))
+    ),
+    # Production-safe Byte-v2 decode cache-update validation mode. Native
+    # decode-append kernels write failures into a device-side sticky error flag,
+    # and the v1 model runner checks it once after model forward instead of
+    # synchronizing once per token/layer.
+    "VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK",
+                "0",
+            )
+        )
+    ),
+    # Reuse a persistent split-K partial workspace for Byte-v2 decode instead
+    # of allocating the partial tensor inside the native op on every call.
+    "VLLM_BYTE_V2_PERSISTENT_PARTIAL_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_PERSISTENT_PARTIAL_WORKSPACE", "0"))
+    ),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton

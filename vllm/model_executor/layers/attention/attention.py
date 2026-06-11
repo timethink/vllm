@@ -29,6 +29,7 @@ from vllm.utils.torch_utils import (
     _encode_layer_name,
     _resolve_layer_name,
     direct_register_custom_op,
+    is_byte_v2_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
 from vllm.v1.attention.backend import (
@@ -39,6 +40,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
@@ -569,6 +571,38 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        if is_byte_v2_kv_cache(self.kv_cache_dtype):
+            if self.sliding_window is not None:
+                raise ValueError(
+                    "Byte-v2 KV cache does not support sliding window "
+                    "attention yet."
+                )
+            return ByteV2FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                raw_tail_bytes=(
+                    0 if envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE else None
+                ),
+                sparse_fallback_pool_ratio=(
+                    envs.VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO
+                    if (
+                        envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE
+                        and envs.VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL
+                    )
+                    else 0.0
+                ),
+                sparse_fallback_pool_min_blocks=(
+                    envs.VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS
+                    if (
+                        envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE
+                        and envs.VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL
+                    )
+                    else 0
+                ),
+            )
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"

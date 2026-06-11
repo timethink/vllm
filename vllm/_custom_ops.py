@@ -2734,6 +2734,155 @@ def reshape_and_cache_flash(
     )
 
 
+def byte_v2_reshape_and_cache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    head_size_v: int,
+    page_size_bytes: int,
+    fallback_pool: torch.Tensor | None = None,
+    fallback_block_ids: torch.Tensor | None = None,
+    fallback_next_slot: torch.Tensor | None = None,
+    fallback_tile_ids: torch.Tensor | None = None,
+    fallback_tile_next_slot: torch.Tensor | None = None,
+    deferred_error: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if key.is_cuda and kv_cache.is_cuda and envs.VLLM_BYTE_V2_USE_NATIVE_KERNELS:
+        return torch.ops._C_cache_ops.byte_v2_reshape_and_cache(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            block_size,
+            num_kv_heads,
+            head_size,
+            head_size_v,
+            page_size_bytes,
+            fallback_pool,
+            fallback_block_ids,
+            fallback_next_slot,
+            fallback_tile_ids,
+            fallback_tile_next_slot,
+            deferred_error,
+        )
+
+    from vllm.v1.attention.backends.byte_v2_ops import (
+        byte_v2_reshape_and_cache as byte_v2_reshape_and_cache_op,
+    )
+
+    return byte_v2_reshape_and_cache_op(
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+        block_size,
+        num_kv_heads,
+        head_size,
+        head_size_v,
+        page_size_bytes,
+        fallback_pool,
+        fallback_block_ids,
+        fallback_next_slot,
+        fallback_tile_ids,
+        fallback_tile_next_slot,
+        deferred_error,
+    )
+
+
+def byte_v2_paged_decode_attention(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    scale: float,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    head_size_v: int,
+    page_size_bytes: int,
+    fallback_pool: torch.Tensor | None = None,
+    fallback_block_ids: torch.Tensor | None = None,
+    fallback_tile_ids: torch.Tensor | None = None,
+    partial_workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if query.is_cuda and kv_cache.is_cuda and envs.VLLM_BYTE_V2_USE_NATIVE_KERNELS:
+        query = query.contiguous()
+        return torch.ops._C_cache_ops.byte_v2_paged_decode_attention(
+            query,
+            kv_cache,
+            block_table,
+            seq_lens,
+            scale,
+            block_size,
+            num_kv_heads,
+            head_size,
+            head_size_v,
+            page_size_bytes,
+            fallback_pool,
+            fallback_block_ids,
+            fallback_tile_ids,
+            partial_workspace,
+        )
+
+    from vllm.v1.attention.backends.byte_v2_ops import (
+        byte_v2_paged_decode_attention as byte_v2_paged_decode_attention_op,
+    )
+
+    return byte_v2_paged_decode_attention_op(
+        query,
+        kv_cache,
+        block_table,
+        seq_lens,
+        scale,
+        block_size,
+        num_kv_heads,
+        head_size,
+        head_size_v,
+        page_size_bytes,
+        fallback_pool,
+        fallback_block_ids,
+        fallback_tile_ids,
+    )
+
+
+def byte_v2_wmma_layout_microbench(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    variant: int = 0,
+    repeat_count: int = 1,
+) -> torch.Tensor:
+    return torch.ops._C_cache_ops.byte_v2_wmma_layout_microbench(
+        query,
+        key,
+        value,
+        variant,
+        repeat_count,
+    )
+
+
+def byte_v2_decode_page_wmma_microbench(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    num_kv_heads: int,
+    kv_head: int,
+    page_size_bytes: int,
+    repeat_count: int = 1,
+) -> torch.Tensor:
+    return torch.ops._C_cache_ops.byte_v2_decode_page_wmma_microbench(
+        query,
+        kv_cache,
+        num_kv_heads,
+        kv_head,
+        page_size_bytes,
+        repeat_count,
+    )
+
+
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,

@@ -129,6 +129,141 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
+    def get_byte_v2_sparse_fallback_stats(self) -> dict[str, Any]:
+        compilation_config = getattr(self.model_runner, "compilation_config", None)
+        forward_context = getattr(compilation_config, "static_forward_context", {})
+
+        layers: list[dict[str, Any]] = []
+        for layer_name, layer in sorted(forward_context.items()):
+            impl = getattr(layer, "impl", None)
+            get_stats = getattr(impl, "get_sparse_fallback_pool_stats", None)
+            if get_stats is None:
+                continue
+            stats = dict(get_stats())
+            stats["layer_name"] = layer_name
+            layers.append(stats)
+
+        enabled_layers = [layer for layer in layers if layer.get("enabled")]
+        return {
+            "num_layers": len(layers),
+            "enabled_layers": len(enabled_layers),
+            "total_capacity": sum(
+                int(layer["capacity"]) for layer in enabled_layers
+            ),
+            "total_next_slot": sum(
+                int(layer["next_slot"]) for layer in enabled_layers
+            ),
+            "total_assigned_blocks": sum(
+                int(layer["assigned_blocks"]) for layer in enabled_layers
+            ),
+            "max_next_slot": max(
+                (int(layer["next_slot"]) for layer in enabled_layers),
+                default=0,
+            ),
+            "max_capacity": max(
+                (int(layer["capacity"]) for layer in enabled_layers),
+                default=0,
+            ),
+            "any_exhausted": any(
+                bool(layer["exhausted"]) for layer in enabled_layers
+            ),
+            "layers": layers,
+        }
+
+    def get_byte_v2_tile_fallback_stats(self) -> dict[str, Any]:
+        compilation_config = getattr(self.model_runner, "compilation_config", None)
+        forward_context = getattr(compilation_config, "static_forward_context", {})
+
+        layers: list[dict[str, Any]] = []
+        for layer_name, layer in sorted(forward_context.items()):
+            impl = getattr(layer, "impl", None)
+            get_stats = getattr(impl, "get_tile_fallback_stats", None)
+            kv_cache = getattr(layer, "kv_cache", None)
+            if get_stats is None or kv_cache is None:
+                continue
+            stats = dict(get_stats(kv_cache))
+            stats["layer_name"] = layer_name
+            layers.append(stats)
+
+        enabled_layers = [layer for layer in layers if layer.get("enabled")]
+        total_full_tiles = sum(
+            int(layer["full_total_tiles"]) for layer in enabled_layers
+        )
+        total_raw_full_tiles = sum(
+            int(layer["raw_full_total_tiles"]) for layer in enabled_layers
+        )
+        total_bad_tiles = sum(
+            int(layer["full_bad_tiles"]) for layer in enabled_layers
+        )
+        total_sum_misses = sum(
+            int(layer["sum_bad_tile_misses"]) for layer in enabled_layers
+        )
+        return {
+            "num_layers": len(layers),
+            "enabled_layers": len(enabled_layers),
+            "total_full_active_blocks": sum(
+                int(layer["full_active_blocks"]) for layer in enabled_layers
+            ),
+            "total_full_raw_fallback_blocks": sum(
+                int(layer["full_raw_fallback_blocks"])
+                for layer in enabled_layers
+            ),
+            "total_partial_raw_fallback_blocks": sum(
+                int(layer["partial_raw_fallback_blocks"])
+                for layer in enabled_layers
+            ),
+            "total_full_tiles": total_full_tiles,
+            "total_raw_full_tiles": total_raw_full_tiles,
+            "total_full_bad_tiles": total_bad_tiles,
+            "total_full_good_tiles_inside_raw_fallback_blocks": sum(
+                int(layer["full_good_tiles_inside_raw_fallback_blocks"])
+                for layer in enabled_layers
+            ),
+            "total_full_tile_fallback_ratio": (
+                float(total_bad_tiles / total_full_tiles)
+                if total_full_tiles > 0
+                else 0.0
+            ),
+            "total_bad_tile_ratio_within_raw_fallback_blocks": (
+                float(total_bad_tiles / total_raw_full_tiles)
+                if total_raw_full_tiles > 0
+                else 0.0
+            ),
+            "total_sum_bad_tile_misses": total_sum_misses,
+            "mean_misses_per_bad_tile": (
+                float(total_sum_misses / total_bad_tiles)
+                if total_bad_tiles > 0
+                else 0.0
+            ),
+            "max_misses_per_bad_tile": max(
+                (
+                    int(layer["max_misses_per_bad_tile"])
+                    for layer in enabled_layers
+                ),
+                default=0,
+            ),
+            "bad_tiles_misses_le_1": sum(
+                int(layer["bad_tiles_misses_le_1"]) for layer in enabled_layers
+            ),
+            "bad_tiles_misses_le_2": sum(
+                int(layer["bad_tiles_misses_le_2"]) for layer in enabled_layers
+            ),
+            "bad_tiles_misses_le_4": sum(
+                int(layer["bad_tiles_misses_le_4"]) for layer in enabled_layers
+            ),
+            "bad_tiles_misses_le_8": sum(
+                int(layer["bad_tiles_misses_le_8"]) for layer in enabled_layers
+            ),
+            "bad_tiles_misses_gt_8": sum(
+                int(layer["bad_tiles_misses_gt_8"]) for layer in enabled_layers
+            ),
+            "invalid_raw_fallback_slots": sum(
+                int(layer["invalid_raw_fallback_slots"])
+                for layer in enabled_layers
+            ),
+            "layers": layers,
+        }
+
     def get_model_inspection(self) -> str:
         """Return a transformers-style hierarchical view of the model."""
         from vllm.model_inspection import format_model_inspection

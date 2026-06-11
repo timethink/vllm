@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
 )
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -250,6 +251,7 @@ class SingleTypeKVCacheManager(ABC):
             )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) in (
+                ByteV2FullAttentionSpec,
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
@@ -282,6 +284,7 @@ class SingleTypeKVCacheManager(ABC):
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) in (
+                ByteV2FullAttentionSpec,
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
@@ -1382,6 +1385,11 @@ def register_all_kvcache_specs(vllm_config):
     )
 
     # FullAttentionSpec subclasses — grouped with FullAttentionSpec
+    KVCacheSpecRegistry.register(
+        ByteV2FullAttentionSpec,
+        FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
+    )
     KVCacheSpecRegistry.register(
         TQFullAttentionSpec,
         FullAttentionManager,

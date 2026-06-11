@@ -1078,6 +1078,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.model_state.postprocess_state(idx_mapping, num_sampled)
 
+    def _reset_byte_v2_deferred_cache_update_error(self) -> None:
+        if self.cache_config.cache_dtype != "byte_v2":
+            return
+        from vllm.v1.attention.backends.byte_v2_attn import (
+            ByteV2AttentionImpl,
+        )
+
+        ByteV2AttentionImpl.reset_deferred_cache_update_error(self.device)
+
+    def _check_byte_v2_deferred_cache_update_error(self) -> None:
+        if self.cache_config.cache_dtype != "byte_v2":
+            return
+        from vllm.v1.attention.backends.byte_v2_attn import (
+            ByteV2AttentionImpl,
+        )
+
+        ByteV2AttentionImpl.check_deferred_cache_update_error(self.device)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1184,6 +1202,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         kernel_meta.no_lora_flag_cpu[0] = False
                         kernel_meta.num_active_loras_cpu[0] = 1
 
+        self._reset_byte_v2_deferred_cache_update_error()
+
         attn_metadata = None
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
@@ -1274,6 +1294,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        self._check_byte_v2_deferred_cache_update_error()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

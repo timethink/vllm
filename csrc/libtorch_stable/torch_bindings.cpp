@@ -750,6 +750,57 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        str kv_cache_dtype,"
       "                        Tensor k_scale, Tensor v_scale) -> ()");
 
+  ops.def(
+      "byte_v2_reshape_and_cache("
+      "                        Tensor key, Tensor value,"
+      "                        Tensor! kv_cache,"
+      "                        Tensor slot_mapping,"
+      "                        int block_size,"
+      "                        int num_kv_heads,"
+      "                        int head_size,"
+      "                        int head_size_v,"
+      "                        int page_size_bytes,"
+      "                        Tensor? fallback_pool=None,"
+      "                        Tensor!? fallback_block_ids=None,"
+      "                        Tensor!? fallback_next_slot=None,"
+      "                        Tensor!? fallback_tile_ids=None,"
+      "                        Tensor!? fallback_tile_next_slot=None,"
+      "                        Tensor!? deferred_error=None) -> Tensor");
+
+  ops.def(
+      "byte_v2_paged_decode_attention("
+      "                        Tensor query,"
+      "                        Tensor kv_cache,"
+      "                        Tensor block_table,"
+      "                        Tensor seq_lens,"
+      "                        float scale,"
+      "                        int block_size,"
+      "                        int num_kv_heads,"
+      "                        int head_size,"
+      "                        int head_size_v,"
+      "                        int page_size_bytes,"
+      "                        Tensor? fallback_pool=None,"
+      "                        Tensor? fallback_block_ids=None,"
+      "                        Tensor? fallback_tile_ids=None,"
+      "                        Tensor? partial_workspace=None) -> Tensor");
+
+  ops.def(
+      "byte_v2_wmma_layout_microbench("
+      "                        Tensor query,"
+      "                        Tensor key,"
+      "                        Tensor value,"
+      "                        int variant,"
+      "                        int repeat_count) -> Tensor");
+
+  ops.def(
+      "byte_v2_decode_page_wmma_microbench("
+      "                        Tensor query,"
+      "                        Tensor kv_cache,"
+      "                        int num_kv_heads,"
+      "                        int kv_head,"
+      "                        int page_size_bytes,"
+      "                        int repeat_count) -> Tensor");
+
   // Concat kv_c and k_pe and cache them.
   ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
@@ -855,6 +906,14 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("swap_blocks", TORCH_BOX(&swap_blocks));
   ops.impl("reshape_and_cache", TORCH_BOX(&reshape_and_cache));
   ops.impl("reshape_and_cache_flash", TORCH_BOX(&reshape_and_cache_flash));
+  ops.impl("byte_v2_reshape_and_cache",
+           TORCH_BOX(&byte_v2_reshape_and_cache));
+  ops.impl("byte_v2_paged_decode_attention",
+           TORCH_BOX(&byte_v2_paged_decode_attention));
+  ops.impl("byte_v2_wmma_layout_microbench",
+           TORCH_BOX(&byte_v2_wmma_layout_microbench));
+  ops.impl("byte_v2_decode_page_wmma_microbench",
+           TORCH_BOX(&byte_v2_decode_page_wmma_microbench));
   ops.impl("concat_and_cache_mla", TORCH_BOX(&concat_and_cache_mla));
   ops.impl("concat_and_cache_mla_rope_fused",
            TORCH_BOX(&concat_and_cache_mla_rope_fused));

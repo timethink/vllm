@@ -32,6 +32,7 @@ CacheDType = Literal[
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
+    "byte_v2",
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -272,5 +273,11 @@ class CacheConfig:
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor",
                 str(cache_dtype),
+            )
+        elif cache_dtype == "byte_v2":
+            logger.info(
+                "Using experimental Byte-v2 compressed data format to store "
+                "kv cache. It reduces the GPU memory footprint and KV cache "
+                "read bandwidth, but requires a Byte-v2 attention backend.",
             )
         return cache_dtype

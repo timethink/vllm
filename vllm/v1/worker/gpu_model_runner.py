@@ -141,6 +141,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ByteV2FullAttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -1059,6 +1060,24 @@ class GPUModelRunner(
             device=self.device, non_blocking=True
         )
         return model_kwargs
+
+    def _reset_byte_v2_deferred_cache_update_error(self) -> None:
+        if self.cache_config.cache_dtype != "byte_v2":
+            return
+        from vllm.v1.attention.backends.byte_v2_attn import (
+            ByteV2AttentionImpl,
+        )
+
+        ByteV2AttentionImpl.reset_deferred_cache_update_error(self.device)
+
+    def _check_byte_v2_deferred_cache_update_error(self) -> None:
+        if self.cache_config.cache_dtype != "byte_v2":
+            return
+        from vllm.v1.attention.backends.byte_v2_attn import (
+            ByteV2AttentionImpl,
+        )
+
+        ByteV2AttentionImpl.check_deferred_cache_update_error(self.device)
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
@@ -4255,6 +4274,8 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        self._reset_byte_v2_deferred_cache_update_error()
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -4285,6 +4306,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        self._check_byte_v2_deferred_cache_update_error()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -7041,6 +7064,7 @@ class GPUModelRunner(
         self,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
         kernel_block_sizes: list[int],
+        kv_cache_config: KVCacheConfig,
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -7066,8 +7090,14 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                if (
+                    isinstance(kv_cache_spec, ByteV2FullAttentionSpec)
+                    and kv_cache_spec.sparse_fallback_pool_ratio > 0
+                ):
+                    num_blocks = kv_cache_config.num_blocks
+                else:
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
@@ -7107,9 +7137,102 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
+                    byte_v2_sparse_pool = None
 
                     raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
-                    if kv_cache_spec.page_size_padded is not None:
+                    if (
+                        isinstance(kv_cache_spec, ByteV2FullAttentionSpec)
+                        and kv_cache_spec.sparse_fallback_pool_ratio > 0
+                    ):
+                        assert kernel_num_blocks == num_blocks, (
+                            "Byte-v2 sparse fallback allocator currently "
+                            "requires storage block size to match kernel block "
+                            "size."
+                        )
+                        raw_bytes = kv_cache_raw_tensors[layer_name].view(torch.uint8)
+                        main_cache_bytes = (
+                            kernel_num_blocks * kv_cache_spec.main_page_size_bytes
+                        )
+                        fallback_pool_blocks = (
+                            kv_cache_spec.sparse_fallback_pool_blocks(
+                                kernel_num_blocks
+                            )
+                        )
+                        fallback_pool_bytes = (
+                            fallback_pool_blocks * kv_cache_spec.raw_block_bytes
+                        )
+                        metadata_start = round_up(
+                            main_cache_bytes + fallback_pool_bytes, 4
+                        )
+                        fallback_block_ids_bytes = (
+                            kernel_num_blocks
+                            * kv_cache_spec.sparse_fallback_block_id_bytes
+                        )
+                        fallback_next_slot_bytes = (
+                            kv_cache_spec.sparse_fallback_next_slot_bytes
+                        )
+                        fallback_tile_ids_bytes = (
+                            kernel_num_blocks
+                            * kv_cache_spec.tile_fallback_tiles_per_block
+                            * kv_cache_spec.sparse_fallback_tile_id_bytes
+                        )
+                        fallback_tile_next_slot_bytes = (
+                            kv_cache_spec.sparse_fallback_tile_next_slot_bytes
+                        )
+                        expected_bytes = (
+                            metadata_start
+                            + fallback_block_ids_bytes
+                            + fallback_next_slot_bytes
+                            + fallback_tile_ids_bytes
+                            + fallback_tile_next_slot_bytes
+                        )
+                        assert raw_bytes.numel() == expected_bytes
+
+                        kv_cache = raw_bytes[:main_cache_bytes].view(kv_cache_shape)
+                        fallback_pool = raw_bytes[
+                            main_cache_bytes : main_cache_bytes
+                            + fallback_pool_bytes
+                        ].view(fallback_pool_blocks, kv_cache_spec.raw_block_bytes)
+                        fallback_block_ids = raw_bytes[
+                            metadata_start : metadata_start
+                            + fallback_block_ids_bytes
+                        ].view(torch.int32)
+                        fallback_next_slot = raw_bytes[
+                            metadata_start
+                            + fallback_block_ids_bytes : metadata_start
+                            + fallback_block_ids_bytes
+                            + fallback_next_slot_bytes
+                        ].view(torch.int32)
+                        fallback_tile_ids = raw_bytes[
+                            metadata_start
+                            + fallback_block_ids_bytes
+                            + fallback_next_slot_bytes : metadata_start
+                            + fallback_block_ids_bytes
+                            + fallback_next_slot_bytes
+                            + fallback_tile_ids_bytes
+                        ].view(torch.int32)
+                        fallback_tile_ids = fallback_tile_ids.view(
+                            kernel_num_blocks,
+                            kv_cache_spec.tile_fallback_tiles_per_block,
+                        )
+                        fallback_tile_next_slot = raw_bytes[
+                            metadata_start
+                            + fallback_block_ids_bytes
+                            + fallback_next_slot_bytes
+                            + fallback_tile_ids_bytes : expected_bytes
+                        ].view(torch.int32)
+                        fallback_block_ids.fill_(-1)
+                        fallback_next_slot.zero_()
+                        fallback_tile_ids.fill_(-1)
+                        fallback_tile_next_slot.zero_()
+                        byte_v2_sparse_pool = (
+                            fallback_pool,
+                            fallback_block_ids,
+                            fallback_next_slot,
+                            fallback_tile_ids,
+                            fallback_tile_next_slot,
+                        )
+                    elif kv_cache_spec.page_size_padded is not None:
                         # Use strided view to handle page_size_bytes that
                         # include padding. This follows
                         # the same pattern as MambaSpec handling below.
@@ -7130,7 +7253,20 @@ class GPUModelRunner(
                     else:
                         # No padding — safe to use a contiguous view.
                         kv_cache = raw_tensor.view(kv_cache_shape)
-                    kv_caches[layer_name] = kv_cache.permute(*inv_order)
+                    kv_cache = kv_cache.permute(*inv_order)
+                    kv_caches[layer_name] = kv_cache
+
+                    if byte_v2_sparse_pool is not None:
+                        attn_layer = self.compilation_config.static_forward_context[
+                            layer_name
+                        ]
+                        register_pool = getattr(
+                            attn_layer.impl,
+                            "register_sparse_fallback_pool",
+                            None,
+                        )
+                        assert register_pool is not None
+                        register_pool(kv_cache, *byte_v2_sparse_pool)
 
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
@@ -7234,7 +7370,7 @@ class GPUModelRunner(
 
             # Change the memory buffer to the desired shape
             kv_caches = self._reshape_kv_cache_tensors(
-                kv_cache_raw_tensors, kernel_block_sizes
+                kv_cache_raw_tensors, kernel_block_sizes, kv_cache_config
             )
 
         # Set up cross-layer KV cache sharing
