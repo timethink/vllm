@@ -7806,3 +7806,3707 @@ Step 32 的 capacity pressure 显示，3% sparse fallback pool 在真实 Llama-3
 2. 若方案 1 无收益，立即回滚，不做方案 2。
 3. 若方案 1 有收益，再接入 independent cute stage1，跑 decode-only 和 E2E。
 4. fallback 表达方式优化作为下一条主线，不和 layout-v2 同时改，避免变量混在一起。
+
+## Step 34：tile fallback outlier 分布统计
+
+### 目的
+
+Step 32/33 后，下一条主线转向 fallback 表达方式。这里先不改 production
+CUDA decode，而是做 reference codec 和真实 KV 分布统计，回答两个问题：
+
+1. 真实 Llama-3 8B 的 tile fallback 是否大多只是少数元素超出 exponent window。
+2. 如果改成 element-level outlier list，理论上能把 raw tile fallback pool 降到什么量级。
+
+### 代码改动
+
+- 新增 `vllm/v1/attention/backends/byte_v2_outliers.py`：
+  - `compress_byte_v2_tile_with_outliers()` /
+    `decompress_byte_v2_tile_with_outliers()`，用于单 tile reference codec。
+  - `byte_v2_tile_exponent_miss_counts()`，统计每个 tile 超出 16-exponent
+    window 的元素数。
+  - `estimate_byte_v2_outlier_storage_from_misses()`，估算不同
+    `max_outliers_per_tile` 下的 outlier list bytes。
+- `ByteV2AttentionImpl.get_tile_fallback_stats()` 不再只看 raw block fallback。
+  它现在也会读取 `fallback_tile_ids` 指向的 tile fallback pool，统计真实 tile
+  fallback 的 exponent miss 分布。
+- `benchmarks/byte_v2_tile_fallback_stats.py` 合并 worker/layer 的
+  `outlier_storage_estimates`，输出全局估算。
+- 新增单测覆盖 reference codec、storage estimate、以及 stats 从 tile pool 读取
+  raw tile。
+
+### 验证命令
+
+```bash
+.venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_outliers.py \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_tile_fallback_stats_read_tile_pool \
+  -q
+
+.venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_attention_impl_sparse_fallback_pool_min_blocks \
+  tests/v1/attention/test_byte_v2_metadata.py \
+  -q
+
+.venv/bin/python -m ruff check \
+  vllm/v1/attention/backends/byte_v2_outliers.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/v1/worker/worker_base.py \
+  benchmarks/byte_v2_tile_fallback_stats.py \
+  tests/v1/attention/test_byte_v2_outliers.py \
+  tests/v1/attention/test_byte_v2_backend.py
+```
+
+结果：
+
+- `6 passed`
+- `6 passed`
+- `All checks passed`
+
+### 真实模型统计
+
+公共配置：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_NO_USAGE_STATS=1 \
+VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE=1 \
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS=0 \
+VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK=1 \
+.venv/bin/python benchmarks/byte_v2_tile_fallback_stats.py \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --decode-len 1 \
+  --batch-size 1 \
+  --gpu-memory-utilization 0.45 \
+  --disable-prefix-caching
+```
+
+记录文件：
+
+- `benchmarks/profiles/bytev2_step34_outlier_stats_p1024_b1_d1_fixed.json`
+- `benchmarks/profiles/bytev2_step34_outlier_stats_p2048_b1_d1_fixed.json`
+
+| prompt_len | active layer-blocks | tile fallback tiles | tile fallback ratio | miss sum | mean miss/tile | max miss/tile | pool exhausted |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1024 | 2048 | 4941 | 1.8848% | 5014 | 1.0148 | 2 | false |
+| 2048 | 4096 | 9925 | 1.8930% | 10094 | 1.0170 | 2 | false |
+
+miss 分布：
+
+| prompt_len | bad tiles <= 1 miss | bad tiles <= 2 miss | bad tiles > 8 miss |
+| ---: | ---: | ---: | ---: |
+| 1024 | 4868 | 4941 | 0 |
+| 2048 | 9756 | 9925 | 0 |
+
+storage estimate：
+
+| prompt_len | raw tile fallback bytes | max_outliers=1 bytes | max_outliers=1 / raw tile | max_outliers=2 bytes | max_outliers=2 / raw tile |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 2,529,792 | 56,848 | 2.25% | 19,983 | 0.79% |
+| 2048 | 5,081,600 | 125,552 | 2.47% | 40,207 | 0.79% |
+
+当前 estimator 仍按“每 layer 至少 1 个 raw-block slot 等价容量”向上取整，
+所以 `equivalent_raw_block_slots` 对全局 outlier bytes 不敏感：
+
+- p1024：`max_outliers=2` 等价 32 个 raw-block slot，pool ratio 1.5625%。
+- p2048：`max_outliers=2` 等价 32 个 raw-block slot，pool ratio 0.78125%。
+
+这不是 outlier list 的真实下限，而是当前 allocator 仍按 layer/block slot
+分配的结果。若后续实现真正 byte-addressed outlier arena，理论额外容量应接近
+`additional_bytes`，不应被 raw-block slot 粒度放大。
+
+### 结论
+
+1. 真实 Llama-3 8B p1024/p2048 下，当前 lossless ByteV2 的 fallback 已经主要是
+   tile-level fallback，而不是 block-level raw fallback。
+2. 发生 fallback 的 tile 中，几乎都是 1 个 outlier 元素，最多 2 个；没有发现
+   `>8` misses 的 tile。
+3. raw tile fallback 的 512B 粒度过粗。以 `max_outliers_per_tile=2` 估算，
+   outlier list 只需要当前 raw tile fallback bytes 的约 0.79%。
+4. 下一步不应继续扩大 `VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO`，而应实现 compact
+   outlier pool：
+   - encode 阶段为 bad tile 写 compressed payload + outlier entries；
+   - metadata 从 `fallback_tile_ids` 转为 per-page outlier offset/count 或 compact
+     tile outlier directory；
+   - decode 阶段 compressed hot path 先正常解码 tile，再按 outlier list 覆盖少量
+     BF16 元素。
+
+### 后续实现顺序
+
+1. 增加 outlier arena allocator，仅作为 opt-in 实验，不替换当前 tile fallback
+   默认路径。
+2. 先做 cache update encode 端：bad tile 不写 raw tile fallback，而是写
+   outlier entries；超过阈值的 tile 仍回退 raw tile。
+3. 再做 decode 端：在 tile-level fastpath 中补 outlier overlay。第一版只支持
+   `max_outliers_per_tile <= 2`。
+4. 单测覆盖 encode/decode bit exact；E2E 先跑 p1024/p2048/b1，再跑 Step 32 中
+   触发 3% pool exhaustion 的高并发长 prompt。
+5. 保留门槛：
+   - p2048/b1 correctness 不退化；
+   - 3% pool 在原先耗尽场景跑通；
+   - 常规 p512/p2048 E2E 不慢于当前 tile fallback 路径 3% 以上。
+
+## Step 35：compact outlier arena allocator 预埋
+
+### 本轮目标
+
+先完成 Step 34 后续实现顺序中的第 1 步：增加 opt-in 的 compact outlier
+arena allocation 和注册通路。当前不改 native CUDA cache update/decode 主路径，
+因此默认推理行为不变。
+
+### 新增 env
+
+```text
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=0
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=0.0
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=0
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=0
+```
+
+只有同时满足以下条件时，`Attention.get_kv_cache_spec()` 才会把 outlier arena
+容量写入 `ByteV2FullAttentionSpec`：
+
+- `VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE=1`
+- `VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1`
+- `VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1`
+- `VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK > 0`
+
+### allocation layout
+
+每个 layer 的 raw KV allocation 现在支持如下布局：
+
+```text
+[main ByteV2 pages]
+[raw fallback pool]
+[padding to int32 alignment]
+[outlier arena: int32 entries]
+[padding to int32 alignment]
+[fallback_block_ids: int32[num_blocks]]
+[fallback_next_slot: int32[1]]
+[fallback_tile_ids: int32[num_blocks, tiles_per_block]]
+[fallback_tile_next_slot: int32[1]]
+[outlier_tile_meta: int32[num_blocks, tiles_per_block]]
+[outlier_next_entry: int32[1]]
+```
+
+outlier entry 第一版按 4B 预留，后续 CUDA encode 可 pack 成：
+
+```text
+bits[7:0]   = tile 内元素 index
+bits[23:8]  = raw BF16 bits
+bits[31:24] = reserved
+```
+
+`outlier_tile_meta` 第一版只作为 `int32` slot，建议后续 pack：
+
+```text
+bits[7:0]   = outlier count
+bits[30:8]  = arena offset
+bit[31]     = 0
+```
+
+这样每个 tile 只需要一个 int32 metadata。无 outlier tile 使用 `-1`。
+
+### 已改代码
+
+- `vllm/envs.py`
+  - 新增 outlier arena 三个 opt-in env。
+- `vllm/v1/kv_cache_interface.py`
+  - `ByteV2FullAttentionSpec` 新增：
+    - `outlier_arena_entries_per_block`
+    - `outlier_arena_min_entries`
+    - `outlier_arena_entry_bytes`
+    - `outlier_tile_meta_bytes`
+    - `outlier_next_entry_bytes`
+  - 新增 offset helper：
+    - `sparse_fallback_pool_bytes()`
+    - `outlier_arena_entries()`
+    - `outlier_arena_bytes()`
+    - `outlier_arena_start_bytes()`
+    - `metadata_start_bytes()`
+    - `outlier_metadata_bytes()`
+- `vllm/model_executor/layers/attention/attention.py`
+  - 将 env 传入 `ByteV2FullAttentionSpec`。
+- `vllm/v1/worker/gpu/attn_utils.py`
+- `vllm/v1/worker/gpu_model_runner.py`
+  - 同步 raw allocation 切分：
+    `main + raw fallback + outlier arena + metadata`。
+  - 初始化 `outlier_tile_meta.fill_(-1)` 和 `outlier_next_entry.zero_()`。
+- `vllm/v1/attention/backends/byte_v2_attn.py`
+  - `ByteV2SparseFallbackPool` 增加可选 outlier tensors。
+  - `_get_sparse_fallback_pool()` 支持 runtime allocation fallback。
+  - `register_sparse_fallback_pool()` 支持 model runner 注册 arena。
+  - `get_sparse_fallback_pool_stats()` 输出 outlier capacity/usage。
+- `vllm/v1/worker/worker_base.py`
+  - sparse fallback RPC 汇总 outlier capacity/usage。
+
+### 验证
+
+```bash
+.venv/bin/python -m pytest \
+  tests/v1/test_byte_v2_kv_cache_spec.py \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_attention_impl_sparse_fallback_pool_min_blocks \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_attention_impl_outlier_arena_pool \
+  -q
+```
+
+结果：`15 passed`
+
+```bash
+.venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_tile_fallback_stats_read_tile_pool \
+  tests/v1/attention/test_byte_v2_metadata.py \
+  -q
+```
+
+结果：`6 passed`
+
+```bash
+.venv/bin/python -m ruff check \
+  vllm/envs.py \
+  vllm/v1/kv_cache_interface.py \
+  vllm/model_executor/layers/attention/attention.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/v1/worker/gpu/attn_utils.py \
+  vllm/v1/worker/gpu_model_runner.py \
+  vllm/v1/worker/worker_base.py \
+  benchmarks/byte_v2_tile_fallback_stats.py \
+  tests/v1/test_byte_v2_kv_cache_spec.py \
+  tests/v1/attention/test_byte_v2_backend.py
+```
+
+结果：`All checks passed`
+
+### 当前状态
+
+当前 Step 35 完成 allocator/metadata 预埋。Step 36 已进一步实现
+prefill-direct native encode 的 opt-in 写入路径。Step 37 已完成 decode 主路径
+overlay，因此在 `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE > 0` 且 arena tensor 存在时，
+prefill-direct 写出的 compressed+outlier tile 可以在 native paged decode 中还原。
+
+### 下一步
+
+1. 补 continuation prefill / decode append / general touched-block compress 的
+   outlier arena 写入或保真解压。
+2. 增加 outlier arena exhausted 的显式 CUDA 单测。
+3. 继续 profile outlier overlay 对 decode stage1 的额外开销。
+
+## Step 36：compact outlier arena native prefill-direct encode
+
+### 本轮目标
+
+把 Step 35 预埋的 outlier arena 接入 native cache update 的 prefill-direct
+fast path。目标是先减少真实 Llama KV 中“只有少量 outlier 的 tile”对 raw tile
+fallback pool 的占用，但保持默认关闭，避免 decode overlay 未完成前影响 E2E
+正确性。
+
+### 设计
+
+新增开关：
+
+```text
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=0
+```
+
+只有同时满足以下条件才启用：
+
+- compressed-only cache；
+- sparse fallback pool 和 tile fallback metadata 已启用；
+- outlier arena tensors 已分配并传入 native op；
+- `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE > 0`；
+- 当前 cache update 命中 prefill-direct path。
+
+prefill-direct encode 的 tile 分类改为三类：
+
+1. `miss_count <= VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE`
+   - 仍走普通 compressed tile。
+2. `lossy_max < miss_count <= VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE`
+   - 写 compressed payload；
+   - window 外元素在 payload 中 clamp 到 base window；
+   - raw BF16 bits + tile element index 写入 `outlier_arena`；
+   - `outlier_tile_meta[block_id, tile_idx]` 记录 offset/count；
+   - 不占 raw tile fallback pool。
+3. `miss_count > VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE` 或 arena 容量不足
+   - 回退当前 raw tile fallback。
+
+metadata pack：
+
+```text
+outlier entry int32:
+bits[7:0]   = tile element index
+bits[23:8]  = raw BF16 bits
+bits[31:24] = reserved
+
+outlier tile meta int32:
+bits[7:0]   = outlier count
+bits[30:8]  = arena offset
+bit[31]     = 0
+```
+
+### 已改代码
+
+- `vllm/envs.py`
+  - 新增 `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE`。
+- `vllm/_custom_ops.py`
+- `vllm/v1/attention/backends/byte_v2_ops.py`
+- `vllm/v1/attention/backends/byte_v2_attn.py`
+- `csrc/libtorch_stable/ops.h`
+- `csrc/libtorch_stable/torch_bindings.cpp`
+  - `byte_v2_reshape_and_cache()` 参数链路新增：
+    - `outlier_arena`
+    - `outlier_tile_meta`
+    - `outlier_next_entry`
+- `csrc/libtorch_stable/cache_kernels.cu`
+  - `byte_v2_prefill_direct_encode_blocks_kernel()` 支持 outlier arena。
+  - native wrapper 校验 outlier tensor dtype/device/shape。
+  - 新增 error code 10：`outlier arena exhausted`，用于后续 fail-closed
+    reporting；当前 encode 分支优先回退 raw tile fallback。
+- `tests/v1/attention/test_byte_v2_ops.py`
+  - 新增 `test_byte_v2_native_outlier_arena_prefill_direct_cuda`。
+
+### 验证
+
+由于完整 `uv pip install -e . --torch-backend=auto` 会触发 flash-attn/MoE 等大量
+无关 target，本轮手动重编并 relink 了 `_C_stable_libtorch.abi3.so`：
+
+```bash
+# 重新编译 C++ schema binding
+ccache /usr/bin/c++ ... -c csrc/libtorch_stable/torch_bindings.cpp
+
+# 重新编译 ByteV2 cache update CUDA TU
+ccache /usr/local/cuda/bin/nvcc ... -c csrc/libtorch_stable/cache_kernels.cu
+
+# 重新链接并复制到 vllm/_C_stable_libtorch.abi3.so
+/usr/bin/c++ ... -shared -o _C_stable_libtorch.abi3.so ...
+cp build/temp.linux-x86_64-cpython-312/_C_stable_libtorch.abi3.so \
+  vllm/_C_stable_libtorch.abi3.so
+```
+
+CUDA 单测：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_tile_fallback_pool_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_lossy_outlier_threshold_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_prefill_direct_cuda \
+  -q
+```
+
+结果：`3 passed`
+
+### 当前状态
+
+prefill-direct encode 已可把 small-outlier tile 写入 compact arena，验证中
+`fallback_tile_next_slot` 保持 0，说明没有占 raw tile fallback pool。Step 37
+进一步补上 native paged decode overlay。
+
+未完成：
+
+- continuation prefill / decode append / general touched-block compress path 仍未写
+  outlier arena；涉及已带 outlier 的 partial page append 时仍需要额外保真处理。
+- arena exhausted 当前会走 raw tile fallback；后续需要补显式 exhaustion 单测和
+  stats 观测。
+
+## Step 37：compact outlier arena decode overlay 和 E2E smoke
+
+### 本轮目标
+
+把 Step 36 写入的 compact outlier arena 接入 native paged decode，使
+compressed payload 解码后能用 arena 中的 raw BF16 bits 覆盖 window 外元素，
+从而可以打开 `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE` 做 E2E correctness smoke。
+
+### 设计
+
+- `byte_v2_paged_decode_attention()` 新增可选参数：
+  - `outlier_arena: int32[num_entries]`
+  - `outlier_tile_meta: int32[num_blocks, total_tiles]`
+- native wrapper 校验两个 tensor 必须一起提供，且 dtype/device/shape/contiguous
+  合法。
+- generic element loader 在 compressed tile 路径中：
+  - 先按 compressed payload 解码 BF16 bits；
+  - 若 `outlier_tile_meta[physical_block, tile_idx] >= 0`，扫描该 tile 的少量
+    outlier entry；
+  - entry 的 `tile element index` 命中当前元素时返回 raw BF16 bits。
+- split-K GQA WMMA 主路径中：
+  - K/V tile 先解压到 shared memory；
+  - 对 compressed tile 调 `byte_v2_overlay_*_tile_outliers_to_shared()`；
+  - raw tile fallback 不做 overlay；
+  - CUTE stage1 暂未支持 overlay，outlier arena 存在时自动禁用 CUTE stage1。
+
+当前 overlay 只保证 native paged decode 主路径正确。`byte_v2_decompress_page_to_raw_block()`
+仍没有读取 outlier arena，所以带 outlier 的 compressed page 若后续进入 partial-page
+decode append 解压，仍可能丢失 outlier；这需要下一步单独处理。
+
+### 已改代码
+
+- `vllm/_custom_ops.py`
+- `vllm/v1/attention/backends/byte_v2_ops.py`
+- `vllm/v1/attention/backends/byte_v2_attn.py`
+  - decode 参数链路新增 `outlier_arena` / `outlier_tile_meta`。
+- `csrc/libtorch_stable/ops.h`
+- `csrc/libtorch_stable/torch_bindings.cpp`
+  - `_C_cache_ops.byte_v2_paged_decode_attention` schema 新增两个可选参数。
+- `csrc/libtorch_stable/cache_kernels.cu`
+  - 新增 outlier meta/entry unpack helper。
+  - generic `byte_v2_load_kv_bits()` 支持 element-level overlay。
+  - split-K WMMA stage1 的 tile fastpath 支持 shared-memory overlay。
+- `tests/v1/attention/test_byte_v2_ops.py`
+  - 新增 `test_byte_v2_native_outlier_arena_decode_overlay_cuda`。
+- `tests/v1/attention/test_byte_v2_e2e.py`
+  - `_generate_token_ids()` 支持通过
+    `BYTE_V2_E2E_GPU_MEMORY_UTILIZATION` 覆盖 8B smoke 需要的显存比例。
+- `benchmarks/benchmark_byte_v2_decode_e2e.py`
+  - E2E benchmark JSON 记录 outlier arena 相关 env。
+
+### 验证
+
+native schema：
+
+```bash
+.venv/bin/python - <<'PY'
+import torch
+import vllm._C_stable_libtorch
+print(torch.ops._C_cache_ops.byte_v2_paged_decode_attention._schemas)
+PY
+```
+
+确认 schema 包含：
+
+```text
+Tensor? outlier_arena=None, Tensor? outlier_tile_meta=None
+```
+
+CUDA 单测：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_decode_overlay_cuda \
+  -q
+```
+
+结果：`1 passed`
+
+完整 ByteV2 ops/decode 回归：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_ops.py \
+  tests/v1/attention/test_byte_v2_decode.py \
+  -q
+```
+
+结果：`42 passed`
+
+8B E2E correctness smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+BYTE_V2_RUN_E2E=1 \
+BYTE_V2_E2E_MODEL=/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+BYTE_V2_E2E_GPU_MEMORY_UTILIZATION=0.8 \
+VLLM_BYTE_V2_USE_NATIVE_KERNELS=1 \
+VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE=1 \
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS=512 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1 \
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=4 \
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=4096 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_TILE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_SPLIT_K=0 \
+VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK=1 \
+.venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_e2e.py::test_byte_v2_matches_raw_vllm_e2e_smoke \
+  -q -s
+```
+
+结果：`1 passed`。raw 和 ByteV2 生成的 prompt/output token ids 一致。
+
+8B E2E performance smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_BYTE_V2_USE_NATIVE_KERNELS=1 \
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS=512 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1 \
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=4 \
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=4096 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_TILE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_SPLIT_K=0 \
+VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK=1 \
+.venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --modes raw,byte_v2_compressed_only \
+  --prompt-len 1024 \
+  --decode-lens 16,64 \
+  --batch-size 1 \
+  --num-runs 1 \
+  --warmup-decode-len 4 \
+  --gpu-memory-utilization 0.8 \
+  --enforce-eager \
+  --disable-prefix-caching \
+  --output-json benchmarks/byte_v2_decode_e2e_llama3_8b_p1024_b1_outlier_arena_smoke.json
+```
+
+结果：
+
+| mode | decode_len | output tok/s | elapsed |
+| --- | ---: | ---: | ---: |
+| raw | 16 | 27.72 | 0.577s |
+| raw | 64 | 32.82 | 1.950s |
+| ByteV2 compressed-only + outlier arena | 16 | 14.74 | 1.086s |
+| ByteV2 compressed-only + outlier arena | 64 | 15.79 | 4.054s |
+
+sparse/outlier stats：
+
+- `workers_with_pool=1`
+- `any_exhausted=false`
+- `total_next_slot=224`
+- `total_assigned_blocks=96`
+- `total_outlier_next_entry=14604`
+- `total_assigned_outlier_tiles=14604`
+- `total_outlier_capacity=1649024`
+- `any_outlier_exhausted=false`
+
+### 当前结论
+
+1. compact outlier arena 现在可以跑通 native prefill-direct encode + native paged
+   decode overlay + 8B E2E correctness smoke。
+2. p1024/b1/d16,d64 下没有 raw fallback pool 或 outlier arena exhaustion。
+3. 性能仍明显低于 raw，主要因为 decode stage1 额外 overlay metadata 检查和 ByteV2
+   解码开销叠加；该实验目标是 correctness/容量表达跑通，不是性能优化完成。
+
+### 未完成
+
+- outlier-aware `byte_v2_decompress_page_to_raw_block()`，用于 partial-page append
+  或未来 continuation update 保真。
+- continuation prefill / decode append / general touched-block compress path 写入
+  compact outlier arena。
+- outlier arena exhausted 的显式单测。
+- overlay 开销 profile，以及只在存在 outlier tile 的 block/page 上启用 overlay 的
+  compact metadata fast path。
+
+## Step 38：compact outlier arena E2E 开销隔离
+
+状态：已实验，暂不作为默认性能路径；保持 opt-in。
+
+### 目的
+
+Step 37 已证明 compact outlier arena 的 native prefill-direct encode、native paged
+decode overlay 和 8B E2E correctness 可以跑通。但 E2E 性能仍低于 raw，因此本轮隔离：
+
+1. 不开 outlier arena 的 ByteV2 compressed-only 基线；
+2. 打开 arena 但 `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=0`，测纯 metadata/路径切换开销；
+3. 打开 arena 且 `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1`，测 raw tile fallback
+   被 outlier overlay 替代后的收益。
+
+### 实验配置
+
+共同配置：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_BYTE_V2_USE_NATIVE_KERNELS=1 \
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS=512 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_TILE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_SPLIT_K=0 \
+VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK=1 \
+.venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --prompt-len 1024 \
+  --decode-lens 16,64 \
+  --batch-size 1 \
+  --num-runs 1 \
+  --warmup-decode-len 4 \
+  --gpu-memory-utilization 0.8 \
+  --enforce-eager \
+  --disable-prefix-caching
+```
+
+输出文件：
+
+- `benchmarks/byte_v2_decode_e2e_llama3_8b_p1024_b1_no_arena_compare.json`
+- `benchmarks/byte_v2_decode_e2e_llama3_8b_p1024_b1_arena_max0_compare.json`
+- `benchmarks/byte_v2_decode_e2e_llama3_8b_p1024_b1_arena_max1_compare.json`
+
+### 结果
+
+| mode | arena | max outlier/tile | decode_len | output tok/s | elapsed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| raw | 0 | 0 | 16 | 27.69 | 0.578s |
+| raw | 0 | 0 | 64 | 32.81 | 1.951s |
+| ByteV2 compressed-only | 0 | 0 | 16 | 14.63 | 1.094s |
+| ByteV2 compressed-only | 0 | 0 | 64 | 15.63 | 4.094s |
+| ByteV2 compressed-only | 1 | 0 | 16 | 14.55 | 1.100s |
+| ByteV2 compressed-only | 1 | 0 | 64 | 7.60 | 8.420s |
+| ByteV2 compressed-only | 1 | 1 | 16 | 14.56 | 1.099s |
+| ByteV2 compressed-only | 1 | 1 | 64 | 14.75 | 4.338s |
+
+fallback/outlier stats：
+
+| config | decode_len | raw tile fallbacks | outlier tiles | outlier entries | exhausted |
+| --- | ---: | ---: | ---: | ---: | --- |
+| no arena | 16 | 9882 | 0 | 0 | false |
+| no arena | 64 | 15491 | 0 | 0 | false |
+| arena, max=0 | 16 | 9882 | 0 | 0 | false |
+| arena, max=0 | 64 | 15529 | 0 | 0 | false |
+| arena, max=1 | 16 | 146 | 9736 | 9736 | false |
+| arena, max=1 | 64 | 903 | 14604 | 14604 | false |
+
+### 结论
+
+1. `max_outlier_per_tile=1` 能显著减少 raw tile fallback：
+   p1024/b1/d64 从约 1.55 万个 raw tile fallback 降到 903 个。
+2. 这个容量表达收益没有转化为 E2E 性能收益。d64 从 no-arena 的 15.63 tok/s
+   变成 arena max=1 的 14.75 tok/s，略有退化。
+3. `arena=1,max=0` 的 d64 掉到 7.60 tok/s，说明 arena 打开后走到的
+   decode overlay/metadata 路径本身存在明显额外开销；即使没有 outlier entry，也会影响
+   长 decode。
+4. 当前不应默认启用 compact outlier arena 作为性能优化。它仍可作为 opt-in 的
+   correctness/capacity 实验路径保留。
+
+### 下一步
+
+1. 对 arena decode overlay 做 Nsight profile，重点看：
+   - outlier metadata load/check 指令数；
+   - CUTE stage1 被禁用后的 stage1 kernel 差距；
+   - raw tile fallback path 和 compressed+overlay path 的 global load sectors；
+   - register、shared bank conflict、eligible warps。
+2. 设计只在存在 outlier tile 的 block/page 上启用 overlay 的 fast path：
+   - encode 阶段生成 per-block/per-page `has_outlier` compact bitmap；
+   - decode hot path 先走 no-overlay kernel；
+   - 只有 `has_outlier` 的 page/tile 走 overlay variant，避免每个 tile 都查
+     `outlier_tile_meta`。
+3. CUTE/independent stage1 若要支持 outlier arena，必须把 overlay 融入 shared
+   layout，而不是在通用 loader 中逐元素检查。
+4. 如果 profile 显示 overlay/check 成本无法低于 raw tile fallback 成本，则停止
+   性能方向，只保留 outlier arena 作为容量实验，不继续扩大这条优化线。
+
+## Step 39：compact outlier arena encode 开销优化
+
+状态：已实现并保留。
+
+### 背景
+
+Step 38 的 E2E 结果显示 compact outlier arena 能显著减少 raw tile fallback，
+但没有转化为稳定性能收益。本轮先用 decode-only benchmark + Nsight Systems
+隔离 arena 路径的 kernel 时间，避免直接从高方差 E2E 判断。
+
+### profile 结果
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 nsys profile --force-overwrite=true \
+  --trace=cuda,nvtx \
+  --output benchmarks/profiles/nsys_bytev2_decode_kernel_p1024_arena_max1 \
+  .venv/bin/python benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+    --batch-size 1 \
+    --seq-len 1024 \
+    --split-k 16 \
+    --fallback-ratio 0.125 \
+    --fallback-pattern single_outlier_per_k_tile \
+    --tile-fallback-pool \
+    --outlier-arena-entries-per-block 4 \
+    --outlier-arena-min-entries 4096 \
+    --outlier-max-per-tile 1 \
+    --num-runs 20 \
+    --warmup-runs 5 \
+    --skip-correctness \
+    --variant page_fastpath \
+    --tile-fastpath-mode on
+```
+
+关键 kernel 时间：
+
+| config | stage1 avg | split-reduce avg | prefill-direct encode |
+| --- | ---: | ---: | ---: |
+| no arena | 63.0 us | 2.93 us | 58.0 us |
+| arena max=1, 优化前 | 65.0 us | 2.92 us | 257.1 us |
+
+结论：
+
+1. decode overlay 本身只让 stage1 增加约 2 us/launch，不是主要瓶颈。
+2. 主要退化在 `byte_v2_prefill_direct_encode_blocks_kernel()`：打开 arena 后
+   encode 从 58 us 增加到 257 us。
+3. 原因是 arena encode 对每个 tile 使用 256-bin histogram 找最佳 exponent
+   window；即使绝大多数 tile 本来可以直接压缩，也会多做 histogram/atomic。
+
+### 修改 1：compressible tile fast filter
+
+在 arena/lossy 路径先做 warp-level exponent min/max：
+
+- 如果 `tile_max - tile_min <= 15`，直接写 `tile_bases`，不建 histogram。
+- 只有超出当前 ByteV2 16-exponent window 的 tile 才进入旧 histogram
+  best-window/outlier 判断。
+
+结果：
+
+| config | prefill-direct encode |
+| --- | ---: |
+| arena max=1, 优化前 | 257.1 us |
+| min/max fast filter | 236.2 us |
+
+收益只有约 8%。说明 outlier tile 上的 histogram、lane0 串行 outlier entry
+写入仍然很重。
+
+### 修改 2：single-outlier tile fast path
+
+真实统计和 synthetic case 中，大多数 arena tile 都是 1 个 outlier。因此新增
+仅覆盖以下条件的 fast path：
+
+```text
+has_outlier_arena == true
+lossy_max_misses_per_tile == 0
+outlier_max_per_tile == 1
+```
+
+做法：
+
+1. min/max 判定发现 tile 超出 16-exponent window 后，不建 histogram。
+2. 分别测试两个候选 window：
+   - `base = tile_min`，统计高端 miss 数；
+   - `base = tile_max - 15`，统计低端 miss 数。
+3. 如果任一候选 window 只有 1 个 miss，则把该 tile 记录为 outlier tile；
+   如果都超过 1 个 miss，仍走 raw tile fallback。
+4. outlier entry 写入从 lane0 串行扫描 256 个元素，改为 warp 并行查找唯一
+   outlier，再由 lane0 写 compact arena entry。
+5. 其他情况仍走旧 histogram 路径，保持 `outlier_max_per_tile > 1` 和 lossy
+   实验的通用性。
+
+### 验证
+
+CUDA 单测：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_prefill_direct_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_decode_overlay_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_tile_fallback_pool_cuda \
+  -q -s
+```
+
+结果：`3 passed`。
+
+decode-only benchmark：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+.venv/bin/python benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  --batch-size 1 \
+  --seq-len 1024 \
+  --split-k 16 \
+  --fallback-ratio 0.125 \
+  --fallback-pattern single_outlier_per_k_tile \
+  --tile-fallback-pool \
+  --outlier-arena-entries-per-block 4 \
+  --outlier-arena-min-entries 4096 \
+  --outlier-max-per-tile 1 \
+  --num-runs 100 \
+  --warmup-runs 20 \
+  --skip-correctness \
+  --variant page_fastpath \
+  --tile-fastpath-mode on \
+  --output-json benchmarks/profiles/bytev2_decode_kernel_p1024_b1_single_outlier_tiles_arena_max1_after_single_outlier_fastpath.json
+```
+
+结果：
+
+```text
+median_us=1043.97
+p90_us=1072.13
+fallback_tiles=0/2048
+outlier_tiles=512
+outlier_entries=512/4096
+```
+
+Nsight Systems：
+
+| config | stage1 avg | split-reduce avg | prefill-direct encode |
+| --- | ---: | ---: | ---: |
+| no arena | 63.0 us | 2.93 us | 58.0 us |
+| arena max=1, 优化前 | 65.0 us | 2.92 us | 257.1 us |
+| min/max fast filter | 65.2 us | 2.93 us | 236.2 us |
+| single-outlier fast path | 64.9 us | 2.93 us | 75.8 us |
+
+single-outlier fast path 把 arena encode 开销从 257.1 us 降到 75.8 us，
+接近 no-arena 的 58.0 us；decode stage1 没有明显退化。
+
+8B E2E smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_BYTE_V2_USE_NATIVE_KERNELS=1 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_TILE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_SPLIT_K=16 \
+VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE=1 \
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1 \
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=4 \
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=4096 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1 \
+VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC=1 \
+VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK=1 \
+.venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+  --modes byte_v2_compressed_only \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --prompt-len 1024 \
+  --decode-lens 64 \
+  --batch-size 1 \
+  --num-runs 2 \
+  --warmup-decode-len 8 \
+  --gpu-memory-utilization 0.80 \
+  --enforce-eager \
+  --output-json benchmarks/profiles/bytev2_e2e_p1024_b1_d64_arena_max1_after_single_outlier_fastpath.json
+```
+
+结果：
+
+| config | decode_len | output tok/s | elapsed |
+| --- | ---: | ---: | ---: |
+| ByteV2 compressed-only + arena max=1 | 64 | 15.99 | 4.003s |
+
+pool 统计：
+
+- `any_exhausted=false`
+- `any_outlier_exhausted=false`
+- `total_assigned_outlier_tiles=4999`
+- `total_outlier_next_entry=4999`
+- `total_outlier_capacity=1649024`
+- `total_next_slot=320`
+
+E2E 相比 Step 38 的 arena max=1 d64（约 14.75 tok/s，另一次 rerun 约
+15.36 tok/s）有改善，但 E2E 方差较大；本轮保留修改的主要依据是 nsys 中
+prefill-direct encode 的稳定下降。
+
+### 结论
+
+1. compact outlier arena 的主要新增瓶颈不是 decode overlay，而是 encode 端
+   outlier tile 分类和 entry 写入。
+2. 对 `outlier_max_per_tile=1` 做专用快路径有效，能把 arena encode 开销从
+   257.1 us 降到 75.8 us。
+3. 当前仍保留通用 histogram 路径，避免影响 `outlier_max_per_tile > 1` 和
+   lossy 实验。
+4. 后续若继续优化 arena，优先看 decode stage1 的 overlay metadata check 和
+   CUTE/independent stage1 对 outlier overlay 的支持，而不是继续扩大 encode
+   端复杂度。
+
+## Step 40: per-block has-outlier flag 实验
+
+### 背景
+
+compact outlier arena 的 decode overlay 需要检查 `outlier_tile_meta`。如果一个
+physical block 没有任何 outlier tile，则理论上可以在 block 粒度直接跳过所有 tile
+metadata 检查，减少 compressed hot path 的 metadata 读和分支。
+
+### 实现
+
+新增 per-block int32 flag：
+
+```text
+outlier_block_flags[physical_block] == 0: 该 block 没有 compact outlier entry
+outlier_block_flags[physical_block] != 0: 该 block 可能有 compact outlier entry
+```
+
+改动点：
+
+1. `ByteV2FullAttentionSpec` 增加 `outlier_block_flag_bytes=4`，并把
+   `num_blocks * 4` 计入 `outlier_metadata_bytes()`。
+2. allocator 在 sparse fallback metadata 之后切出 `outlier_block_flags`：
+   - `vllm/v1/worker/gpu/attn_utils.py`
+   - `vllm/v1/worker/gpu_model_runner.py`
+3. native cache update 支持写 flag：
+   - prefill-direct encode：block 开始清 0；写入 compact outlier entry 后置 1。
+   - decode append / touched-block compress：当前不写 outlier arena，清 0，避免旧
+     metadata 被误用。
+4. native decode 支持读取 flag：
+   - flag 为 0 时，把 block-local `outlier_arena/outlier_tile_meta` 置空，跳过
+     tile metadata overlay。
+   - flag 参数为 `nullptr` 时保持旧行为。
+5. Python/backend 增加 opt-in 开关：
+   - `VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS=1` 时 backend 才传 flag。
+   - 默认关闭，因为真实 Llama-3 8B prompt 下多数 block 都含至少一个 outlier，
+     block 级 flag 很少能跳过 metadata。
+6. decode kernel benchmark 增加 `--use-outlier-block-flags`，用于显式测该方案。
+
+### 验证
+
+CUDA 单测：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_prefill_direct_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_decode_overlay_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_tile_fallback_pool_cuda \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_attention_impl_outlier_arena_pool \
+  tests/v1/test_byte_v2_kv_cache_spec.py::test_byte_v2_full_attention_spec_outlier_arena_allocation_size \
+  -q -s
+```
+
+结果：`5 passed`。
+
+构建：
+
+```bash
+uv pip install --python .venv/bin/python -e . --torch-backend=auto
+```
+
+结果：成功，native rebuild 耗时约 17 分钟。
+
+### decode-only 结果
+
+合成低 outlier-block 场景：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  --batch-size 1 \
+  --seq-len 1024 \
+  --split-k 16 \
+  --fallback-ratio 0.125 \
+  --fallback-pattern single_outlier_per_k_tile \
+  --tile-fallback-pool \
+  --outlier-arena-entries-per-block 4 \
+  --outlier-arena-min-entries 4096 \
+  --outlier-max-per-tile 1 \
+  --num-runs 100 \
+  --warmup-runs 20 \
+  --skip-correctness \
+  --variant page_fastpath \
+  --tile-fastpath-mode on
+```
+
+结果：
+
+| config | median | p90 | outlier blocks | outlier tiles |
+| --- | ---: | ---: | ---: | ---: |
+| flags off | 1049.60 us | 1144.83 us | 0 | 512 |
+| flags on | 1044.99 us | 1126.40 us | 8/64 | 512 |
+
+Nsight Systems 对比上一版：
+
+| config | stage1 avg | split-reduce avg | prefill-direct encode |
+| --- | ---: | ---: | ---: |
+| single-outlier fast path | 64.89 us | 2.93 us | 75.78 us |
+| block flags on | 61.40 us | 2.93 us | 76.29 us |
+
+在合成场景中，stage1 kernel 约有 5.4% 改善；整体 decode-only median 只有小幅
+改善，属于低 outlier-block 分布下的局部收益。
+
+### E2E 结果
+
+8B E2E smoke，prompt=1024、decode=64、batch=1、enforce eager：
+
+| config | output tok/s | elapsed | pool exhausted |
+| --- | ---: | ---: | --- |
+| block flags on | 14.05-14.15 | 4.52-4.56s | false |
+| block flags off after gate | 14.09 | 4.54s | false |
+
+真实 Llama-3 8B prompt 的统计显示，每层约 48-65 个 prompt block 被标记为
+`assigned_outlier_blocks`，而总 prompt block 约 64 个；也就是说大多数 block 都有
+至少一个 compact outlier entry，block 级 flag 几乎不能跳过 metadata。
+
+### 结论
+
+1. per-block has-outlier flag 在“多数 block 无 outlier”的合成场景下能降低 stage1
+   kernel 时间。
+2. 真实 Llama-3 8B prompt 下多数 block 都有 outlier，E2E 没有可观收益。
+3. 该能力保留为 opt-in 实验路径，默认关闭：
+
+```bash
+VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS=1
+```
+
+4. 后续如果要继续优化真实场景，应做 per-tile / warp-local metadata fast path，而不是
+   只依赖 per-block flag。
+
+## Step 41: tile-level has-outlier bitmap 实验
+
+### 背景
+
+Step 40 的 per-block flag 只能跳过完全没有 compact outlier entry 的 block。
+真实 Llama-3 8B prompt 中多数 block 都至少有一个 outlier，但之前 tile 统计显示，
+一个 block 内真正含 outlier 的 tile 比例仍然很低。因此继续增加 tile 粒度 bitmap：
+
+```text
+outlier_tile_bitmap[physical_block, word] bit tile_idx == 0:
+  该 tile 没有 compact outlier entry，可跳过 outlier_tile_meta 读取
+
+outlier_tile_bitmap[physical_block, word] bit tile_idx == 1:
+  该 tile 可能有 compact outlier entry，需要读取 outlier_tile_meta 并 overlay
+```
+
+当 bitmap 参数为 `nullptr` 时保持旧行为：只要 outlier arena/meta 存在，就按旧路径查
+`outlier_tile_meta`。
+
+### 实现
+
+1. `ByteV2FullAttentionSpec` 增加 `outlier_tile_bitmap_word_bytes=4` 和
+   `outlier_tile_bitmap_words_per_block = ceil(total_tiles / 32)`。
+2. allocator metadata layout 更新为：
+
+```text
+fallback_block_ids
+fallback_next_slot
+fallback_tile_ids
+fallback_tile_next_slot
+outlier_block_flags
+outlier_tile_bitmap
+outlier_tile_meta
+outlier_next_entry
+```
+
+3. backend pool 增加 `outlier_tile_bitmap`，并在 stats 中输出
+   `assigned_outlier_bitmap_tiles`。
+4. native op/schema/Python wrapper 增加可选参数：
+   - cache update：`outlier_block_flags -> outlier_tile_bitmap -> outlier_tile_meta`
+   - decode：`outlier_block_flags -> outlier_tile_bitmap -> outlier_tile_meta`
+5. cache update kernel 行为：
+   - prefill-direct encode：每个 physical block 开始时清零 bitmap words；只有成功写入
+     compact outlier arena 的 tile 才置位。
+   - decode append / touched-block compress：当前不写 outlier arena，清零该 block 的
+     block flag 和 tile bitmap，避免旧 metadata 被误用。
+6. decode kernel 行为：
+   - block flag 为 0 时仍先跳过整个 block 的 arena/meta。
+   - block 可能有 outlier 时，再按 tile bitmap 跳过无 outlier tile 的
+     `outlier_tile_meta` 读取。
+   - GQA shared、GQA WMMA、split-K stage1 以及 compressed/tile fast path 都接入了
+     bitmap gate。
+7. 新增 opt-in 开关，默认关闭：
+
+```bash
+VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP=1
+```
+
+decode-only benchmark 增加：
+
+```bash
+--use-outlier-tile-bitmap
+```
+
+### 验证
+
+Python/ruff：
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/envs.py \
+  vllm/v1/kv_cache_interface.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/_custom_ops.py \
+  vllm/v1/attention/backends/byte_v2_ops.py \
+  vllm/v1/worker/gpu/attn_utils.py \
+  vllm/v1/worker/gpu_model_runner.py \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_ops.py \
+  tests/v1/attention/test_byte_v2_backend.py \
+  tests/v1/test_byte_v2_kv_cache_spec.py
+
+.venv/bin/python -m ruff check \
+  vllm/envs.py \
+  vllm/v1/kv_cache_interface.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/_custom_ops.py \
+  vllm/v1/attention/backends/byte_v2_ops.py \
+  vllm/v1/worker/gpu/attn_utils.py \
+  vllm/v1/worker/gpu_model_runner.py \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_ops.py \
+  tests/v1/attention/test_byte_v2_backend.py \
+  tests/v1/test_byte_v2_kv_cache_spec.py
+```
+
+结果：通过。
+
+native rebuild：
+
+```bash
+uv pip install --python .venv/bin/python -e . --torch-backend=auto
+```
+
+结果：成功，native rebuild 耗时约 17 分 29 秒。
+
+CUDA 单测：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/test_byte_v2_kv_cache_spec.py::test_byte_v2_full_attention_spec_outlier_arena_allocation_size \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_attention_impl_outlier_arena_pool \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_prefill_direct_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_decode_overlay_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_tile_fallback_pool_cuda \
+  -q -s
+```
+
+结果：`5 passed`。
+
+其中 `test_byte_v2_native_outlier_arena_prefill_direct_cuda` 额外覆盖了一个 stale
+`outlier_tile_meta` 场景：手动把没有 outlier 的 V tile meta 写成旧值，如果 tile
+bitmap 不生效，decode 会错误 overlay；当前结果与 raw reference 一致。
+
+E2E smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1 \
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=4 \
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=4096 \
+VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP=1 \
+VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS=1 \
+.venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --modes byte_v2_compressed_only \
+  --prompt-len 128 \
+  --decode-lens 8 \
+  --batch-size 1 \
+  --num-runs 1 \
+  --warmup-decode-len 1 \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --gpu-memory-utilization 0.85 \
+  --enforce-eager \
+  --disable-prefix-caching
+```
+
+结果：
+
+- `decode_len=8`，median output throughput `14.72 tok/s`，median elapsed
+  `0.543s`。
+- `any_exhausted=false`，`any_outlier_exhausted=false`。
+- final stats 中 `total_assigned_outlier_tiles=1574`，
+  `total_outlier_next_entry=1574`，并且各层
+  `assigned_outlier_bitmap_tiles == assigned_outlier_tiles`，说明 bitmap 在真实
+  backend 路径中被写入。
+
+### decode-only 结果
+
+场景 A：每个 block 只有 1 个 tile 有 outlier，且所有 block 都有 outlier。
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  --batch-size 1 \
+  --seq-len 1024 \
+  --split-k 16 \
+  --fallback-ratio 1.0 \
+  --fallback-pattern single_outlier \
+  --tile-fallback-pool \
+  --outlier-max-per-tile 1 \
+  --outlier-arena-entries-per-block 2 \
+  --outlier-arena-min-entries 4096 \
+  --use-outlier-block-flags \
+  --num-runs 50 \
+  --warmup-runs 10 \
+  --skip-correctness \
+  --variant page_fastpath \
+  --tile-fastpath-mode on \
+  --partial-workspace
+```
+
+| config | median | p90 | outlier bitmap tiles | outlier tiles |
+| --- | ---: | ---: | ---: | ---: |
+| tile bitmap off | 1043.97 us | 1096.70 us | 0 | 64 |
+| tile bitmap on | 1050.62 us | 1065.98 us | 64 | 64 |
+
+场景 B：只有 12.5% block 有 1 个 outlier tile，不传 block flag，只看 tile bitmap
+是否能单独降低 meta 读取。
+
+| config | median | p90 | outlier bitmap tiles | outlier tiles |
+| --- | ---: | ---: | ---: | ---: |
+| tile bitmap off | 1038.85 us | 1062.91 us | 0 | 8 |
+| tile bitmap on | 1040.90 us | 1120.26 us | 8 | 8 |
+
+### 结论
+
+1. tile-level bitmap 功能已打通，并能正确防止 stale `outlier_tile_meta` 被误用。
+2. 当前 decode-only microbenchmark 没有观察到稳定性能提升；bitmap 读、bit test 和
+   现有 stage1 pipeline 的其它成本抵消了减少 `outlier_tile_meta` 读取的收益。
+3. 因为 E2E 可能受方差影响，当前保留实现但默认关闭，只作为后续 profiling 和
+   CUTE/independent stage1 overlay 改造的实验开关。
+4. 如果后续要让该 bitmap 产生收益，需要把它和 stage1 tile loader 融合得更彻底：
+   - warp/group 级一次读取 bitmap word，避免每个 overlay helper 重复算 word；
+   - 在 shared loader 调度中把 no-outlier tile 走完全独立的 no-overlay path；
+   - CUTE/independent stage1 中把 tile bitmap 作为 producer 分支，而不是 consumer
+     元素级 overlay 分支。
+
+## Step 42：CUTE stage1 支持 fallback/outlier metadata
+
+### 目标
+
+前一轮 profile 表明 decode stage1 的主要差距不在单纯的 fallback/outlier 分支检查。
+本轮先尝试了一个 generic compressed-only hotpath：在 split stage1 中通过编译期模板
+去掉 fallback/outlier 参数和 overlay helper。该方案在 fallback=0 decode-only 下没有
+收益，因此不保留。
+
+随后把已有 CUTE-style fixed-shape stage1 扩展到 metadata 场景，使其可以在
+`VLLM_BYTE_V2_DECODE_CUTE_STAGE1=1` 且 Llama-3 8B 形状下处理：
+
+- sparse fallback pool / block raw fallback；
+- tile fallback pool；
+- compact outlier arena；
+- outlier block flag / tile bitmap gate。
+
+没有 metadata 时仍走 `metadata_fastpath=false` 编译期路径，保持原 CUTE no-metadata
+fast path。
+
+### 代码改动
+
+- `csrc/libtorch_stable/cache_kernels.cu`
+  - `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel` 增加
+    `metadata_fastpath` 模板参数。
+  - metadata 变体在 compressed page 下复用 no-fallback tile decoder、tile fallback
+    decoder 和 outlier overlay helper。
+  - metadata 变体支持 raw fallback page，从 sparse fallback pool 或 page raw tail
+    读取 raw K/V。
+  - host launch 中当 `VLLM_BYTE_V2_DECODE_CUTE_STAGE1=1`、shape 为
+    `num_heads=32,num_kv_heads=8,head_size=128,head_size_v=128`、page size 为
+    compressed-only 时启用 CUTE；有 fallback/outlier metadata 时实例化
+    `metadata_fastpath=true`。
+- `benchmarks/kernels/benchmark_byte_v2_decode_kernel.py`
+  - 新增 `--cute-stage1`，并自动启用 page fastpath。
+- `vllm/envs.py`
+  - 增加 `VLLM_BYTE_V2_DECODE_CUTE_STAGE1` 环境变量定义。
+- `tests/v1/attention/test_byte_v2_decode.py`
+  - 新增 CUTE metadata correctness 测试，覆盖 compressed-only page size +
+    fallback pool raw block。
+
+### 验证
+
+```bash
+.venv/bin/python -m py_compile \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_decode.py \
+  vllm/envs.py
+
+.venv/bin/python -m ruff check \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_decode.py \
+  vllm/envs.py
+
+git diff --check -- \
+  csrc/libtorch_stable/cache_kernels.cu \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_decode.py \
+  vllm/envs.py
+
+uv pip install --python .venv/bin/python -e . --torch-backend=auto
+
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_metadata_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_gqa_wmma_split_k_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_page_fastpath_split_k_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_tile_fastpath_cuda \
+  -q -s
+```
+
+结果：Python/ruff/diff-check 通过，native rebuild 成功，CUDA 单测 `5 passed`。
+
+E2E smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_CUTE_STAGE1=1 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1 \
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=4 \
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=4096 \
+.venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --modes byte_v2_compressed_only \
+  --prompt-len 128 \
+  --decode-lens 8 \
+  --batch-size 1 \
+  --num-runs 1 \
+  --warmup-decode-len 1 \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --gpu-memory-utilization 0.85 \
+  --enforce-eager \
+  --disable-prefix-caching
+```
+
+结果：`decode_len=8`，median output throughput `14.83 tok/s`，median elapsed
+`0.539s`；`any_exhausted=false`，`any_outlier_exhausted=false`；
+`total_assigned_outlier_tiles=1574`，`total_outlier_next_entry=1574`。
+
+### decode-only A/B
+
+配置：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  --batch-size 1 \
+  --seq-len 1024,2048 \
+  --split-k 16,32 \
+  --num-runs 100 \
+  --warmup-runs 20 \
+  --variant page_fastpath \
+  --tile-fastpath-mode on \
+  --partial-workspace \
+  --fallback-ratio 0.03 \
+  --fallback-pattern single_outlier_per_k_tile \
+  --tile-fallback-pool \
+  --outlier-arena-entries-per-block 8 \
+  --outlier-arena-min-entries 4096 \
+  --outlier-max-per-tile 1 \
+  --skip-correctness
+```
+
+同配置启用 CUTE：
+
+```bash
+--cute-stage1
+```
+
+| seq_len | split_k | page-fastpath | CUTE metadata | latency delta |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 16 | 1046.53 us | 1015.81 us | -2.9% |
+| 1024 | 32 | 1084.42 us | 992.26 us | -8.5% |
+| 2048 | 16 | 1231.87 us | 1171.46 us | -4.9% |
+| 2048 | 32 | 1155.07 us | 1114.59 us | -3.5% |
+
+额外 fallback=0/no-metadata 场景下，CUTE stage1 也保持收益：
+
+| seq_len | split_k | CUTE median |
+| ---: | ---: | ---: |
+| 1024 | 16 | 999.94 us |
+| 1024 | 32 | 987.14 us |
+| 2048 | 16 | 1122.30 us |
+| 2048 | 32 | 1101.82 us |
+
+### 结论
+
+1. 单纯去掉 generic stage1 的 fallback/outlier 分支没有收益，说明瓶颈主要来自
+   stage1 的 softmax/reduce 组织、shared layout 和 WMMA 消费方式，而不是 metadata
+   pointer check。
+2. CUTE-style stage1 的 warp-level softmax 和固定 Llama GQA/head geometry 对 decode
+   stage1 有稳定收益。
+3. metadata 支持后，CUTE stage1 可以进入 outlier arena / tile fallback 实验路径，
+   下一步应做 E2E 对比，并考虑把 CUTE stage1 作为 ByteV2 Llama-3 8B 形状的默认
+   opt-in 性能路径。
+
+## Step 43：batched decode append 默认化与 host device-property cache
+
+### 目标
+
+Step 42 之后重新 profile p512/b4/d128，发现 E2E 中还有两个容易误判的问题：
+
+1. `benchmark_byte_v2_decode_e2e.py --child-mode byte_v2_compressed_only`
+   没有在 child 进程内应用 `_mode_env()`，单独 nsys child profile 会漏掉
+   `VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE=1`。
+2. 在修正 child-mode 以后，decode append fast path 已经把 cache update GPU
+   时间压到几十毫秒级，但 Nsight API 表里出现 4096 次
+   `cudaGetDeviceProperties`，总计约 4.5s，对应 128 decode step * 32 layers。
+
+因此本轮目标不是继续改 stage1，而是：
+
+- 让 child-mode profile 与 parent-mode 环境一致；
+- 让 eager/profile 下安全地默认走 batched decode append fast path；
+- 缓存 ByteV2 attention wrapper 里的 BF16 WMMA device capability 查询。
+
+### 代码改动
+
+1. `benchmarks/benchmark_byte_v2_decode_e2e.py`
+   - `run_child()` 开头执行 `os.environ.update(_mode_env(mode))`。
+   - 修正后，直接跑 `--child-mode byte_v2_compressed_only` 会设置
+     `VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE=1`，并创建 sparse fallback pool。
+
+2. `csrc/libtorch_stable/cache_kernels.cu`
+   - 新增 `byte_v2_validate_decode_append_slots_kernel`。
+   - eager multi-token decode update 默认先做无副作用 validation：
+     - slot/block 合法；
+     - active tokens 不重复写同一个 physical block；
+     - page status/valid rows 合法；
+     - 空 block 只允许 offset 0；
+     - non-overwrite append 只允许 `existing_valid_rows == block_offset`；
+     - finalized block 或 same-block continuation 自动回退 generic path。
+   - validation 通过时走 `byte_v2_decode_append_cache_kernel`；
+     失败时走 generic touched-block path。
+   - 单 token、CUDA graph capture、显式
+     `VLLM_BYTE_V2_DECODE_APPEND_BATCH_FASTPATH=1` 保持原 fast path 行为。
+   - 新增 `byte_v2_device_supports_bf16_wmma()`，用 `std::once_flag` 按 device
+     缓存 BF16 WMMA capability，替换每次 attention launch 前的
+     `cudaGetDeviceProperties`。
+
+3. `tests/v1/attention/test_byte_v2_ops.py`
+   - batched decode append 测试不再依赖显式 env，覆盖默认 safe path。
+   - 新增 same-block batched update fallback 测试，验证 continuation/same-block
+     场景不会被 fast path 误写。
+
+### 验证
+
+native rebuild：
+
+```bash
+uv pip install -e . --torch-backend=auto
+```
+
+结果：成功，约 `22m46s`。
+
+targeted tests：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_batched_decode_append_uses_partial_raw_fallback_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_batched_same_block_update_falls_back_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_decode_append_finalizes_partial_raw_fallback_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_batched_decode_append_finalizes_blocks_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_batched_decode_append_duplicate_block_fails_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_decode_append_fallback_pool_exhaustion_cuda \
+  -q
+```
+
+结果：`6 passed`。
+
+decode/backend smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_decode.py \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_deferred_cache_update_records_sticky_error \
+  -q
+```
+
+结果：`27 passed`。
+
+### E2E
+
+workload：
+
+```text
+model=/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct
+prompt_len=512
+batch_size=4
+decode_len=128
+enforce_eager=true
+fallback_pool_ratio=0.03
+outlier_arena=off
+CUTE metadata auto=on
+split_k=8
+```
+
+结果：
+
+| mode | tok/s | elapsed | pool exhausted |
+| --- | ---: | ---: | --- |
+| raw | 131.15 | 3.904s | false |
+| ByteV2 compressed-only | 102.66 | 4.988s | false |
+
+ByteV2 达到 raw 的约 `78.3%`。
+
+### nsys
+
+有效 compressed-only profile：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+VLLM_BYTE_V2_USE_NATIVE_KERNELS=1 \
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=0 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_TILE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_SPLIT_K=8 \
+VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE=1 \
+VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO=1 \
+nsys profile --trace=cuda,nvtx,cublas \
+  --output benchmarks/profiles/nsys_cached_props_bytev2_cute_p512_b4_d128 \
+  .venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+    --child-mode byte_v2_compressed_only \
+    --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+    --prompt-len 512 --decode-lens 128 --batch-size 4 \
+    --num-runs 1 --warmup-decode-len 8 \
+    --gpu-memory-utilization 0.80 --enforce-eager
+```
+
+ByteV2 profile run：`104.56 tok/s`。
+
+关键 GPU kernel：
+
+| kernel/category | total |
+| --- | ---: |
+| measured projected GPU time | 5455.5 ms |
+| `Kernel2` | 2248.4 ms |
+| GEMM `64x64_sliced1x2` | 1144.4 ms |
+| `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel` | 292.6 ms |
+| `byte_v2_paged_decode_attention_split_reduce_parallel_kernel` | 13.5 ms |
+| `byte_v2_decode_append_cache_kernel` | 33.3 ms |
+| `byte_v2_validate_decode_append_slots_kernel` | 10.2 ms |
+| `byte_v2_init_decode_append_result_kernel` | 4.6 ms |
+
+关键 API 对比：
+
+| API | 修复前 | 修复后 |
+| --- | ---: | ---: |
+| `cudaGetDeviceProperties_v2_v12000` | 4096 calls / 4506.2 ms | 不再出现在 measured API top list |
+
+### 结论
+
+本轮改动保留。
+
+主要收益来自 host wrapper 的 `cudaGetDeviceProperties` cache，其次是 batched
+decode append 默认 safe path。p512/b4/d128 已经不再被
+`byte_v2_compress_touched_blocks_kernel` 主导，cache update GPU 时间下降到：
+
+```text
+decode append: 33.3 ms
+validation:    10.2 ms
+result init:    4.6 ms
+```
+
+剩余差距主要是：
+
+1. ByteV2 CUTE stage1 仍有 292.6 ms，raw attention 之前约 93 ms 量级；
+2. eager 路径还有大量 `cudaMemcpyAsync` 和 `cudaStreamSynchronize`；
+3. ByteV2 production cudagraph 还未重新启用和验证。
+
+下一步优先级：
+
+1. 减少 validation/result host copy，同步到 deferred sticky error 或调度侧 metadata；
+2. 重新回到 stage1：CUTE/CUTLASS-style loader、shared layout、PV/write partial；
+3. 做 non-eager/cudagraph profile，确认 production 路径和 raw 的真实差距。
+
+## Step 44：metadata-gated deferred batched decode append
+
+### 背景
+
+Step 43 之后，p512/b4/d128 的 ByteV2 compressed-only 已经恢复到
+`102.66 tok/s`，但 nsys 仍显示 eager multi-token decode append 有明显的 host
+validation/result copy：
+
+| item | Step 43 no-deferred |
+| --- | ---: |
+| `byte_v2_validate_decode_append_slots_kernel` | 4064 calls / 10.24 ms |
+| `cudaMemcpyAsync` | 17293 calls / 2026.35 ms |
+| `cudaStreamSynchronize` | 8320 calls / 28.17 ms |
+
+因此本轮目标是把 Step 43 的 validation/result host copy 转为
+production-safe 的 deferred sticky error 路径。
+
+### 反例：不能只看 `deferred_error`
+
+第一版尝试在 native 层用：
+
+```text
+has_deferred_error && !has_outlier_arena
+```
+
+直接打开 `num_tokens > 1` 的 decode append fast path。targeted unit test 能过，
+但真实 E2E warmup 失败：
+
+```text
+Byte-v2 deferred decode cache append failed:
+duplicate token slot in one cache update (error_code=3, block_id=1, ...)
+```
+
+原因是 `deferred_error` 只表示“错误可以延后上报”，不能证明当前 update 是
+pure decode append。warmup/prefill 同样会携带 deferred error tensor，因此会被误放进
+batched decode append fast path。
+
+### 修复方案
+
+本轮改成 metadata-gated：
+
+1. `unified_kv_cache_update()` 从 `get_attention_context()` 取
+   `attn_metadata`。
+2. 对实现了 `do_kv_cache_update_with_metadata()` 的 backend 传入 metadata；
+   其他 backend 仍走旧的 `do_kv_cache_update()`，不改变 raw vLLM 路径。
+3. `ByteV2AttentionImpl` 增加 `_is_pure_decode_cache_update()`：
+   - metadata 是 `ByteV2Metadata`；
+   - `num_prefills == 0`；
+   - `num_prefill_tokens == 0`；
+   - `max_query_len == 1`；
+   - `num_decodes == num_decode_tokens`；
+   - `num_decode_tokens == num_actual_tokens == slot_mapping.numel()`；
+   - `slot_mapping.numel() > 1`。
+4. native op 新增默认参数：
+
+```text
+decode_append_fast_path_safe=False
+```
+
+只有上层 metadata 判定为 pure decode，且 native 层确认
+`has_deferred_error && !has_outlier_arena` 时，eager multi-token update 才跳过
+validation/result host copy。
+
+单 token fast path、CUDA graph capture fast path、显式
+`VLLM_BYTE_V2_DECODE_APPEND_BATCH_FASTPATH=1` 保持 Step 43 行为。
+
+### 代码改动
+
+1. `vllm/model_executor/layers/attention/attention.py`
+   - `unified_kv_cache_update()` 增加 metadata-aware 分发。
+
+2. `vllm/v1/attention/backends/byte_v2_attn.py`
+   - 增加 `_is_pure_decode_cache_update()`。
+   - 增加 `do_kv_cache_update_with_metadata()`。
+   - 透传 `decode_append_fast_path_safe` 到 ByteV2 cache update op。
+
+3. `vllm/_custom_ops.py`、
+   `vllm/v1/attention/backends/byte_v2_ops.py`、
+   `csrc/libtorch_stable/ops.h`、
+   `csrc/libtorch_stable/torch_bindings.cpp`、
+   `csrc/libtorch_stable/cache_kernels.cu`
+   - 为 `byte_v2_reshape_and_cache` 增加
+     `decode_append_fast_path_safe` 参数。
+
+4. `tests/v1/attention/test_byte_v2_backend.py`
+   - 增加 direct native op 的 deferred batched append fast path 测试；
+   - 增加 duplicate-block sticky error 测试。
+
+### 验证
+
+静态检查：
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/_custom_ops.py \
+  vllm/v1/attention/backends/byte_v2_ops.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/model_executor/layers/attention/attention.py \
+  tests/v1/attention/test_byte_v2_backend.py
+
+.venv/bin/python -m ruff check \
+  vllm/_custom_ops.py \
+  vllm/v1/attention/backends/byte_v2_ops.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/model_executor/layers/attention/attention.py \
+  tests/v1/attention/test_byte_v2_backend.py
+```
+
+结果：通过。
+
+native rebuild：
+
+```bash
+uv pip install -e . --torch-backend=auto
+```
+
+结果：成功，约 `16m05s`。
+
+targeted CUDA tests：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_deferred_batched_decode_append_fast_path_cuda \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_deferred_batched_duplicate_block_records_error_cuda \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_deferred_cache_update_records_sticky_error \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_batched_decode_append_uses_partial_raw_fallback_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_batched_same_block_update_falls_back_cuda \
+  -q
+```
+
+结果：`5 passed`。
+
+decode/backend smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_decode.py \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_deferred_cache_update_records_sticky_error \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_deferred_batched_decode_append_fast_path_cuda \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_deferred_batched_duplicate_block_records_error_cuda \
+  -q
+```
+
+结果：`29 passed`。
+
+### E2E
+
+workload：
+
+```text
+model=/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct
+prompt_len=512
+batch_size=4
+decode_len=128
+fallback_pool_ratio=0.03
+outlier_arena=off
+CUTE metadata auto=on
+split_k=8
+enforce_eager=true
+```
+
+结果：
+
+| variant | tok/s | elapsed | raw 占比 |
+| --- | ---: | ---: | ---: |
+| raw | 131.09 | 3.906s | 100% |
+| ByteV2 no-deferred | 102.60 | 4.990s | 78.3% |
+| ByteV2 deferred metadata gate | 122.24 | 4.189s | 93.3% |
+
+相对 no-deferred 提升约 `+19.1%`。本轮改动保留。
+
+### nsys
+
+本轮 deferred metadata-gated profile：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+VLLM_BYTE_V2_USE_NATIVE_KERNELS=1 \
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1 \
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=0 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=0 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_TILE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_SPLIT_K=8 \
+VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE=1 \
+VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO=1 \
+VLLM_BYTE_V2_DECODE_FLASH_STAGE1=0 \
+VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK=1 \
+nsys profile --force-overwrite=true --trace=cuda,nvtx,cublas \
+  --cuda-graph-trace=node --sample=none --cpuctxsw=none \
+  --cuda-event-trace=false \
+  --output benchmarks/profiles/nsys_deferred_append_bytev2_cute_p512_b4_d128 \
+  .venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+    --child-mode byte_v2_compressed_only \
+    --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+    --prompt-len 512 --decode-lens 128 --batch-size 4 \
+    --num-runs 1 --warmup-decode-len 8 \
+    --gpu-memory-utilization 0.80 --enforce-eager
+```
+
+profile run：`122.27 tok/s`。
+
+对比 Step 43：
+
+| item | Step 43 no-deferred | Step 44 deferred gate |
+| --- | ---: | ---: |
+| `byte_v2_validate_decode_append_slots_kernel` | 4064 calls / 10.24 ms | 0 |
+| `byte_v2_decode_append_cache_kernel` | 4064 calls / 33.29 ms | 4064 calls / 34.49 ms |
+| `byte_v2_init_decode_append_result_kernel` | 4064 calls / 4.63 ms | 4064 calls / 6.21 ms |
+| `byte_v2_record_deferred_cache_update_error_kernel` | 0 | 4064 calls / 6.08 ms |
+| `cudaMemcpyAsync` | 17293 calls / 2026.35 ms | 5005 calls / 1056.50 ms |
+| `cudaStreamSynchronize` | 8320 calls / 28.17 ms | 320 calls / 2.81 ms |
+
+解释：
+
+- validation kernel 和 host-side validation result copy 被移除；
+- sticky error record 增加约 `6.08 ms`，但它是 device-side 小 kernel；
+- host API 层 `cudaMemcpyAsync` 和 `cudaStreamSynchronize` 大幅下降，是 E2E
+  提升的主要原因；
+- `byte_v2_decode_append_cache_kernel` 本身略有波动，不是本轮主要收益来源。
+
+### 结论与下一步
+
+Step 44 达到保留门槛，并且修复了“只看 deferred_error 会误把 warmup/prefill
+当 pure decode”的正确性问题。
+
+当前 p512/b4/d128 eager 下，ByteV2 compressed-only 约为 raw 的 `93.3%`。下一步优先：
+
+1. 做 raw vs ByteV2 的最新 detailed profile，确认剩余 `6.7%` 差距来自
+   attention stage1、host/API、sampling/GEMM 还是 cudagraph 缺失；
+2. 尝试 non-eager/cudagraph 路径。raw production 会开启 cudagraph，如果 ByteV2
+   仍只在 eager 对齐，真实 production 差距会重新变大；
+3. 如果继续 cache update，小心评估
+   `init_decode_append_result + record_deferred_cache_update_error` 融入
+   `byte_v2_decode_append_cache_kernel`。该方向预计收益较小，必须用 E2E 保留。
+
+## Step 45：最新 raw vs ByteV2 detailed profile
+
+### 目标
+
+Step 44 后，p512/b4/d128 eager 下 ByteV2 compressed-only 达到 raw 的约
+`93.3%`。本轮目标是确认剩余差距主要来自：
+
+1. attention stage1；
+2. host/API；
+3. sampling/GEMM；
+4. cudagraph 缺失。
+
+### 环境限制
+
+本轮尝试重新跑最新 raw nsys：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+nsys profile --force-overwrite=true --trace=cuda,nvtx,cublas \
+  --cuda-graph-trace=node --sample=none --cpuctxsw=none \
+  --cuda-event-trace=false \
+  --output benchmarks/profiles/nsys_step45_raw_eager_p512_b4_d128 \
+  .venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+    --child-mode raw \
+    --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+    --prompt-len 512 --decode-lens 128 --batch-size 4 \
+    --num-runs 1 --warmup-decode-len 8 \
+    --gpu-memory-utilization 0.80 --enforce-eager
+```
+
+但 GPU2 在启动时已被其他进程占用，vLLM 报：
+
+```text
+Free memory on device cuda:0 (14.78/44.42 GiB) on startup is less than
+desired GPU memory utilization (0.8, 35.54 GiB).
+```
+
+随后尝试在 GPU0 用较低 `gpu_memory_utilization=0.32` 跑 non-eager/cudagraph
+sanity check，但外部进程占用约 `29.10 GiB`，Inductor 编译阶段 OOM：
+
+```text
+torch._inductor.exc.InductorError: OutOfMemoryError
+```
+
+因此本轮 detailed profile 使用：
+
+- raw eager：已有同 workload 的有效 profile
+  `benchmarks/profiles/nsys_next_sp_raw_p512_b4_d128_*`。raw 路径没有被 Step 44
+  代码改动影响。
+- ByteV2 eager：Step 44 最新 deferred metadata-gated profile
+  `benchmarks/profiles/nsys_deferred_append_bytev2_cute_p512_b4_d128_*`。
+- cudagraph 判断：引用已有干净 production baseline
+  `benchmarks/profiles/bytev2_no_arena_baseline_p512_b4_d128_256_r3.json`。
+
+### E2E 对照
+
+Step 44 最新 eager E2E：
+
+| mode | tok/s | elapsed | ByteV2/raw |
+| --- | ---: | ---: | ---: |
+| raw | 131.09 | 3.906s | 100% |
+| ByteV2 compressed-only | 122.24 | 4.189s | 93.3% |
+
+已有 production/cudagraph baseline：
+
+| mode | decode_len | tok/s | elapsed | ByteV2/raw |
+| --- | ---: | ---: | ---: | ---: |
+| raw | 128 | 133.60 | 3.832s | 100% |
+| ByteV2 no-arena | 128 | 123.19 | 4.156s | 92.2% |
+| raw | 256 | 133.45 | 7.673s | 100% |
+| ByteV2 no-arena | 256 | 123.78 | 8.273s | 92.8% |
+
+结论：production/cudagraph 下 ByteV2 与 raw 的差距没有明显重新扩大，仍约
+`7%-8%`。因此当前主要问题不是“ByteV2 完全缺 cudagraph”，而是 graph 内部的
+attention/cache-update kernel 差距。
+
+### eager nsys kernel 分桶
+
+workload：
+
+```text
+model=/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct
+prompt_len=512
+batch_size=4
+decode_len=128
+prefix cache on
+enforce_eager=true
+ByteV2: compressed-only, fallback_pool_ratio=0.03, no arena,
+        split_k=8, CUTE metadata auto, deferred cache update error on
+```
+
+分类脚本按 kernel 名称分桶：
+
+- raw attention：
+  `flash_fwd_splitkv_kernel` + `flash_fwd_splitkv_combine_kernel`
+- ByteV2 attention：
+  `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel` +
+  `byte_v2_paged_decode_attention_split_reduce_parallel_kernel`
+- raw cache update：
+  `reshape_and_cache_flash_kernel`
+- ByteV2 cache update：
+  `byte_v2_decode_append_cache_kernel` +
+  `byte_v2_init_decode_append_result_kernel` +
+  `byte_v2_record_deferred_cache_update_error_kernel` +
+  `byte_v2_prefill_direct_encode_blocks_kernel`
+
+结果：
+
+| category | raw eager | ByteV2 eager | delta |
+| --- | ---: | ---: | ---: |
+| attention | 93.37 ms | 305.29 ms | +211.92 ms |
+| cache update | 12.25 ms | 48.25 ms | +36.00 ms |
+| GEMM/MLP/linear | 3677.46 ms | 3679.25 ms | +1.78 ms |
+| norm/rope/activation/elementwise | 84.87 ms | 76.17 ms | -8.70 ms |
+| sampling/scheduler misc | 4.81 ms | 7.11 ms | +2.30 ms |
+| other | 0.91 ms | 1.26 ms | +0.35 ms |
+| total GPU kernel | 3873.67 ms | 4117.32 ms | +243.65 ms |
+
+注意：E2E elapsed delta 是 `4.189s - 3.906s = 283 ms`，与 GPU kernel delta
+`244 ms` 同量级。差额主要来自 CPU/API 调度、测量同步和运行噪声。
+
+### top kernels
+
+raw eager：
+
+| kernel | total |
+| --- | ---: |
+| `Kernel2` | 2248.26 ms |
+| GEMM `64x64_sliced1x2` | 1142.51 ms |
+| GEMM `64x64_ldg8` | 233.55 ms |
+| raw FlashAttention split-k | 72.56 ms |
+| raw FlashAttention combine | 20.81 ms |
+| `reshape_and_cache_flash_kernel` | 12.25 ms |
+
+ByteV2 eager：
+
+| kernel | total |
+| --- | ---: |
+| `Kernel2` | 2248.25 ms |
+| GEMM `64x64_sliced1x2` | 1144.41 ms |
+| ByteV2 CUTE stage1 | 292.14 ms |
+| GEMM `64x64_ldg8` | 233.55 ms |
+| `byte_v2_decode_append_cache_kernel` | 34.49 ms |
+| ByteV2 split reduce | 13.15 ms |
+| `byte_v2_init_decode_append_result_kernel` | 6.21 ms |
+| `byte_v2_record_deferred_cache_update_error_kernel` | 6.08 ms |
+
+### API 对比
+
+raw eager API：
+
+| API | calls | total |
+| --- | ---: | ---: |
+| `cudaEventSynchronize` | 128 | 1004.81 ms |
+| `cudaLaunchKernel` | 46692 | 314.42 ms |
+| `cuLaunchKernel` | 8128 | 50.77 ms |
+| `cudaMemcpyAsync` | 525 | 4.92 ms |
+
+ByteV2 eager API：
+
+| API | calls | total |
+| --- | ---: | ---: |
+| `cudaMemcpyAsync` | 5005 | 1056.50 ms |
+| `cudaLaunchKernel` | 51396 | 348.60 ms |
+| `cuLaunchKernel` | 8128 | 52.47 ms |
+| `cudaStreamSynchronize` | 320 | 2.81 ms |
+| `cudaEventSynchronize` | 128 | 1.45 ms |
+
+解释：
+
+- API 表中 raw 的 `cudaEventSynchronize` 和 ByteV2 的 `cudaMemcpyAsync` 是 host
+  侧等待/同步开销表现，不应直接相加到 GPU kernel delta 上。
+- Step 44 已经把 ByteV2 的 per-token validation sync 大幅减少：
+  `cudaStreamSynchronize` 从 8320 次降到 320 次。
+- 当前 ByteV2 API 仍有更多 `cudaMemcpyAsync`，但从 GPU kernel delta 看，
+  E2E 剩余差距主要不是 API，而是 attention stage1。
+
+### 结论
+
+当前剩余 `6%-8%` 差距的来源排序：
+
+1. **attention stage1 是第一瓶颈。**
+   ByteV2 attention `305.29 ms`，raw FlashAttention `93.37 ms`，多
+   `211.92 ms`，解释了绝大多数 GPU kernel delta。
+2. **cache update 是第二瓶颈，但量级明显小。**
+   ByteV2 cache update `48.25 ms`，raw `12.25 ms`，多 `36.00 ms`。
+   其中 deferred sticky error record 和 result init 约 `12.29 ms`。
+3. **GEMM/MLP 不是差距来源。**
+   两边只差 `+1.78 ms`，基本持平。
+4. **sampling/scheduler 不是主要差距。**
+   只差 `+2.30 ms`。
+5. **cudagraph 缺失不是当前主要解释。**
+   已有 production/cudagraph baseline 中 ByteV2 仍为 raw 的 `92%-93%`，与本轮
+   eager 的 `93.3%` 接近。ByteV2 backend 当前也声明
+   `UNIFORM_SINGLE_TOKEN_DECODE` cudagraph support。
+
+### 下一步
+
+不要把下一轮重点放在 sampling、GEMM 或单纯 cudagraph 开关上。建议：
+
+1. 继续做 ByteV2 attention stage1 的结构性优化：
+   - K/V decode 指令数；
+   - shared layout / WMMA load pattern；
+   - PV/write partial；
+   - split reduce partial 写回和扫描成本。
+2. cache update 可以做一个小步 fusion：
+   把 `init_decode_append_result` 和
+   `record_deferred_cache_update_error` 融入
+   `byte_v2_decode_append_cache_kernel`，但预期上限只有约 `12 ms / 4.1s`
+   量级，必须用 E2E 保留。
+3. 等 GPU 空闲后，重跑干净的 p512/b4/d128 production nsys，确认 cudagraph
+   baseline 是否仍是 `92%-93% raw`。
+
+### GPU0 空闲后的 production/cudagraph 复测
+
+GPU0 空闲后重新跑了干净的 non-eager/cudagraph E2E 和 Nsight Systems profile。
+workload 固定为：
+
+```text
+model=/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct
+prompt_len=512
+batch_size=4
+decode_len=128
+gpu_memory_utilization=0.80
+enforce_eager=false
+ByteV2: compressed-only, fallback_pool_ratio=0.03, no arena,
+        split_k=8, CUTE metadata auto, deferred cache update error on
+```
+
+输出文件：
+
+- E2E:
+  `benchmarks/profiles/step45_cudagraph_clean_p512_b4_d128_gpu0.json`
+- raw nsys:
+  `benchmarks/profiles/nsys_step45_cudagraph_raw_clean_p512_b4_d128.nsys-rep`
+- ByteV2 nsys:
+  `benchmarks/profiles/nsys_step45_cudagraph_bytev2_clean_p512_b4_d128.nsys-rep`
+
+E2E 结果：
+
+| mode | tok/s | elapsed | ByteV2/raw |
+| --- | ---: | ---: | ---: |
+| raw production/cudagraph | 133.55 | 3.834s | 100% |
+| ByteV2 compressed-only production/cudagraph | 125.15 | 4.091s | 93.7% |
+
+ByteV2 sparse fallback pool 未耗尽：
+
+```text
+any_exhausted=false
+total_assigned_blocks=256
+total_capacity=16384
+max_next_slot=40
+```
+
+raw 和 ByteV2 日志中都完成了 cudagraph capture，包括 `PIECEWISE` 和 `FULL`
+graph。因此本轮确认：当前 `6%-7%` E2E 差距不是因为 ByteV2 没有进入
+cudagraph production 路径。
+
+production/cudagraph nsys kernel 分桶：
+
+| category | raw | ByteV2 | delta |
+| --- | ---: | ---: | ---: |
+| attention | 93.30 ms | 304.19 ms | +210.89 ms |
+| cache update | 9.99 ms | 42.20 ms | +32.20 ms |
+| GEMM/MLP/linear | 3673.36 ms | 3674.40 ms | +1.03 ms |
+| norm/rope/activation/elementwise | 62.02 ms | 43.96 ms | -18.07 ms |
+| sampling/scheduler misc | 5.25 ms | 6.59 ms | +1.34 ms |
+| other | 0.63 ms | 0.73 ms | +0.10 ms |
+| total GPU kernel | 3844.55 ms | 4072.06 ms | +227.51 ms |
+
+top attention/cache kernels：
+
+| path | kernel | total | launches | avg |
+| --- | --- | ---: | ---: | ---: |
+| raw attention | `flash_fwd_splitkv_kernel` | 76.09 ms | 4096 | 18.58 us |
+| raw attention | `flash_fwd_splitkv_combine_kernel` | 17.21 ms | 4064 | 4.23 us |
+| raw cache update | `reshape_and_cache_flash_kernel` | 9.99 ms | 4096 | 2.44 us |
+| ByteV2 attention | `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel` | 291.01 ms | 4096 | 71.05 us |
+| ByteV2 attention | `byte_v2_paged_decode_attention_split_reduce_parallel_kernel` | 13.18 ms | 4096 | 3.22 us |
+| ByteV2 cache update | `byte_v2_decode_append_cache_kernel` | 31.70 ms | 4064 | 7.80 us |
+| ByteV2 cache update | `byte_v2_record_deferred_cache_update_error_kernel` | 4.85 ms | 4064 | 1.19 us |
+| ByteV2 cache update | `byte_v2_init_decode_append_result_kernel` | 4.08 ms | 4064 | 1.00 us |
+| ByteV2 prefill encode | `byte_v2_prefill_direct_encode_blocks_kernel` | 1.46 ms | 32 | 45.63 us |
+
+production API summary 的主要差异：
+
+| API | raw | ByteV2 |
+| --- | ---: | ---: |
+| `cudaGraphLaunch_v10000` | 79.97 ms / 127 calls | 84.02 ms / 127 calls |
+| `cudaLaunchKernel` | 14.05 ms / 1476 calls | 16.76 ms / 2084 calls |
+| `cudaMemcpyAsync` | 4.86 ms / 525 calls | 3818.86 ms / 941 calls |
+| `cudaEventSynchronize` | 3519.65 ms / 128 calls | 1.48 ms / 128 calls |
+| `cudaStreamSynchronize` | not top | 2.79 ms / 320 calls |
+
+API 表中的 raw `cudaEventSynchronize` 和 ByteV2 `cudaMemcpyAsync` 都包含 host
+等待行为，不能简单与 GPU kernel 时间相加。不过 `cudaGraphLaunch` 两边接近，
+GPU kernel delta 又主要集中在 attention/cache update，因此 host/API 或
+cudagraph 缺失不是当前主因。
+
+更新后的结论：
+
+1. **attention stage1 仍是绝对主瓶颈。** production 下 ByteV2 attention 比
+   raw 多 `210.89 ms`，解释了大部分 `227.51 ms` GPU kernel delta。
+2. **cache update 是第二瓶颈。** production 下 ByteV2 比 raw 多 `32.20 ms`。
+   其中 append kernel 是主要项，init/error record 的 launch/node 成本仍可继续
+   fusion。
+3. **GEMM/MLP、sampling 和 cudagraph 不是主要差距来源。** GEMM/MLP 只差
+   `1.03 ms`，两边都完成 cudagraph capture，E2E ratio 提升到 `93.7% raw`。
+4. 下一步仍应优先优化 `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel`
+   的 K/V decode、shared/WMMA load、PV/write partial；cache update fusion
+   作为第二优先级的小步实验。
+
+## Step 46：CUTE metadata stage1 early-exit + NCU 复测
+
+### 目标
+
+Step 45 的 production profile 已确认剩余差距主要来自
+`byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel`。本轮不先改代码，
+而是重新拆分当前最优 CUTE metadata stage1 内部耗时，确认下一步优化应该落在
+loader、QK、softmax 还是 PV/write。
+
+### 配置
+
+固定当前 production 相同的核心配置：
+
+```text
+GPU=0
+num_heads=32
+num_kv_heads=8
+head_size=128
+head_size_v=128
+block_size=16
+split_k=8
+fallback_ratio=0.03
+fallback_pattern=single_outlier
+tile_fallback_pool=on
+cute_stage1_auto=on
+tile_fastpath=on
+parallel_reduce=on
+outlier_arena=off
+```
+
+decode-only early-exit 输出：
+
+```text
+benchmarks/profiles/step46_cute_early_summary.json
+benchmarks/profiles/step46_cute_early_p512_b4_d128_m{0,1,2,3}.json
+benchmarks/profiles/step46_cute_early_p512_b4_d256_m{0,1,2,3}.json
+benchmarks/profiles/step46_cute_early_p2048_b1_d32_m{0,1,2,3}.json
+```
+
+NCU 输出：
+
+```text
+benchmarks/profiles/step46_ncu_cute_stage1_p512_b4_d128_m{0,1,2,3}.csv
+benchmarks/profiles/step46_ncu_cute_stage1_p2048_b1_d32_m{0,1,2,3}.csv
+benchmarks/profiles/step46_ncu_cute_stage1_p512_b4_d128_m0.ncu-rep
+benchmarks/profiles/step46_ncu_cute_stage1_p512_b4_d128_m0_source.txt
+benchmarks/profiles/step46_ncu_cute_stage1_p512_b4_d128_m0_details.txt
+```
+
+### decode-only early-exit timing
+
+注意：decode-only benchmark 调用完整 op，因此 mode 0-3 的 median latency 包含
+stage1 之外的 reduce/op overhead。这里主要看差分趋势；更准确的单 kernel duration
+见下面 NCU。
+
+| workload | mode0 full | mode1 load/decode | QK inc | softmax inc | PV/write inc |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p512/b4/d128 | 89.09 us | 73.73 us | 5.12 us | 2.05 us | 8.19 us |
+| p512/b4/d256 | 90.11 us | 71.68 us | 4.10 us | 2.05 us | 12.29 us |
+| p2048/b1/d32 | 202.75 us | 155.65 us | 10.24 us | 9.22 us | 27.65 us |
+
+粗略结论：load/decode 仍是最大段；长 context / batch=1 下 PV/write 和 QK/softmax
+增量会变大，但仍小于 load/decode。
+
+### NCU stage1 duration
+
+NCU 直接过滤
+`byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel`，每个 mode 采一个
+stage1 launch。
+
+| workload | full | load/decode | QK inc | softmax inc | PV/write inc |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p512/b4/d128 | 73.22 us | 54.27 us | 4.42 us | 2.75 us | 11.78 us |
+| p2048/b1/d32 | 234.50 us | 178.85 us | 12.93 us | 10.62 us | 32.10 us |
+
+占比：
+
+| workload | load/decode | QK | softmax | PV/write |
+| --- | ---: | ---: | ---: | ---: |
+| p512/b4/d128 | 74.1% | 6.0% | 3.8% | 16.1% |
+| p2048/b1/d32 | 76.3% | 5.5% | 4.5% | 13.7% |
+
+结论很明确：当前 stage1 的主瓶颈仍是 compressed K/V loader + decode +
+shared 写入路径，而不是 QK、softmax 或 split reduce。
+
+### NCU 关键指标
+
+| workload | mode | duration | executed inst | memory throughput | DRAM | L1 hit | L2 hit | regs/thread | waves/SM | achieved occ |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| p512/b4/d128 | full | 73.22 us | 6.43M | 115.6 GB/s | 17.30% | 68.19% | 15.41% | 96 | 0.61 | 25.22% |
+| p512/b4/d128 | load/decode | 54.27 us | 4.96M | 155.6 GB/s | 23.19% | 68.21% | 15.14% | 96 | 0.61 | 25.13% |
+| p2048/b1/d32 | full | 234.50 us | 6.00M | 36.4 GB/s | 5.32% | 69.73% | 9.53% | 96 | 0.15 | 8.33% |
+| p2048/b1/d32 | load/decode | 178.85 us | 4.56M | 50.5 GB/s | 7.38% | 69.73% | 9.49% | 96 | 0.15 | 8.33% |
+
+NCU warnings：
+
+| workload | warning | value |
+| --- | --- | ---: |
+| p512/b4/d128 full | uncoalesced global excessive sectors | 319856 / 686464 = 47% |
+| p512/b4/d128 full | uncoalesced shared excessive wavefronts | 696320 / 1070608 = 65% |
+| p2048/b1/d32 full | uncoalesced global excessive sectors | 317168 / 663808 = 48% |
+| p2048/b1/d32 full | uncoalesced shared excessive wavefronts | 696320 / 1051024 = 66% |
+
+其他重要信号：
+
+- p512/b4/d128 full 的 long scoreboard warning：平均每 warp 约 `6.4 cycles`
+  等待 L1TEX scoreboard，占 issue 间隔约 `47.6%`。
+- p512/b4/d128 load/decode 也有同样的 uncoalesced global excessive sectors，
+  说明大量问题发生在 loader 本身，而不是后面的 QK/PV。
+- p2048/b1/d32 只有 `0.15 waves/SM`、`8.33% achieved occupancy`，长 context
+  batch=1 下并行度明显不足；这会放大单 CTA 处理过多 page 的 latency。
+- 当前 `.ncu-rep` 的 source page 只能看到 SASS 地址，没有 CUDA 源码行映射。
+  这说明当前扩展构建缺少可用 lineinfo；后续若要做真正源码行级 NCU，需要重新
+  用 lineinfo/debug 编译 CUDA 扩展。
+
+### 本轮结论
+
+1. **下一步应优先优化 compressed K/V loader。**
+   load/decode 在两个代表 workload 中占 stage1 的 `74%-76%`。
+2. **shared layout 仍是明确问题。**
+   full stage1 有 `65%-66%` shared excessive wavefronts，PV/write 和 WMMA load
+   都可能受 shared layout 影响。
+3. **global access pattern 仍是明确问题。**
+   full 与 load/decode mode 都有约 `47%-48%` excessive global sectors，说明
+   compressed payload/tile metadata 读取没有充分合并。
+4. **低 batch/长 context 的并行度不足仍存在。**
+   p2048/b1 只有 `0.15 waves/SM`，继续优化单 CTA 内部指令虽有意义，但后续也
+   需要考虑 page-chunk 粒度或更高 CTA 并行度。
+
+上一轮曾尝试一个最小 no-arena overlay-skip patch：在 CUTE metadata
+tile-fastpath 中，当没有 outlier arena 时跳过
+`byte_v2_overlay_*_tile_outliers_to_shared()`。Step 47 已完成编译后验证：
+decode-only 有小幅正向信号，但 NCU stage1 指标几乎完全不变，E2E 略退化。
+因此该 patch 已按保留门槛回滚，不保留代码入口。
+
+### 下一步实验
+
+下一轮只做一个小 patch，目标是 loader/data-movement：
+
+1. 为 CUTE metadata stage1 增加一个 opt-in 的 no-arena compressed tile loader
+   fast path：
+   - 当 `outlier_arena == nullptr` 且 tile header 无 fallback 时，完全跳过
+     outlier bitmap/meta 指针准备和 overlay helper 调用；
+   - K/V loader 分离为专用 helper，避免 runtime `is_value`/overlay 分支；
+   - 继续保留 tile fallback path，不能破坏 correctness。
+2. 保留门槛：
+   - p512/b4/d128 NCU load/decode duration 下降；
+   - full stage1 duration 下降；
+   - uncoalesced global sectors 或 executed instructions 至少一项下降；
+   - p512/b4/d128 E2E 不退化。
+3. 如果该 fast path 没有明确收益，回滚，不继续在这一层堆分支。
+
+## Step 47：no-arena overlay-skip 实验结果
+
+### 实验目标
+
+验证一个最小 opt-in patch：在 CUTE metadata stage1 的 no-arena production
+路径中，如果 tile 没有 fallback，则跳过
+`byte_v2_overlay_*_tile_outliers_to_shared()` helper 调用。
+
+### correctness
+
+编译后通过了最相关的 CUDA smoke：
+
+```text
+tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_metadata_cuda PASSED
+tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_auto_metadata_cuda PASSED
+tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_auto_long_context_cuda PASSED
+3 passed in 34.24s
+```
+
+### decode-only A/B
+
+workload：`p512/b4/d128`，`split_k=8`，`fallback_ratio=0.03`，
+`single_outlier`，tile fallback pool，CUTE auto，parallel reduce on。
+
+| variant | median us | p90 us | tok/s |
+| --- | ---: | ---: | ---: |
+| baseline | 94.21 | 102.40 | 42,459 |
+| overlay-skip | 89.09 | 91.14 | 44,899 |
+| baseline repeat 1 | 91.14 | 93.18 | 43,890 |
+| overlay-skip repeat 1 | 89.09 | 92.16 | 44,899 |
+| baseline repeat 2 | 90.11 | 91.14 | 44,389 |
+| overlay-skip repeat 2 | 89.09 | 90.11 | 44,899 |
+
+decode-only 有小幅正向信号，但幅度接近短 kernel benchmark 的抖动区间。
+
+### NCU A/B
+
+同一 workload 抓取一个 CUTE stage1 launch：
+
+| metric | baseline | overlay-skip |
+| --- | ---: | ---: |
+| Duration | 74.240 us | 74.016 us |
+| Executed Instructions | 6,514,096 | 6,514,096 |
+| Issued Instructions | 6,522,481 | 6,522,506 |
+| Branch Instructions | 715,824 | 715,824 |
+| Registers / thread | 96 | 96 |
+| Waves / SM | 0.61 | 0.61 |
+| Achieved occupancy | 25.22% | 25.23% |
+| Excessive global sectors | 319,856 / 686,464, 47% | 319,856 / 686,464, 47% |
+| Excessive shared wavefronts | 696,320 / 1,070,608, 65% | 696,320 / 1,070,608, 65% |
+
+NCU 没有支持该 patch 的证据：stage1 duration 基本不变，执行指令数、分支数、
+global/shared uncoalesced 指标完全不变。
+
+### E2E
+
+workload：Llama-3 8B，`p512/b4/d128`，ByteV2 compressed-only，
+`fallback_ratio=0.03`，CUTE auto，cudagraph enabled。
+
+| variant | elapsed s | output tok/s | fallback exhausted |
+| --- | ---: | ---: | --- |
+| baseline | 4.09556 | 125.013 | false |
+| overlay-skip | 4.09848 | 124.924 | false |
+
+E2E 没有收益，且略低于 baseline。
+
+### 结论
+
+不保留该 patch。虽然 decode-only median 有小幅改善，但 NCU stage1 指标不变，
+E2E 没有兑现。按保留门槛，已删除：
+
+- `VLLM_BYTE_V2_DECODE_CUTE_NO_ARENA_OVERLAY_SKIP`
+- `--cute-no-arena-overlay-skip`
+- CUTE stage1 kernel 的 `no_arena_overlay_skip` 参数
+- tile-fastpath 中的 overlay helper 条件跳过逻辑
+
+后续不要继续在“空 outlier arena helper 早退”这一层做优化；主要矛盾仍是
+K/V load-decode 访问模式、shared layout/WMMA load pattern 和低并行度。
+
+## Step 48：CUTE stage1 lineinfo NCU 源码行级 profile
+
+### 目标
+
+上一轮 Step 46 的 early-exit profile 已经确认 stage1 的主要时间在
+compressed K/V load/decode，但当时 `.ncu-rep` 没有 CUDA source line 映射，
+只能看到 SASS 地址。本轮用带 `-lineinfo` 的 `_C_stable_libtorch` 临时构建产物
+重新 profile，目标是把 global/shared/stall 热点映射回
+`csrc/libtorch_stable/cache_kernels.cu` 的具体源码行。
+
+### 构建和验证
+
+全局 `CMAKE_CUDA_FLAGS=-lineinfo uv pip install -e . --torch-backend=auto`
+会触发大量 CUDA target 重编，成本很高；本轮最终复用临时 CMake build dir，
+只链接 `_C_stable_libtorch`：
+
+```text
+cmake --build /tmp/tmpvfglk_3g.build-temp --target _C_stable_libtorch -j 8
+cp /tmp/tmpvfglk_3g.build-temp/_C_stable_libtorch.abi3.so vllm/_C_stable_libtorch.abi3.so
+```
+
+smoke：
+
+```text
+p512/b4/d128 decode-only:
+median_us=88.06, p90_us=92.16, tok/s=45421.51
+fallback_blocks=0/8, fallback_tiles=4/1024
+```
+
+说明 lineinfo 临时构建产物可以正常加载和执行。
+
+### NCU workload
+
+均抓取一个 CUTE metadata stage1 launch：
+
+```text
+p512/b4/d128, split_k=8, fallback_ratio=0.03, single_outlier
+p2048/b1/d32, split_k=8, fallback_ratio=0.03, single_outlier
+```
+
+报告文件：
+
+```text
+benchmarks/profiles/step48_lineinfo_cute_stage1_p512_b4_d128.ncu-rep
+benchmarks/profiles/step48_lineinfo_cute_stage1_p2048_b1_d32.ncu-rep
+benchmarks/profiles/step48_lineinfo_source_p512_b4_d128.txt
+benchmarks/profiles/step48_lineinfo_source_p2048_b1_d32.txt
+```
+
+### stage1 总体指标
+
+| workload | duration | executed inst | long scoreboard | issue active | regs/thread | waves/SM | achieved occ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| p512/b4/d128 | 73.376 us | 6.431M | 6.35 cycle/issue | 0.23 | 96 | 0.61 | 25.23% |
+| p2048/b1/d32 | 233.728 us | 6.004M | 6.35 cycle/issue | 0.08 | 96 | 0.15 | 8.33% |
+
+| workload | DRAM throughput | L1/TEX hit | L2 hit | global excessive sectors | shared excessive wavefronts |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p512/b4/d128 | 17.15% | 68.20% | 15.50% | 319,856 / 686,464 = 47% | 696,320 / 1,070,608 = 65% |
+| p2048/b1/d32 | 5.36% | 69.74% | 7.39% | 317,168 / 663,808 = 48% | 696,320 / 1,051,024 = 66% |
+
+NCU 的规则提示和 Step 46 一致：
+
+- `CPIStall`：每 warp 约 `6.3-6.4 cycles` 在等待 L1TEX/global/local
+  scoreboard，占总 issue 间隔约 `47.5%-51.2%`。
+- `UncoalescedGlobalAccess`：global excessive sectors 约 `47%-48%`。
+- `UncoalescedSharedAccess`：shared excessive wavefronts 约 `65%-66%`。
+- `SOLBottleneck`：grid 太小，p512 只有 `0.6 waves/SM`，p2048/b1 只有
+  `0.2 waves/SM`。
+
+### 源码行热点
+
+1. compressed payload 的 `byte_v2_load_u16()` 是主要 global excessive 来源：
+
+```cpp
+// cache_kernels.cu:1051-1054
+__device__ __forceinline__ uint16_t byte_v2_load_u16(
+    const uint8_t* __restrict__ ptr) {
+  return static_cast<uint16_t>(ptr[0]) |
+         (static_cast<uint16_t>(ptr[1]) << 8);
+}
+```
+
+source/SASS 显示 line 1053/1054 对应大量 `LDG.E.U8`，并贡献主要
+global excessive sectors：
+
+| source line | 含义 | p512 signal | p2048 signal |
+| --- | --- | ---: | ---: |
+| 1053 | `ptr[0]` U8 load | global excessive 约 193K | global excessive 约 193K |
+| 1054 | `ptr[1]` U8 load | global excessive 约 127K | global excessive 约 127K |
+
+这说明当前 2 个 byte 分别读取再 `PRMT/LOP3` 拼接的方式没有被合并成理想的
+16/32-bit 连续读取；compressed payload 的低字节读取本身就是主要 global
+访问模式问题，而不是 outlier metadata 分支造成的。
+
+2. K/V tile decode helper 仍有明显指令成本：
+
+```cpp
+// K tile: cache_kernels.cu:1248-1268
+const uint16_t low_pair = byte_v2_load_u16(low_ptr + elem0);
+const int packed = static_cast<int>(packed_ptr[pair_idx]);
+bits0 = byte_v2_make_bf16_bits_from_fast_code(...);
+bits1 = byte_v2_make_bf16_bits_from_fast_code(...);
+k_shared[shared_offset] = ...
+k_shared[shared_offset + 1] = ...
+
+// V tile: cache_kernels.cu:1317-1335
+const uint16_t low_pair = byte_v2_load_u16(low_ptr + elem0);
+const int packed = static_cast<int>(packed_ptr[pair_idx]);
+...
+v_shared[shared_offset] = ...
+v_shared[shared_offset + 1] = ...
+```
+
+high-level line instruction counts 中，`low >> 7` / `code & 0x07`
+等 decode 行仍有约 `131K` 级别执行次数；说明 decode 逻辑仍是 stage1 的
+重要非带宽开销。
+
+3. shared layout 问题主要出现在 V shared 写入和 WMMA/PV shared 读取：
+
+```cpp
+// cache_kernels.cu:1334-1335
+v_shared[shared_offset] = ...
+v_shared[shared_offset + 1] = ...
+
+// cache_kernels.cu:5718-5719
+nvcuda::wmma::load_matrix_sync(
+    b_frag, k_shared + dim_base * kByteV2TileSize, kByteV2TileSize);
+
+// cache_kernels.cu:5790-5792
+nvcuda::wmma::load_matrix_sync(p_frag, p_shared, kByteV2TileSize);
+nvcuda::wmma::load_matrix_sync(v_frag, v_shared + dim_base, head_size_v);
+```
+
+特别是 V shared store 的 SASS 行显示单条 store 有 `98,304`
+级别 shared excessive wavefront；PV 的 C++ `load_matrix_sync` 展开到大量
+shared `LD.E`，每条约 `7,168 / 8,192` wavefront，ideal 只有 `1,024`。
+这与之前“row-major K + WMMA col-major / stride padding 退化”的结果一致：
+简单改 stride 不够，必须让 shared layout 和实际 `ldmatrix/load_matrix_sync`
+消费顺序一起设计。
+
+4. softmax/PV 标量 shared 数组也有开销，但不是首要矛盾：
+
+```cpp
+// cache_kernels.cu:5759-5761
+tile_acc_factor[warp_id] = old_scale;
+denom_shared[warp_id] = ...
+running_max_shared[warp_id] = new_max;
+
+// cache_kernels.cu:5772
+acc[q] *= tile_acc_factor[q];
+```
+
+这些行有 shared excessive wavefront，但绝对值远小于总 shared excessive；
+优化它们可能有收益，但不应优先于 payload load 与 WMMA shared layout。
+
+5. p2048/b1 的低并行度非常明确：
+
+```text
+p512/b4/d128 grid_size = 256, waves/SM = 0.61, achieved occ = 25.23%
+p2048/b1/d32 grid_size = 64,  waves/SM = 0.15, achieved occ = 8.33%
+```
+
+长 context/低 batch 下，即使单 CTA 内部优化有效，也会被并行度不足放大。
+因此后续优化不能只做单 CTA 内 micro-op 调整，还需要引入更细的 page chunk
+并行或 persistent/page-parallel stage1。
+
+### 结论
+
+本轮 lineinfo profile 明确推翻了“主要是 outlier metadata 检查成本”的假设：
+no-arena overlay-skip 上轮已经没有 NCU/E2E 收益，而本轮源码行显示最大 global
+问题来自 compressed payload 的 `LDG.E.U8` 低字节读取本身。
+
+后续优先级应调整为：
+
+1. **payload load v3**：避免两次 U8 global load，尝试对齐的 U16/U32/warp-stripe
+   payload 读取；先做 decode-only microbench，门槛必须看到 global excessive
+   sectors 和 long scoreboard 下降。
+2. **V shared / WMMA layout v3**：围绕实际 `load_matrix_sync` 展开的 shared
+   `LD.E` pattern 设计 swizzle，而不是只改 stride。
+3. **低 batch 并行度**：p2048/b1 需要更细 page-chunk 或 persistent/page-parallel
+   stage1；否则 waves/SM 只有 `0.15`，单 CTA latency 再低也难接近 raw。
+4. **secondary**：softmax/PV 标量 shared 数组可做 register 化或 warp shuffle 化，
+   但它不是当前第一瓶颈。
+
+下一轮建议先做一个很小的下限实验：只改 compressed tile loader 的 `low_pair`
+读取方式，增加 opt-in `u16-aligned load` variant；如果 NCU 中 line 1053/1054 的
+global excessive sectors 和 long scoreboard 不下降，就不接 E2E，不保留。
+
+## Step 49：payload load v3 lower-bound：aligned U16 low payload load
+
+### 目标
+
+Step 48 的 lineinfo profile 显示 CUTE metadata stage1 的最大 global
+uncoalesced 来源是 `byte_v2_load_u16()` 内部两次 `LDG.E.U8`：
+
+```cpp
+return static_cast<uint16_t>(ptr[0]) |
+       (static_cast<uint16_t>(ptr[1]) << 8);
+```
+
+本轮做一个很小的下限实验：只在 CUTE stage1 compressed tile fastpath 中，把
+`low` payload 的两字节读取改成 opt-in aligned `uint16_t` load。ByteV2 tile
+layout 中：
+
+```text
+page header = 16B
+tile payload = 386B
+low payload start = page + 16 + tile_id * 386 + 2
+```
+
+因此 `low_ptr + elem0` 在当前格式下始终 2 字节对齐。实验实现为模板参数和
+benchmark 开关，不在 hot loop 传 runtime layout bool。
+
+保留门槛：
+
+1. NCU 中 global excessive sectors 下降。
+2. long scoreboard 下降。
+3. stage1 duration 或 decode-only median 至少有稳定收益。
+
+如果只降低 sector 但 stage1 duration 不降，则不保留。
+
+### 构建和 correctness
+
+实验实现后复用 lineinfo build dir 只重编 `_C_stable_libtorch`：
+
+```text
+cmake --build /tmp/tmpvfglk_3g.build-temp --target _C_stable_libtorch -j 8
+cp /tmp/tmpvfglk_3g.build-temp/_C_stable_libtorch.abi3.so vllm/_C_stable_libtorch.abi3.so
+```
+
+correctness smoke：
+
+```text
+CUDA_VISIBLE_DEVICES=0 \
+VLLM_BYTE_V2_DECODE_ALIGNED_U16_PAYLOAD_LOAD=1 \
+.venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_metadata_cuda -q
+
+结果：1 passed
+```
+
+说明 aligned loader 版本功能上可执行。
+
+### decode-only A/B
+
+GPU 当时有外部负载，因此 decode-only 只作为初筛，最终判断以 NCU 为准。
+
+| workload | baseline median | aligned median | 结论 |
+| --- | ---: | ---: | --- |
+| p512/b4/split-k8，首轮 | 90.11 us | 73.73 us | 看似大幅提升，但疑似运行顺序/负载噪声 |
+| p512/b4/split-k8，反向复跑 | 72.70 us | 73.73 us | aligned 略慢，p512 不稳定 |
+| p2048/b1/split-k64，首轮 | 81.92 us | 72.70 us | aligned 较快 |
+| p2048/b1/split-k64，反向复跑 | 79.87 us | 74.75 us | aligned 仍较快，但该 split-k 与 Step 48 profile 不一致 |
+| p2048/b1/split-k8 | 194.56 us | 212.99 us | aligned 明显退化 |
+
+decode-only 的信号不一致：p2048/split-k64 有正向，但和 Step 48 的
+p2048/split-k8 lineinfo workload 不一致；p512 和 p2048/split-k8 都没有稳定收益。
+
+### NCU A/B
+
+捕获同一个 CUTE metadata stage1 kernel：
+
+```text
+p512/b4/d128, split_k=8, fallback_ratio=0.03, single_outlier
+p2048/b1/d32, split_k=8, fallback_ratio=0.03, single_outlier
+```
+
+报告：
+
+```text
+benchmarks/profiles/step49_payload_u16_ncu_baseline_p512_b4.ncu-rep
+benchmarks/profiles/step49_payload_u16_ncu_aligned_p512_b4.ncu-rep
+benchmarks/profiles/step49_payload_u16_ncu_baseline_p2048_b1_s8.ncu-rep
+benchmarks/profiles/step49_payload_u16_ncu_aligned_p2048_b1_s8.ncu-rep
+```
+
+关键指标：
+
+| workload | variant | stage1 duration | inst | long scoreboard | issue active | waves/SM | global sectors | global excessive | shared excessive |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| p512/b4 | baseline | 72.960 us | 6.431M | 6.33 | 20.83% | 0.61 | 686,464 | 319,856 | 696,320 |
+| p512/b4 | aligned U16 | 74.240 us | 6.693M | 6.04 | 21.51% | 0.61 | 494,000 | 127,392 | 696,320 |
+| p2048/b1 | baseline | 234.976 us | 6.004M | 6.53 | 5.80% | 0.15 | 663,808 | 317,168 | 696,320 |
+| p2048/b1 | aligned U16 | 238.560 us | 6.266M | 6.18 | 5.99% | 0.15 | 471,344 | 124,704 | 696,320 |
+
+观察：
+
+1. aligned U16 确实把 global sectors 降低约 `28%-29%`，把 global excessive
+   sectors 降低约 `60%`。
+2. long scoreboard 从 `6.33/6.53` 降到 `6.04/6.18`，方向正确但幅度有限。
+3. executed instructions 增加约 `4.1%-4.4%`。
+4. shared excessive wavefronts 完全不变，仍是 `696,320`。
+5. stage1 duration 没有下降：p512 `+1.8%`，p2048 `+1.5%`。
+
+source/SASS 确认 aligned 版本把主要 low payload 读取从成对 `LDG.E.U8` 变成
+`LDG.E.U16`，但额外的数据整理/依赖成本抵消了 sector 改善。
+
+### 处理结果
+
+不保留本轮代码改动。
+
+原因是该实验没有满足门槛：global excessive sectors 和 long scoreboard 改善了，
+但 stage1 duration 没有改善，decode-only A/B 也不稳定。代码已回滚到默认
+`byte_v2_load_u16()` 路径，重新编译并通过：
+
+```text
+CUDA_VISIBLE_DEVICES=0 \
+.venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_metadata_cuda -q
+
+结果：1 passed
+```
+
+### 结论和下一步
+
+这个下限实验说明：
+
+1. Step 48 对 global uncoalesced 来源的判断是正确的，`low` payload 读取确实是
+   sector 热点。
+2. 但只把两个 U8 load 换成一个 U16 load 不够，因为 stage1 当前还受 shared
+   layout/WMMA load pattern、decode 指令依赖、低 waves/SM 共同限制。
+3. 后续不要继续做单点 scalar loader 替换；如果要解决 payload load，应做真正的
+   layout-v3/warp-stripe payload，使 load、decode、shared store 和 WMMA 消费顺序
+   一起变好。
+
+下一步优先级：
+
+1. **shared/WMMA layout v3 lower-bound**：在现有 payload 格式不变的情况下，
+   先验证能否降低 `696,320` shared excessive wavefronts；如果不能降低 shared
+   指标，不接 E2E。
+2. **payload layout-v3**：不是 `reinterpret_cast<uint16_t*>` 这种局部替换，而是
+   重新排布 tile payload 为 warp/lane-stripe 读取格式，并同时设计 K/V 不同物理顺序。
+3. **p2048/b1 page-parallel stage1**：当前 p2048 split-k8 只有 `0.15 waves/SM`，
+   需要更细粒度 page chunk 并行；单 CTA 内 loader 优化无法解决并行度不足。
+
+## Step 50：shared/WMMA lower-bound 复测
+
+### 实验目标
+
+Step 49 证明 aligned U16 payload loader 可以降低 global sectors，但不能降低
+stage1 duration，且 `shared excessive wavefronts` 固定在 `696,320`。因此本轮不再
+继续做单点 payload loader，而是先验证 shared/WMMA 结构是否真是下一层瓶颈。
+
+代码中已经存在一个显式实验路径：
+
+```text
+VLLM_BYTE_V2_DECODE_FLASH_STAGE1=1
+```
+
+该路径使用 `byte_v2_paged_decode_attention_gqa4_h128_flash_split_stage1_kernel`，
+仍然读取真实 compressed page metadata/fallback，但把 CUTE metadata kernel 中的
+`scores/p_shared/pv_shared` 中间共享内存路径替换为 4 个 warp 的直接 online
+softmax/PV。它可以作为 shared/WMMA lower-bound：如果它能降低 shared wavefronts
+和 stage1 duration，说明 Step 49 后续应该围绕 shared/WMMA pipeline，而不是继续
+做普通 scalar loader 微调。
+
+本轮没有新增代码，只复用已有显式路径并做 A/B profile。当前 `_C_stable_libtorch`
+仍是 lineinfo 构建，适合 NCU/source profile；正式性能数值仍需用普通 production
+构建复测。
+
+### correctness
+
+```text
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_flash_stage1_raw_fallback_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_flash_stage1_tile_fallback_cuda -q
+
+结果：2 passed, 16 warnings
+```
+
+说明 flash-stage1 的 raw fallback 与 tile fallback 功能 smoke test 仍然可用。
+
+### decode-only A/B
+
+固定：
+
+```text
+fallback_ratio=0.03
+fallback_pattern=single_outlier
+tile_fallback_pool=on
+outlier_arena=off
+tile_fastpath=on
+parallel_reduce=on
+skip_correctness
+```
+
+结果：
+
+| workload | CUTE metadata | flash-stage1 | 变化 |
+| --- | ---: | ---: | ---: |
+| p512/b4/split-k8 | 87.04 us / 45.96K tok/s | 79.87 us / 50.08K tok/s | +8.9% tok/s |
+| p512/b4/split-k8，反向复跑 | 89.09 us / 44.90K tok/s | 64.51 us / 62.00K tok/s | +38.1% tok/s |
+| p2048/b1/split-k8 | 204.80 us / 4.88K tok/s | 171.97 us / 5.82K tok/s | +19.1% tok/s |
+| p2048/b1/split-k8，反向复跑 | 210.94 us / 4.74K tok/s | 171.01 us / 5.85K tok/s | +23.4% tok/s |
+| p2048/b1/split-k64 | 93.18 us / 10.73K tok/s | 86.02 us / 11.63K tok/s | +8.3% tok/s |
+
+decode-only 显示 flash-stage1 对 stage1 kernel 本身有稳定收益，尤其是
+p2048/b1/split-k8 这种低并行度场景。
+
+### NCU A/B
+
+捕获：
+
+```text
+byte_v2_paged_decode_attention_gqa4_h128_cute_split_stage1_metadata_kernel
+byte_v2_paged_decode_attention_gqa4_h128_flash_split_stage1_kernel
+```
+
+报告：
+
+```text
+benchmarks/profiles/step50_shared_wmma_ncu_cute_p512_b4_s8.ncu-rep
+benchmarks/profiles/step50_shared_wmma_ncu_flash_p512_b4_s8.ncu-rep
+benchmarks/profiles/step50_shared_wmma_ncu_cute_p2048_b1_s8.ncu-rep
+benchmarks/profiles/step50_shared_wmma_ncu_flash_p2048_b1_s8.ncu-rep
+```
+
+关键指标：
+
+| workload | variant | duration | inst | long scoreboard | barrier | issue active | regs | shmem | waves/SM | global excessive | shared excessive |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| p512/b4/s8 | CUTE | 73.440 us | 6.431M | 6.37 | 2.09 | 20.08% | 96 | 14,928 | 0.61 | 319,856 | 696,320 |
+| p512/b4/s8 | flash | 62.912 us | 6.521M | 5.97 | 0.14 | 23.51% | 116 | 9,216 | 0.76 | 319,856 | 360,448 |
+| p2048/b1/s8 | CUTE | 233.760 us | 6.004M | 6.38 | 1.70 | 5.94% | 96 | 14,928 | 0.15 | 317,168 | 696,320 |
+| p2048/b1/s8 | flash | 194.336 us | 6.257M | 5.80 | 0.07 | 7.52% | 116 | 9,216 | 0.19 | 317,168 | 360,448 |
+
+观察：
+
+1. flash-stage1 把 shared excessive 从 `696,320` 降到 `360,448`，下降约 48%。
+2. stage1 duration 下降：p512 `73.44 -> 62.91 us`，p2048 `233.76 -> 194.34 us`。
+3. barrier stall 大幅下降，说明去掉 `p_shared/pv_shared` 和额外同步是有效的。
+4. global excessive 完全不变，说明本轮解决的是 shared/WMMA 路径，不是 payload
+   global load。
+5. executed instructions 和 registers/thread 上升，flash-stage1 不是免费收益；
+   它用更多寄存器和指令换掉 shared 往返。
+
+这个 NCU 结果支持 Step 49 的判断：下一层瓶颈确实包含 shared/WMMA pipeline。
+
+### E2E 复测
+
+固定：
+
+```text
+model=/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct
+p512/b4/d64
+gpu_memory_utilization=0.45
+enforce_eager
+split_k=8
+sparse_fallback_pool_ratio=0.03
+outlier_arena=off
+```
+
+结果：
+
+| variant | run1 | run2 | fallback pool |
+| --- | ---: | ---: | --- |
+| CUTE metadata | 102.91 tok/s | 99.72 tok/s | not exhausted |
+| flash-stage1 | 61.73 tok/s | 89.16 tok/s | not exhausted |
+
+E2E 与 kernel/NCU 结论不一致：flash-stage1 kernel 本身更快，但整机吞吐低于 CUTE
+metadata，且第一次 run 退化更明显。复跑后退化收敛，但仍低约 10%。因此不能把
+flash-stage1 设为默认，也不能仅凭 stage1 microbench 判断 production 方向。
+
+### 处理结果
+
+本轮不修改 production default。保留现有显式实验开关
+`VLLM_BYTE_V2_DECODE_FLASH_STAGE1=1`，不启用 auto heuristic。
+
+原因：
+
+1. correctness 与 kernel profile 都支持 flash-stage1 是有效 lower-bound。
+2. 但 E2E 没有兑现 kernel 收益，说明还有跨层交互或调度/host/API/cache update
+   影响。
+3. 在解释 E2E 退化前，继续做 shared layout 大改风险较高。
+
+### 下一步
+
+下一步不应直接把 flash-stage1 默认打开，而应做 `CUTE metadata vs flash-stage1`
+的 detailed E2E profile：
+
+1. 用同一 production build 复测，排除 lineinfo build 对 E2E 的影响。
+2. 对同一 workload 做 nsys/NVTX 分段：attention stage1、reduce、cache update、
+   sampling/GEMM、host/API 间隔。
+3. 检查 flash-stage1 是否因为 `regs/thread=116` 降低跨层并发或改变调度节奏。
+4. 如果 E2E 退化来自非 attention 环节，则继续优化调度/launch/cudagraph；如果
+   退化来自 flash-stage1 本身，则以 CUTE metadata 为 production baseline，只把
+   flash-stage1 作为独立 lower-bound 参考。
+
+## Step 51：CUTE vs flash-stage1 的 detailed nsys profile
+
+### 实验目标
+
+Step 50 出现了矛盾结果：
+
+1. decode-only/NCU 中 flash-stage1 更快，shared excessive wavefronts 明显下降。
+2. E2E 中 flash-stage1 没有兑现收益，p512/b4/d64 反而低于 CUTE metadata。
+
+本轮目标是做 detailed profile，确认 E2E 差距到底来自 attention stage1、reduce、
+cache update、GEMM/sampling，还是 host/API 或 cudagraph 缺失。
+
+### profiling 方式和限制
+
+先尝试用 NVTX capture range：
+
+```text
+nsys profile \
+  --trace=cuda,nvtx,osrt,cublas \
+  --capture-range=nvtx \
+  --nvtx-capture=byte_v2_bench_measured \
+  --capture-range-end=stop
+```
+
+该方式没有生成 report。改为全程抓取 parent/child 后，sqlite 里仍只有少量
+CUDA runtime API，没有 `CUPTI_ACTIVITY_KIND_KERNEL`，说明 nsys 没有注入到 vLLM
+的 EngineCore worker 进程。
+
+继续尝试：
+
+```text
+nsys profile --trace-fork-before-exec=true ...
+```
+
+仍然没有捕获 worker 的 CUDA kernel 表。因此本轮为了得到 kernel-level 分解，
+临时使用：
+
+```text
+VLLM_ENABLE_V1_MULTIPROCESSING=0
+```
+
+让 V1 EngineCore 在当前进程中运行。这个 profile 只用于 GPU kernel 分解，不作为
+production E2E 吞吐结论；真实 production 默认仍是 multiprocessing。
+
+当前 `_C_stable_libtorch` 仍是 lineinfo build，因此本轮结论用于定位，不用于正式
+性能报告。若要做正式 production profile，需要先重新安装 extension：
+
+```text
+cd /mnt/sda1/yxz/byte_v2/vllm
+uv pip install -e . --torch-backend=auto
+```
+
+### workload
+
+```text
+model=/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct
+p512/b4/d64
+split_k=8
+sparse_fallback_pool_ratio=0.03
+outlier_arena=off
+enforce_eager
+gpu_memory_utilization=0.45
+VLLM_ENABLE_V1_MULTIPROCESSING=0
+```
+
+生成的主要报告：
+
+```text
+benchmarks/profiles/step51_nsys_uniproc_cute_p512_b4_d64.nsys-rep
+benchmarks/profiles/step51_nsys_uniproc_cute_p512_b4_d64.sqlite
+benchmarks/profiles/step51_nsys_uniproc_flash_p512_b4_d64.nsys-rep
+benchmarks/profiles/step51_nsys_uniproc_flash_p512_b4_d64.sqlite
+```
+
+### measured 区间总览
+
+用 `byte_v2_bench_decode_len_64_run_0` NVTX range 切 measured 区间：
+
+| variant | measured wall | summed GPU kernel | 说明 |
+| --- | ---: | ---: | --- |
+| CUTE metadata | 2408.8 ms | 2294.9 ms | 约 256 output tokens |
+| flash-stage1 | 3506.4 ms | 3259.9 ms | 同 workload |
+
+注意：这是 uniproc + lineinfo build + nsys 的 profiling-only 数值，绝对吞吐不作为
+最终性能；这里主要看分类比例和两条路径差异。
+
+### kernel 分类
+
+| category | CUTE metadata | flash-stage1 | 差值 |
+| --- | ---: | ---: | ---: |
+| GEMM/linear | 2041.4 ms | 2868.9 ms | +827.4 ms |
+| attention stage1 | 180.9 ms | 313.4 ms | +132.5 ms |
+| other model kernels | 38.1 ms | 38.5 ms | +0.4 ms |
+| decode cache update | 23.2 ms | 27.5 ms | +4.4 ms |
+| attention reduce | 6.6 ms | 6.8 ms | +0.2 ms |
+| sampling/scheduler kernels | 2.3 ms | 2.4 ms | +0.1 ms |
+| prefill cache update | 1.5 ms | 1.5 ms | ~0 |
+
+Top kernels：
+
+| variant | kernel | calls | total | avg |
+| --- | --- | ---: | ---: | ---: |
+| CUTE | `Kernel2` | 4032 | 1259.0 ms | 312.3 us |
+| CUTE | `ampere_bf16_s16816gemm_bf16_64x64_sliced1x2...` | 4032 | 622.3 ms | 154.4 us |
+| CUTE | `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel` | 2048 | 180.9 ms | 88.3 us |
+| CUTE | `byte_v2_decode_append_cache_kernel` | 2016 | 17.1 ms | 8.5 us |
+| CUTE | `byte_v2_paged_decode_attention_split_reduce_parallel_kernel` | 2048 | 6.6 ms | 3.2 us |
+| flash | `Kernel2` | 4032 | 1824.0 ms | 452.4 us |
+| flash | `ampere_bf16_s16816gemm_bf16_64x64_sliced1x2...` | 4032 | 879.6 ms | 218.2 us |
+| flash | `byte_v2_paged_decode_attention_gqa4_h128_flash_split_stage1_kernel` | 2048 | 313.4 ms | 153.0 us |
+| flash | `byte_v2_decode_append_cache_kernel` | 2016 | 21.5 ms | 10.7 us |
+| flash | `byte_v2_paged_decode_attention_split_reduce_parallel_kernel` | 2048 | 6.8 ms | 3.3 us |
+
+### 结论
+
+1. E2E 路径中 flash-stage1 没有复现 decode-only microbench 的收益。相反，
+   measured run 里 flash stage1 是 `313.4 ms`，CUTE stage1 是 `180.9 ms`。
+2. flash run 的 GEMM/linear 时间也显著变慢，说明该次 E2E/profile 仍受运行环境、
+   profiler 或调度噪声影响；但即使只看 ByteV2 attention stage1，flash 也不是
+   production 可启用路径。
+3. cache update 不是本轮主要问题：CUTE 约 `23.2 ms`，flash 约 `27.5 ms`。
+4. attention reduce 更不是主因：两者都约 `6.6-6.8 ms`。
+5. 这解释了 Step 50 的 E2E 反转：flash-stage1 的 decode-only lower-bound 不能
+   代表真实 E2E path。当前生产 baseline 应继续使用 CUTE metadata。
+
+### 处理结果
+
+不启用 `VLLM_BYTE_V2_DECODE_FLASH_STAGE1` 默认值，也不增加 auto heuristic。
+flash-stage1 继续只作为显式实验开关保留。
+
+### 下一步
+
+1. **先切 production build 后复测**：当前 lineinfo build 适合定位，不适合最终性能。
+   需要用户手动执行：
+
+   ```text
+   cd /mnt/sda1/yxz/byte_v2/vllm
+   uv pip install -e . --torch-backend=auto
+   ```
+
+2. **继续优化 CUTE metadata stage1，而不是 flash-stage1**：下一轮应围绕 CUTE
+   path 做更小的 source-guided 优化，重点是降低 `180.9 ms` stage1，而不是改
+   reduce/cache update。
+3. **补一个不依赖 nsys worker 注入的 timing hook**：在 benchmark 或 ByteV2
+   backend 中增加可选 CUDA event timing，直接记录 attention stage1/reduce/cache
+   update 的 per-token/per-layer 时间。这样 production multiprocessing 下也能拿到
+   分段时间，不依赖 nsys 是否成功注入 worker。
+
+## Step 52: memory-bound 长上下文 E2E 对比 CUTE metadata split-stage1 与 raw
+
+### 目的
+
+验证在更偏 memory-bound 的长上下文 decode 场景中，ByteV2 压缩 KV cache 的读带宽
+优势是否能在 E2E 吞吐中体现出来。
+
+本轮不使用 `--enforce-eager`，保留 vLLM production CUDA graph 路径。ByteV2 使用当前
+稳定最快的 CUTE metadata split-stage1，而不是 experimental flash-stage1：
+
+```text
+VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL=1
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO=0.03
+VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS=512
+VLLM_BYTE_V2_USE_NATIVE_KERNELS=1
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1
+VLLM_BYTE_V2_DECODE_TILE_FASTPATH=1
+VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO=1
+VLLM_BYTE_V2_DECODE_FLASH_STAGE1=0
+VLLM_BYTE_V2_DECODE_SPLIT_K=8
+VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE=1
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=0
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=0
+VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE=0
+VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC=1
+VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC=1
+VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK=1
+```
+
+### workload
+
+模型：
+
+```text
+/mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct
+```
+
+workload：
+
+```text
+p4096/b1/d64
+p4096/b1/d128
+p8064/b1/d64
+```
+
+由于该 Llama-3 配置 `max_position_embeddings=8192`，不能直接运行
+`prompt_len=8192 + decode_len=64`。因此 8K 场景使用 `prompt_len=8064`，
+`decode_len=64`，总长度 `8128`，不超过模型最大位置。
+
+输出文件：
+
+```text
+benchmarks/profiles/step52_memory_bound_raw_bytev2_cute_p4096_b1_d64_d128.json
+benchmarks/profiles/step52_memory_bound_raw_bytev2_cute_p8064_b1_d64.json
+```
+
+### E2E 结果
+
+| workload | raw tok/s | ByteV2 CUTE tok/s | ByteV2 / raw | raw elapsed | ByteV2 elapsed | pool exhausted |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| p4096/b1/d64 | 34.34 | 24.36 | 70.9% | 1.864 s | 2.627 s | false |
+| p4096/b1/d128 | 34.45 | 24.57 | 71.3% | 3.715 s | 5.209 s | false |
+| p8064/b1/d64 | 33.20 | 18.94 | 57.1% | 1.928 s | 3.379 s | false |
+
+### 结论
+
+1. 在本轮更偏 memory-bound 的长上下文 E2E 场景中，当前 ByteV2 CUTE metadata
+   split-stage1 没有超过 raw vLLM。
+2. 4K context 下 ByteV2 约为 raw 的 `71%`；接近 8K context 时下降到约 `57%`。
+   如果压缩 KV 读带宽收益已经主导，长 context 应该缩小差距；实际结果相反。
+3. sparse fallback pool 没有耗尽，因此本轮退化不是 pool exhaustion 导致。
+4. 这进一步说明当前主要瓶颈仍在 ByteV2 decode attention stage1 的额外成本：
+   compressed payload 解码、metadata 访问、shared/WMMA load pattern、split-stage
+   调度和 partial reduce 共同吃掉了 KV 读带宽降低带来的收益。
+
+### 下一步
+
+不要把长上下文 memory-bound 作为已经能体现 ByteV2 优势的证据。下一步仍应优先：
+
+1. 增加 production path 内的 CUDA event timing hook，直接在 E2E 中拆出
+   attention stage1、reduce、decode cache update、GEMM/sampling 时间。
+2. 围绕 `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel` 做针对性优化，
+   尤其是 load/decode pipeline 与 shared/WMMA layout。
+3. 只有当 stage1 的 per-token/layer 时间接近 raw attention 后，再重新扩大到更长
+   context、更多 batch 和更高并发验证压缩 KV 的读带宽收益。
+
+## Step 53: 加大 decode_len 的长 decode E2E 测试
+
+### 目的
+
+Step 52 主要看长 context、短 decode。本轮进一步加大 decode_len，检查较长 decode
+是否能摊薄调度/初始化开销，并让 ByteV2 压缩 KV 的读带宽优势在 steady-state 中体现。
+
+测试仍然使用 production CUDA graph 路径，ByteV2 使用当前稳定 baseline：
+
+```text
+CUTE metadata split-stage1
+VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO=1
+VLLM_BYTE_V2_DECODE_FLASH_STAGE1=0
+VLLM_BYTE_V2_DECODE_SPLIT_K=8
+VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE=1
+outlier_arena=off
+sparse_fallback_pool_ratio=0.03
+```
+
+输出文件：
+
+```text
+benchmarks/profiles/step53_long_decode_raw_bytev2_cute_p4096_b1_d256_d512_d1024.json
+benchmarks/profiles/step53_long_decode_raw_bytev2_cute_p7168_b1_d256_d512.json
+```
+
+### E2E 结果
+
+| workload | raw tok/s | ByteV2 CUTE tok/s | ByteV2 / raw | raw elapsed | ByteV2 elapsed | pool exhausted |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| p4096/b1/d256 | 34.24 | 24.54 | 71.7% | 7.477 s | 10.431 s | false |
+| p4096/b1/d512 | 34.26 | 24.36 | 71.1% | 14.943 s | 21.019 s | false |
+| p4096/b1/d1024 | 34.27 | 23.94 | 69.9% | 29.879 s | 42.779 s | false |
+| p7168/b1/d256 | 33.62 | 20.14 | 59.9% | 7.615 s | 12.710 s | false |
+| p7168/b1/d512 | 33.61 | 20.04 | 59.6% | 15.234 s | 25.549 s | false |
+
+### 结论
+
+1. 长 decode 没有让 ByteV2 追近 raw。`p4096/b1` 下，ByteV2 从 `d256` 的
+   `71.7% raw` 轻微下降到 `d1024` 的 `69.9% raw`。
+2. 更长 context 下差距进一步扩大。`p7168/b1` 下，ByteV2 只有约 `59.6%-59.9% raw`。
+3. raw 在长 decode 下非常稳定：`p4096` 约 `34.24-34.27 tok/s`，`p7168` 约
+   `33.61-33.62 tok/s`。ByteV2 随 context 变长明显下降，说明当前瓶颈仍随 KV
+   context 扫描成本增长。
+4. sparse fallback pool 没有耗尽，因此本轮不是 fallback pool capacity 问题。
+
+### 对后续优化的影响
+
+较长 decode 进一步排除了“短 decode 调度噪声掩盖 ByteV2 优势”的解释。当前差距更像是
+每个 decode step 内的稳定额外成本：
+
+```text
+compressed K/V payload decode
+metadata/fallback check
+shared layout / WMMA load
+split-stage partial write + reduce
+```
+
+下一步仍应优先做 production path 内的 CUDA event timing hook，把 E2E 中的
+attention stage1、reduce、decode cache update、GEMM/sampling 分开计时，然后继续针对
+CUTE metadata stage1 的 load/decode/shared/WMMA pipeline 做优化。
+
+## Step 54: 增大 batch_size 的容量/并发压力 E2E 测试
+
+### 目的
+
+确认前面 `b1` 长 context/长 decode 场景是否已经是显存容量受限，并测试增大 batch 后
+ByteV2 是否能因为压缩 KV cache 而体现容量或带宽优势。
+
+需要区分两个概念：
+
+```text
+显存容量受限: KV cache tokens 接近 GPU cache capacity，raw 无法继续增大 batch/context。
+HBM 带宽/attention 受限: attention 每步扫描 KV 的读带宽或解码流水线成为瓶颈。
+```
+
+本轮仍使用 production CUDA graph 路径，ByteV2 使用 CUTE metadata split-stage1。
+
+### workload
+
+```text
+p4096/b4/d128,d256
+p4096/b8/d128
+```
+
+输出文件：
+
+```text
+benchmarks/profiles/step54_batch_memory_raw_bytev2_cute_p4096_b4_d128_d256.json
+benchmarks/profiles/step54_batch_memory_raw_bytev2_cute_p4096_b8_d128.json
+benchmarks/profiles/step54_batch_memory_raw_bytev2_cute_p4096_b8_d128_eager.json
+```
+
+### b4 E2E 结果
+
+| workload | raw tok/s | ByteV2 CUTE tok/s | ByteV2 / raw | raw elapsed | ByteV2 elapsed | pool exhausted |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| p4096/b4/d128 | 123.93 | 87.87 | 70.9% | 4.131 s | 5.827 s | false |
+| p4096/b4/d256 | 125.17 | 90.17 | 72.0% | 8.181 s | 11.357 s | false |
+
+raw 在 `b4` 下从 `b1` 的约 `34 tok/s` 扩展到约 `124-125 tok/s`，说明该点不是显存
+容量受限。ByteV2 也能扩展到约 `88-90 tok/s`，但相对 raw 仍然只有约 `71%-72%`，
+和 `b1` 基本一致。
+
+初始化日志里的 KV capacity 也支持这一点：
+
+```text
+b4 raw:    GPU KV cache size 153,984 tokens, max concurrency for 8192 tokens/request 18.80x
+b4 ByteV2: GPU KV cache size 191,328 tokens, max concurrency for 8192 tokens/request 23.36x
+```
+
+实际 `p4096/b4/d256` 只需要约 `4 * (4096 + 256) = 17,408` tokens，远低于容量上限。
+
+### b8 结果
+
+raw production 可以跑通：
+
+| workload | mode | tok/s | elapsed | 备注 |
+| --- | --- | ---: | ---: | --- |
+| p4096/b8/d128 | raw production | 227.41 | 4.503 s | 跑通 |
+| p4096/b8/d128 | raw eager | 223.79 | 4.576 s | 跑通 |
+
+ByteV2 在 `b8` 下失败，production 和 eager 都失败在同一个位置：
+
+```text
+Byte-v2 native prefill direct cache update failed: invalid slot mapping
+error_code=2
+fallback_pool_used=0
+fallback_pool_capacity=512
+```
+
+production 路径中失败发生在 CUDA graph capture；eager 路径中失败发生在 warmup/真实
+prefill 执行。因此这不是单纯 cudagraph 问题，也不是 OOM。日志里 ByteV2 在 `b8`
+仍报告：
+
+```text
+GPU KV cache size 173,248 tokens
+Maximum concurrency for 8,192 tokens per request: 21.15x
+```
+
+实际 `p4096/b8/d128` 约 `8 * (4096 + 128) = 33,792` tokens，仍明显小于 KV cache
+capacity。失败更像是 ByteV2 native prefill direct cache update 对大 batch /
+`max_num_batched_tokens=32768` 的 slot mapping 兼容性 bug。
+
+### 结论
+
+1. 当前已测试的 `b1`、`b4`、`b8 raw` 场景都不是显存容量受限。raw 和 ByteV2 初始化
+   日志里的 KV cache capacity 都显著高于实际请求 token 数。
+2. 增大到 `b4` 后，ByteV2 没有相对 raw 变好，仍约 `71%-72% raw`。这说明当前主要
+   差距不是 batch 太小导致的调度摊销问题。
+3. `b8` 暴露了一个新的功能问题：ByteV2 native prefill direct cache update 的 slot
+   mapping 在更大的 batched prefill 下会失败。这个问题需要先修复，否则无法继续
+   验证更高 batch 的 ByteV2 E2E。
+4. ByteV2 的 KV capacity 优势确实存在，例如 `b4` 下 ByteV2 报告的 cache tokens
+   高于 raw；但在当前 batch/context 下还没有转化为吞吐优势。
+
+### 下一步
+
+1. 先修复 `p4096/b8` 的 ByteV2 prefill direct cache update `invalid slot mapping`。
+   修复后至少验证：
+
+   ```text
+   p4096/b8/d128 production
+   p4096/b8/d128 eager
+   ```
+
+2. 修复后再跑更接近显存容量边界的 workload，例如：
+
+   ```text
+   p4096/b16/d128
+   p7168/b8/d128
+   ```
+
+3. 如果目标是证明压缩 KV 的容量优势，需要选择 raw 接近或达到 KV capacity 的场景；
+   当前 `b4` 仍远离容量上限，只能说明高 batch 并没有自动解决 stage1 性能差距。
+
+## Step 55: 长上下文优化执行计划
+
+### 问题重新定性
+
+当前 `90%+ raw` 与 `70% raw` 的差异主要来自 workload 变化，而不是已经确认的代码
+退化：
+
+| workload | raw tok/s | ByteV2 tok/s | ByteV2 / raw |
+| --- | ---: | ---: | ---: |
+| p512/b4/d128 | 133.55 | 125.15 | 93.7% |
+| p4096/b1/d128 | 34.45 | 24.57 | 71.3% |
+| p4096/b4/d128 | 123.93 | 87.87 | 70.9% |
+| p7168/b1/d512 | 33.61 | 20.04 | 59.6% |
+
+短 context 下，ByteV2 attention/cache-update 的额外开销被 GEMM、MLP、sampling 和
+调度部分掩盖；长 context 下，每个 decode step 扫描更多 KV page，ByteV2 stage1 的
+额外成本被放大：
+
+```text
+compressed K/V payload decode
+metadata/fallback check
+shared layout / WMMA load
+split-stage partial write + reduce
+decode append/cache update
+```
+
+因此长上下文优化不能继续依赖“加 batch 或加 decode_len 自动追近 raw”。下一步需要
+按下面的顺序做。
+
+### 执行顺序
+
+#### 0. 短 context 哨兵复测
+
+每轮长 context 优化前先跑：
+
+```text
+p512/b4/d128 production/cudagraph
+p512/b4/d256 production/cudagraph
+```
+
+保留门槛：
+
+```text
+p512/b4/d128 ByteV2 >= 90% raw
+p512/b4/d256 ByteV2 >= 90% raw
+```
+
+如果短 context 也掉到 80% 左右，先查回归，不继续判断长 context 优化。
+
+#### 1. 修复 p4096/b8 prefill slot mapping
+
+当前 `p4096/b8/d128` 下 raw 能跑通，但 ByteV2 production/eager 都失败：
+
+```text
+Byte-v2 native prefill direct cache update failed: invalid slot mapping
+error_code=2
+fallback_pool_used=0
+fallback_pool_capacity=512
+```
+
+这不是 OOM，因为 ByteV2 仍报告 `GPU KV cache size 173,248 tokens`，实际 workload
+约 `33,792 tokens`。需要修复 ByteV2 native prefill direct cache update 对大 batch /
+chunked prefill / padding slot 的兼容性。
+
+修复点：
+
+```text
+slot < 0: skip
+slot >= num_gpu_blocks * block_size: sticky error
+valid slot: 根据 slot_mapping[token_idx] 更新对应 physical block
+不能假设 slot 连续、单调或无 padding
+```
+
+验证：
+
+```text
+unit: 连续 slot / 非连续 slot / -1 padding / 跨 block / batch=8
+E2E: p4096/b8/d128 eager
+E2E: p4096/b8/d128 production/cudagraph
+```
+
+#### 2. 增加 production CUDA event timing
+
+nsys 对 multiprocessing worker 注入不稳定，因此需要默认关闭的 event timing hook：
+
+```text
+VLLM_BYTE_V2_PROFILE_EVENTS=1
+```
+
+输出到 benchmark JSON：
+
+```text
+prefill cache update total/avg
+decode cache update total/avg
+decode attention stage1 total/avg
+decode attention reduce total/avg
+sampling/output copy total
+```
+
+先跑：
+
+```text
+p512/b4/d128
+p4096/b1/d128
+p4096/b4/d128
+p7168/b1/d128
+```
+
+保留门槛：
+
+```text
+profile off 零开销
+profile on E2E 额外开销 < 3%
+能稳定输出每段时间
+```
+
+#### 3. 长 context CUTE stage1 early-exit + NCU
+
+在当前 CUTE metadata split-stage1 上复测：
+
+```text
+mode0: full stage1
+mode1: load/decode K/V 后退出
+mode2: load/decode K/V + QK 后退出
+mode3: load/decode K/V + QK + softmax 后退出
+mode4: full stage1 + PV/write partial
+```
+
+workload：
+
+```text
+p4096/b1
+p4096/b4
+p7168/b1
+```
+
+必须记录：
+
+```text
+stage1 duration
+integer instructions
+memory instructions
+long scoreboard
+global excessive sectors
+shared excessive wavefronts
+registers/thread
+eligible warps/scheduler
+```
+
+这个结果决定后续优化分支。
+
+#### 4. adaptive split/page parallel sweep
+
+当前固定 `split_k=8` 不一定适合长 context。下一步做 sweep：
+
+```text
+p4096/b1/d128: split_k=8,16,32,64,128
+p4096/b4/d128: split_k=4,8,16,32,64
+p7168/b1/d128: split_k=16,32,64,128
+```
+
+目标是找到 stage1 并行度与 reduce 开销的平衡点，而不是盲目增大 split_k。
+
+保留门槛：
+
+```text
+stage1 + reduce total 下降 >= 5%
+p4096/b1 或 p4096/b4 E2E 提升 >= 3%
+p512/b4 不退化超过 1%
+```
+
+#### 5. 按 profile 选择 kernel 优化方向
+
+如果 `load/decode K/V` 最大：
+
+```text
+做 layout-v3 / vectorized decoder
+microbench >= +5%
+global excessive sectors 或 long scoreboard 必须下降
+E2E >= +3%
+```
+
+如果 `partial write/reduce` 最大：
+
+```text
+做 Stream-K / 多 page chunk 内部 online softmax 累积
+减少 partial output 写回和 reduce 输入规模
+p4096/b1 stage1+reduce >= -8%
+p7168/b1 stage1+reduce >= -10%
+```
+
+如果 metadata/fallback 检查最大：
+
+```text
+做 coarse kernel selection:
+  compressed-only no-fallback kernel
+  metadata/fallback kernel
+不要重新默认启用 tile bitmap
+```
+
+如果 fused compressed stage1 仍然明显慢：
+
+```text
+做 active raw staging oracle:
+  compressed KV 常驻 HBM
+  active decode batch 临时解压到 raw BF16 staging
+  decode attention 走 raw FlashAttention/FlashInfer
+```
+
+### active raw staging oracle
+
+这不是立刻替换 production 的方案，而是长 decode 场景的系统级 oracle。它利用长
+decode 中 prefix pages 会被重复读取的特点，把一次解压成本摊到多个 output token。
+
+估算 Llama-3 8B raw KV 全层每 token：
+
+```text
+32 layers * 2(K,V) * 8 kv_heads * 128 dim * 2 bytes = 131,072 bytes/token
+```
+
+active staging 额外显存：
+
+```text
+p4096/b1 ~= 512 MiB
+p4096/b4 ~= 2 GiB
+p7168/b4 ~= 3.5 GiB
+```
+
+oracle workload：
+
+```text
+p4096/b1/d128,d512,d1024
+p4096/b4/d128,d256
+p7168/b1/d128,d512
+```
+
+判断：
+
+```text
+staging >= 90% raw: 可以作为长 decode hybrid 路线
+staging 只在 d512/d1024 有效: 需要 decode_len threshold
+staging 仍慢: 继续 fused compressed stage1
+```
+
+### 阶段目标
+
+| 阶段 | 目标 |
+| --- | --- |
+| P0 | `p512/b4/d128` 保持 `>=90% raw` |
+| P1 | `p4096/b8/d128` ByteV2 production/eager 跑通 |
+| P2 | `p4096/b1,b4` 有 production event timing 分解 |
+| P3 | `p4096/b4/d128` 从 `70.9% raw` 提升到 `>=80% raw` |
+| P4 | `p7168/b1/d128/d512` 从 `~60% raw` 提升到 `>=70% raw` |
+| P5 | active staging oracle 在长 decode 达到 `>=90% raw` 或明确失败 |
+
+### 不优先继续做的方向
+
+基于已有实验，下面方向暂时不作为长 context 主线：
+
+```text
+盲目继续调 split_k 单点参数
+默认启用 flash-stage1
+默认启用 tile bitmap
+pair-interleaved 3B payload layout
+只看 microbench 不看 E2E/NCU 的 decoder 小改
+```
+
+每个 patch 必须有明确保留门槛；如果 E2E 没收益且 NCU 指标没有对应改善，就不保留为
+默认路径。
+
+## Step 56：b8 prefill slot mapping 修复与 E2E 结果
+
+时间：2026-06-14
+
+### 修改内容
+
+修复 `p4096/b8` ByteV2 在 prefill cache update 阶段报
+`invalid slot mapping` 的问题。
+
+根因是 `byte_v2_validate_prefill_direct_blocks_kernel` 把 direct prefill
+fast path 的资格检查当成硬错误处理。该 fast path 假设每 16 个输入 token
+正好映射到一个完整、连续、从 offset 0 开始的物理 block；但大 batch / 长
+prompt 下 vLLM 的 `slot_mapping` 可能不是这种布局。旧实现即使
+`VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC=1` 打开，也会强行进入
+direct encode，最终在 direct kernel 中触发 `invalid slot mapping`。
+
+本轮改动：
+
+```text
+csrc/libtorch_stable/cache_kernels.cu
+  byte_v2_validate_prefill_direct_blocks_kernel:
+    非 direct-friendly mapping 只标记 direct_ineligible
+    不再写 cache update error
+
+  host prefill direct branch:
+    必须读取 direct_ineligible
+    direct_ineligible == 0 才走 direct encode
+    direct_ineligible != 0 自动落到已有 compressed-only generic path
+
+tests/v1/attention/test_byte_v2_ops.py
+  新增 split direct group CUDA 回归测试
+```
+
+注意：这个修复使 `VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC=1` 不再跳过
+direct 资格判定同步。该同步只用于选择 direct/generic 路径；direct path 原本也会
+同步读取 direct encode 结果，所以这是 correctness 优先的低风险代价。
+
+### 验证
+
+重编译：
+
+```bash
+uv pip install -e . --torch-backend=auto
+```
+
+结果：
+
+```text
+成功，构建耗时约 16m04s
+```
+
+单测：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+.venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_reshape_and_cache_op_falls_back_for_split_direct_group_cuda \
+  -q
+```
+
+结果：
+
+```text
+1 passed
+```
+
+### E2E 结果
+
+#### p512/b4 哨兵，production/cudagraph
+
+输出文件：
+
+```text
+benchmarks/profiles/step55_sentinel_after_fix_p512_b4_d128_d256.json
+```
+
+| workload | raw tok/s | ByteV2 tok/s | ByteV2/raw | raw elapsed | ByteV2 elapsed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p512/b4/d128 | 133.354 | 118.225 | 88.66% | 3.839s | 4.331s |
+| p512/b4/d256 | 132.657 | 121.061 | 91.26% | 7.719s | 8.459s |
+
+结论：d256 仍超过 90%，d128 降到 88.66%，没有功能回归但 P0 的严格
+`p512/b4/d128 >= 90% raw` 门槛未完全满足。后续需要确认这是否来自新增
+direct 资格同步、运行噪声，还是当前 ByteV2 decode stage1 本身波动。
+
+#### p4096/b8/d16 smoke，production/cudagraph
+
+输出文件：
+
+```text
+benchmarks/profiles/step55_b8_smoke_p4096_b8_d16.json
+```
+
+结果：
+
+```text
+ByteV2 d16: 93.397 tok/s, elapsed 1.370s
+fallback any_exhausted=false
+fallback max_capacity=512
+fallback max_next_slot=24
+fallback total_capacity=16384
+fallback total_next_slot=768
+```
+
+结论：之前的 `invalid slot mapping` 已消失，`p4096/b8` ByteV2 production 能跑通。
+
+#### p4096/b8/d128，production/cudagraph
+
+输出文件：
+
+```text
+benchmarks/profiles/step55_b8_production_p4096_b8_d128.json
+```
+
+| workload | raw tok/s | ByteV2 tok/s | ByteV2/raw | raw elapsed | ByteV2 elapsed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p4096/b8/d128 | 227.251 | 136.637 | 60.13% | 4.506s | 7.494s |
+
+fallback：
+
+```text
+any_exhausted=false
+max_capacity=512
+max_next_slot=80
+total_capacity=16384
+total_next_slot=2560
+```
+
+#### p4096/b8/d128，eager
+
+输出文件：
+
+```text
+benchmarks/profiles/step55_b8_eager_p4096_b8_d128.json
+```
+
+| workload | raw tok/s | ByteV2 tok/s | ByteV2/raw | raw elapsed | ByteV2 elapsed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| p4096/b8/d128 | 222.119 | 134.664 | 60.63% | 4.610s | 7.604s |
+
+fallback：
+
+```text
+any_exhausted=false
+max_capacity=512
+max_next_slot=80
+total_capacity=16384
+total_next_slot=2560
+```
+
+### 结论
+
+P1 的功能目标已完成：`p4096/b8/d128` ByteV2 production/eager 都能跑通，
+且 sparse fallback pool 没有耗尽。
+
+性能目标仍未达成：b8 长 context 下 ByteV2 只有 raw 的约 60%。这说明当前
+主要问题不再是 b8 slot mapping correctness，而是长 context / 大 batch 下
+ByteV2 decode attention stage1、metadata/tile fallback 访问和 prefill/cache update
+额外开销的组合。下一步应按长 context 路线继续做 production event timing：
+
+```text
+attention stage1
+reduce
+cache update
+host/API
+sampling/GEMM
+```
+
+优先确认 `p4096/b8` 的 40% 差距中有多少来自 stage1，有多少来自 b8 下
+prefill generic fallback 路径代替 direct path。

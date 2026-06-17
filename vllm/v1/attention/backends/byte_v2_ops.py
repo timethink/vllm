@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.byte_v2_decode import (
 )
 from vllm.v1.attention.backends.byte_v2_layout import (
     ByteV2PageLayout,
+    ByteV2PageLayoutV3,
     byte_v2_reshape_and_cache_ref,
 )
 from vllm.v1.attention.backends.byte_v2_torch import (
@@ -30,7 +31,7 @@ def _make_layout(
     head_size: int,
     head_size_v: int,
     page_size_bytes: int,
-) -> ByteV2PageLayout:
+) -> ByteV2PageLayout | ByteV2PageLayoutV3:
     layout = ByteV2PageLayout(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
@@ -50,10 +51,20 @@ def _make_layout(
     if compressed_layout.page_size_bytes == page_size_bytes:
         return compressed_layout
 
+    v3_layout = ByteV2PageLayoutV3(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        head_size_v=head_size_v,
+    )
+    if v3_layout.page_size_bytes == page_size_bytes:
+        return v3_layout
+
     raise ValueError(
         "Byte-v2 op page size mismatch: "
         f"layout expects {layout.page_size_bytes} or "
-        f"{compressed_layout.page_size_bytes}, got {page_size_bytes}"
+        f"{compressed_layout.page_size_bytes} or "
+        f"{v3_layout.page_size_bytes}, got {page_size_bytes}"
     )
 
 
@@ -73,7 +84,14 @@ def _byte_v2_reshape_and_cache_impl(
     fallback_tile_ids: torch.Tensor | None = None,
     fallback_tile_next_slot: torch.Tensor | None = None,
     deferred_error: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
+    outlier_next_entry: torch.Tensor | None = None,
+    decode_append_fast_path_safe: bool = False,
 ) -> torch.Tensor:
+    del decode_append_fast_path_safe
     if (
         fallback_pool is not None
         or fallback_block_ids is not None
@@ -81,6 +99,11 @@ def _byte_v2_reshape_and_cache_impl(
         or fallback_tile_ids is not None
         or fallback_tile_next_slot is not None
         or deferred_error is not None
+        or outlier_arena is not None
+        or outlier_block_flags is not None
+        or outlier_tile_bitmap is not None
+        or outlier_tile_meta is not None
+        or outlier_next_entry is not None
     ):
         raise NotImplementedError(
             "Byte-v2 sparse fallback pool requires the native CUDA ops"
@@ -119,7 +142,14 @@ def _byte_v2_reshape_and_cache_fake(
     fallback_tile_ids: torch.Tensor | None = None,
     fallback_tile_next_slot: torch.Tensor | None = None,
     deferred_error: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
+    outlier_next_entry: torch.Tensor | None = None,
+    decode_append_fast_path_safe: bool = False,
 ) -> torch.Tensor:
+    del decode_append_fast_path_safe
     return torch.empty(0, device=slot_mapping.device, dtype=torch.int64)
 
 
@@ -147,12 +177,20 @@ def _byte_v2_paged_decode_attention_impl(
     fallback_block_ids: torch.Tensor | None = None,
     fallback_tile_ids: torch.Tensor | None = None,
     partial_workspace: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del partial_workspace
     if (
         fallback_pool is not None
         or fallback_block_ids is not None
         or fallback_tile_ids is not None
+        or outlier_arena is not None
+        or outlier_block_flags is not None
+        or outlier_tile_bitmap is not None
+        or outlier_tile_meta is not None
     ):
         raise NotImplementedError(
             "Byte-v2 sparse fallback pool requires the native CUDA ops"
@@ -189,8 +227,18 @@ def _byte_v2_paged_decode_attention_fake(
     fallback_block_ids: torch.Tensor | None = None,
     fallback_tile_ids: torch.Tensor | None = None,
     partial_workspace: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    del partial_workspace
+    del (
+        partial_workspace,
+        outlier_arena,
+        outlier_block_flags,
+        outlier_tile_bitmap,
+        outlier_tile_meta,
+    )
     return torch.empty(
         query.shape[0],
         query.shape[1],
@@ -224,6 +272,12 @@ def byte_v2_reshape_and_cache(
     fallback_tile_ids: torch.Tensor | None = None,
     fallback_tile_next_slot: torch.Tensor | None = None,
     deferred_error: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
+    outlier_next_entry: torch.Tensor | None = None,
+    decode_append_fast_path_safe: bool = False,
 ) -> torch.Tensor:
     return torch.ops.vllm.byte_v2_reshape_and_cache(
         key,
@@ -241,6 +295,12 @@ def byte_v2_reshape_and_cache(
         fallback_tile_ids,
         fallback_tile_next_slot,
         deferred_error,
+        outlier_arena,
+        outlier_block_flags,
+        outlier_tile_bitmap,
+        outlier_tile_meta,
+        outlier_next_entry,
+        decode_append_fast_path_safe,
     )
 
 
@@ -259,6 +319,10 @@ def byte_v2_paged_decode_attention(
     fallback_block_ids: torch.Tensor | None = None,
     fallback_tile_ids: torch.Tensor | None = None,
     partial_workspace: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.vllm.byte_v2_paged_decode_attention(
         query,
@@ -275,4 +339,8 @@ def byte_v2_paged_decode_attention(
         fallback_block_ids,
         fallback_tile_ids,
         partial_workspace,
+        outlier_arena,
+        outlier_block_flags,
+        outlier_tile_bitmap,
+        outlier_tile_meta,
     )

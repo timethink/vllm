@@ -70,7 +70,8 @@ def _mode_env(mode: str) -> dict[str, str]:
         env["VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE"] = "0"
     elif mode == "byte_v2_compressed_only":
         env["VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE"] = "1"
-        env.setdefault("VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL", "1")
+        if "VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL" not in os.environ:
+            env["VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL"] = "1"
     else:
         raise ValueError(f"Unsupported benchmark mode: {mode}")
     return env
@@ -101,6 +102,7 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
     from vllm.inputs import TokensPrompt
 
     mode = args.child_mode
+    os.environ.update(_mode_env(mode))
     decode_lens = _parse_csv_ints(args.decode_lens)
     max_decode_len = max(decode_lens)
     max_model_len = args.max_model_len or args.prompt_len + max_decode_len + 16
@@ -260,13 +262,25 @@ def run_child(args: argparse.Namespace) -> dict[str, Any]:
                 "VLLM_BYTE_V2_USE_NATIVE_KERNELS",
                 "VLLM_BYTE_V2_DECODE_PAGE_FASTPATH",
                 "VLLM_BYTE_V2_DECODE_TILE_FASTPATH",
+                "VLLM_BYTE_V2_DECODE_CUTE_STAGE1",
+                "VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO",
+                "VLLM_BYTE_V2_DECODE_V3_CP_ASYNC_STAGE",
+                "VLLM_BYTE_V2_DECODE_FAST_STAGE1",
+                "VLLM_BYTE_V2_DECODE_FLASH_STAGE1",
+                "VLLM_BYTE_V2_DECODE_V4_STAGE1",
+                "VLLM_BYTE_V2_DECODE_V4_MACRO_PAGES",
                 "VLLM_BYTE_V2_DECODE_SPLIT_K",
                 "VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE",
                 "VLLM_BYTE_V2_PERSISTENT_PARTIAL_WORKSPACE",
                 "VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE",
+                "VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA",
+                "VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK",
+                "VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES",
+                "VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE",
                 "VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC",
                 "VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC",
                 "VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK",
+                "VLLM_BYTE_V2_PAYLOAD_LAYOUT",
             )
             if os.environ.get(key) is not None
         },

@@ -2750,6 +2750,12 @@ def byte_v2_reshape_and_cache(
     fallback_tile_ids: torch.Tensor | None = None,
     fallback_tile_next_slot: torch.Tensor | None = None,
     deferred_error: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
+    outlier_next_entry: torch.Tensor | None = None,
+    decode_append_fast_path_safe: bool = False,
 ) -> torch.Tensor:
     if key.is_cuda and kv_cache.is_cuda and envs.VLLM_BYTE_V2_USE_NATIVE_KERNELS:
         return torch.ops._C_cache_ops.byte_v2_reshape_and_cache(
@@ -2768,6 +2774,12 @@ def byte_v2_reshape_and_cache(
             fallback_tile_ids,
             fallback_tile_next_slot,
             deferred_error,
+            outlier_arena,
+            outlier_block_flags,
+            outlier_tile_bitmap,
+            outlier_tile_meta,
+            outlier_next_entry,
+            decode_append_fast_path_safe,
         )
 
     from vllm.v1.attention.backends.byte_v2_ops import (
@@ -2790,6 +2802,12 @@ def byte_v2_reshape_and_cache(
         fallback_tile_ids,
         fallback_tile_next_slot,
         deferred_error,
+        outlier_arena,
+        outlier_block_flags,
+        outlier_tile_bitmap,
+        outlier_tile_meta,
+        outlier_next_entry,
+        decode_append_fast_path_safe,
     )
 
 
@@ -2808,6 +2826,10 @@ def byte_v2_paged_decode_attention(
     fallback_block_ids: torch.Tensor | None = None,
     fallback_tile_ids: torch.Tensor | None = None,
     partial_workspace: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_block_flags: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if query.is_cuda and kv_cache.is_cuda and envs.VLLM_BYTE_V2_USE_NATIVE_KERNELS:
         query = query.contiguous()
@@ -2826,6 +2848,10 @@ def byte_v2_paged_decode_attention(
             fallback_block_ids,
             fallback_tile_ids,
             partial_workspace,
+            outlier_arena,
+            outlier_block_flags,
+            outlier_tile_bitmap,
+            outlier_tile_meta,
         )
 
     from vllm.v1.attention.backends.byte_v2_ops import (
@@ -2846,6 +2872,45 @@ def byte_v2_paged_decode_attention(
         fallback_pool,
         fallback_block_ids,
         fallback_tile_ids,
+        partial_workspace,
+        outlier_arena,
+        outlier_block_flags,
+        outlier_tile_bitmap,
+        outlier_tile_meta,
+    )
+
+
+def byte_v2_decompress_cache_to_bf16(
+    kv_cache: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    head_size_v: int,
+    page_size_bytes: int,
+    fallback_pool: torch.Tensor | None = None,
+    fallback_block_ids: torch.Tensor | None = None,
+    fallback_tile_ids: torch.Tensor | None = None,
+    outlier_arena: torch.Tensor | None = None,
+    outlier_tile_bitmap: torch.Tensor | None = None,
+    outlier_tile_meta: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C_cache_ops.byte_v2_decompress_cache_to_bf16(
+        kv_cache,
+        key_cache,
+        value_cache,
+        block_size,
+        num_kv_heads,
+        head_size,
+        head_size_v,
+        page_size_bytes,
+        fallback_pool,
+        fallback_block_ids,
+        fallback_tile_ids,
+        outlier_arena,
+        outlier_tile_bitmap,
+        outlier_tile_meta,
     )
 
 

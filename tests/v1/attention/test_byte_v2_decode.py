@@ -966,6 +966,431 @@ def test_byte_v2_paged_decode_attention_op_cute_stage1_cuda(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_paged_decode_attention_op_fast_stage1_cuda(monkeypatch):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 WMMA split-K path requires Ampere or newer")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "4")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_FAST_STAGE1", "1")
+    torch.manual_seed(229)
+    layout = ByteV2PageLayout(
+        block_size=16, num_kv_heads=8, head_size=128, head_size_v=128
+    )
+    num_blocks = 20
+    key_blocks, value_blocks, kv_cache = _make_blocks(num_blocks, layout)
+    query = (0.5 + 0.01 * torch.randn(1, 32, 128)).to(torch.bfloat16)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor([num_blocks * layout.block_size - 5],
+                            dtype=torch.int32)
+    scale = layout.head_size**-0.5
+
+    expected = _raw_paged_decode(
+        query, key_blocks, value_blocks, block_table, seq_lens, layout, scale
+    )
+    actual = ops.byte_v2_paged_decode_attention(
+        query.cuda(),
+        kv_cache.cuda(),
+        block_table.cuda(),
+        seq_lens.cuda(),
+        scale,
+        block_size=16,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        head_size_v=layout.head_size_v,
+        page_size_bytes=layout.page_size_bytes,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_paged_decode_attention_op_flash_stage1_cuda(monkeypatch):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 Flash-style split-K path requires Ampere or newer")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "4")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_FLASH_STAGE1", "1")
+    torch.manual_seed(230)
+    layout = ByteV2PageLayout(
+        block_size=16, num_kv_heads=8, head_size=128, head_size_v=128
+    )
+    num_blocks = 20
+    key_blocks, value_blocks, kv_cache = _make_blocks(num_blocks, layout)
+    query = (0.5 + 0.01 * torch.randn(1, 32, 128)).to(torch.bfloat16)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor(
+        [num_blocks * layout.block_size - 5], dtype=torch.int32
+    )
+    scale = layout.head_size**-0.5
+
+    expected = _raw_paged_decode(
+        query, key_blocks, value_blocks, block_table, seq_lens, layout, scale
+    )
+    actual = ops.byte_v2_paged_decode_attention(
+        query.cuda(),
+        kv_cache.cuda(),
+        block_table.cuda(),
+        seq_lens.cuda(),
+        scale,
+        block_size=16,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        head_size_v=layout.head_size_v,
+        page_size_bytes=layout.page_size_bytes,
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_paged_decode_attention_op_flash_stage1_raw_fallback_cuda(
+    monkeypatch,
+):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 Flash-style split-K path requires Ampere or newer")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "4")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_FLASH_STAGE1", "1")
+    torch.manual_seed(231)
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+        raw_tail_bytes=0,
+    )
+    num_blocks = 20
+    key_blocks, value_blocks, kv_cache = _make_blocks(num_blocks, layout)
+    fallback_block = 7
+    kv_cache[fallback_block, BYTE_V2_PAGE_STATUS_OFFSET] = (
+        BYTE_V2_PAGE_STATUS_RAW_FALLBACK
+    )
+    kv_cache[fallback_block, BYTE_V2_PAGE_VALID_ROWS_OFFSET] = layout.block_size
+    fallback_pool = torch.empty(1, layout.raw_block_bytes, dtype=torch.uint8)
+    fallback_pool[0, : layout.raw_key_bytes] = key_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_pool[0, layout.raw_key_bytes :] = value_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_block_ids = torch.full((num_blocks,), -1, dtype=torch.int32)
+    fallback_block_ids[fallback_block] = 0
+
+    query = (0.5 + 0.01 * torch.randn(1, 32, 128)).to(torch.bfloat16)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor(
+        [num_blocks * layout.block_size - 5], dtype=torch.int32
+    )
+    scale = layout.head_size**-0.5
+
+    expected = _raw_paged_decode(
+        query, key_blocks, value_blocks, block_table, seq_lens, layout, scale
+    )
+    actual = ops.byte_v2_paged_decode_attention(
+        query.cuda(),
+        kv_cache.cuda(),
+        block_table.cuda(),
+        seq_lens.cuda(),
+        scale,
+        block_size=16,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        head_size_v=layout.head_size_v,
+        page_size_bytes=layout.page_size_bytes,
+        fallback_pool=fallback_pool.cuda(),
+        fallback_block_ids=fallback_block_ids.cuda(),
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_paged_decode_attention_op_flash_stage1_tile_fallback_cuda(
+    monkeypatch,
+):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 Flash-style split-K path requires Ampere or newer")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "4")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_TILE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_FLASH_STAGE1", "1")
+    torch.manual_seed(232)
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+        raw_tail_bytes=0,
+    )
+    num_blocks = 20
+    key_blocks, value_blocks, kv_cache = _make_blocks(num_blocks, layout)
+
+    fallback_block = 9
+    fallback_kv_head = 3
+    fallback_k_dim_tile = 5
+    fallback_v_dim_tile = 2
+    raw_tile_bytes = layout.block_size * 16 * 2
+    fallback_pool = torch.zeros(1, layout.raw_block_bytes, dtype=torch.uint8)
+    fallback_pool_flat = fallback_pool.flatten()
+    key_tile = key_blocks[fallback_block][
+        :,
+        fallback_kv_head,
+        fallback_k_dim_tile * 16 : (fallback_k_dim_tile + 1) * 16,
+    ]
+    value_tile = value_blocks[fallback_block][
+        :,
+        fallback_kv_head,
+        fallback_v_dim_tile * 16 : (fallback_v_dim_tile + 1) * 16,
+    ]
+    fallback_pool_flat[0:raw_tile_bytes] = (
+        key_tile.contiguous().view(torch.uint8).flatten()
+    )
+    fallback_pool_flat[raw_tile_bytes : 2 * raw_tile_bytes] = (
+        value_tile.contiguous().view(torch.uint8).flatten()
+    )
+
+    fallback_tile_ids = torch.full(
+        (num_blocks, layout.total_tiles), -1, dtype=torch.int32
+    )
+    key_tile_idx = layout.tile_index(
+        "k", fallback_kv_head, fallback_k_dim_tile
+    )
+    value_tile_idx = layout.tile_index(
+        "v", fallback_kv_head, fallback_v_dim_tile
+    )
+    fallback_tile_ids[fallback_block, key_tile_idx] = 0
+    fallback_tile_ids[fallback_block, value_tile_idx] = 1
+    kv_cache[
+        fallback_block,
+        layout.tile_offsets("k", fallback_kv_head, fallback_k_dim_tile).fallback,
+    ] = 1
+    kv_cache[
+        fallback_block,
+        layout.tile_offsets("v", fallback_kv_head, fallback_v_dim_tile).fallback,
+    ] = 1
+    fallback_block_ids = torch.full((num_blocks,), -1, dtype=torch.int32)
+
+    query = (0.5 + 0.01 * torch.randn(1, 32, 128)).to(torch.bfloat16)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor(
+        [num_blocks * layout.block_size - 5], dtype=torch.int32
+    )
+    scale = layout.head_size**-0.5
+
+    expected = _raw_paged_decode(
+        query, key_blocks, value_blocks, block_table, seq_lens, layout, scale
+    )
+    actual = ops.byte_v2_paged_decode_attention(
+        query.cuda(),
+        kv_cache.cuda(),
+        block_table.cuda(),
+        seq_lens.cuda(),
+        scale,
+        block_size=16,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        head_size_v=layout.head_size_v,
+        page_size_bytes=layout.page_size_bytes,
+        fallback_pool=fallback_pool.cuda(),
+        fallback_block_ids=fallback_block_ids.cuda(),
+        fallback_tile_ids=fallback_tile_ids.cuda(),
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_paged_decode_attention_op_cute_stage1_metadata_cuda(
+    monkeypatch,
+):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 WMMA split-K path requires Ampere or newer")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "4")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1", "1")
+    torch.manual_seed(129)
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+        raw_tail_bytes=0,
+    )
+    num_blocks = 20
+    key_blocks, value_blocks, kv_cache = _make_blocks(num_blocks, layout)
+    fallback_block = 7
+    kv_cache[fallback_block, BYTE_V2_PAGE_STATUS_OFFSET] = (
+        BYTE_V2_PAGE_STATUS_RAW_FALLBACK
+    )
+    kv_cache[fallback_block, BYTE_V2_PAGE_VALID_ROWS_OFFSET] = layout.block_size
+    fallback_pool = torch.empty(1, layout.raw_block_bytes, dtype=torch.uint8)
+    fallback_pool[0, : layout.raw_key_bytes] = key_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_pool[0, layout.raw_key_bytes :] = value_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_block_ids = torch.full((num_blocks,), -1, dtype=torch.int32)
+    fallback_block_ids[fallback_block] = 0
+
+    query = (0.5 + 0.01 * torch.randn(1, 32, 128)).to(torch.bfloat16)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor(
+        [num_blocks * layout.block_size - 5], dtype=torch.int32
+    )
+    scale = layout.head_size**-0.5
+
+    expected = _raw_paged_decode(
+        query, key_blocks, value_blocks, block_table, seq_lens, layout, scale
+    )
+    actual = ops.byte_v2_paged_decode_attention(
+        query.cuda(),
+        kv_cache.cuda(),
+        block_table.cuda(),
+        seq_lens.cuda(),
+        scale,
+        block_size=16,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        head_size_v=layout.head_size_v,
+        page_size_bytes=layout.page_size_bytes,
+        fallback_pool=fallback_pool.cuda(),
+        fallback_block_ids=fallback_block_ids.cuda(),
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_paged_decode_attention_op_cute_stage1_auto_metadata_cuda(
+    monkeypatch,
+):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 WMMA split-K path requires Ampere or newer")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "4")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO", "1")
+    monkeypatch.delenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1", raising=False)
+    torch.manual_seed(130)
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+        raw_tail_bytes=0,
+    )
+    num_blocks = 20
+    batch_size = 4
+    key_blocks, value_blocks, kv_cache = _make_blocks(num_blocks, layout)
+    fallback_block = 7
+    kv_cache[fallback_block, BYTE_V2_PAGE_STATUS_OFFSET] = (
+        BYTE_V2_PAGE_STATUS_RAW_FALLBACK
+    )
+    kv_cache[fallback_block, BYTE_V2_PAGE_VALID_ROWS_OFFSET] = layout.block_size
+    fallback_pool = torch.empty(1, layout.raw_block_bytes, dtype=torch.uint8)
+    fallback_pool[0, : layout.raw_key_bytes] = key_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_pool[0, layout.raw_key_bytes :] = value_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_block_ids = torch.full((num_blocks,), -1, dtype=torch.int32)
+    fallback_block_ids[fallback_block] = 0
+
+    query = (0.5 + 0.01 * torch.randn(batch_size, 32, 128)).to(torch.bfloat16)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).repeat(
+        batch_size, 1
+    )
+    seq_lens = torch.full(
+        (batch_size,), num_blocks * layout.block_size - 5, dtype=torch.int32
+    )
+    scale = layout.head_size**-0.5
+
+    expected = _raw_paged_decode(
+        query, key_blocks, value_blocks, block_table, seq_lens, layout, scale
+    )
+    actual = ops.byte_v2_paged_decode_attention(
+        query.cuda(),
+        kv_cache.cuda(),
+        block_table.cuda(),
+        seq_lens.cuda(),
+        scale,
+        block_size=16,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        head_size_v=layout.head_size_v,
+        page_size_bytes=layout.page_size_bytes,
+        fallback_pool=fallback_pool.cuda(),
+        fallback_block_ids=fallback_block_ids.cuda(),
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_paged_decode_attention_op_cute_stage1_auto_long_context_cuda(
+    monkeypatch,
+):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("BF16 WMMA split-K path requires Ampere or newer")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_SPLIT_K", "64")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_PAGE_FASTPATH", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO", "1")
+    monkeypatch.delenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1", raising=False)
+    torch.manual_seed(131)
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+        raw_tail_bytes=0,
+    )
+    num_blocks = 128
+    key_blocks, value_blocks, kv_cache = _make_blocks(num_blocks, layout)
+    fallback_block = 17
+    kv_cache[fallback_block, BYTE_V2_PAGE_STATUS_OFFSET] = (
+        BYTE_V2_PAGE_STATUS_RAW_FALLBACK
+    )
+    kv_cache[fallback_block, BYTE_V2_PAGE_VALID_ROWS_OFFSET] = layout.block_size
+    fallback_pool = torch.empty(1, layout.raw_block_bytes, dtype=torch.uint8)
+    fallback_pool[0, : layout.raw_key_bytes] = key_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_pool[0, layout.raw_key_bytes :] = value_blocks[
+        fallback_block
+    ].contiguous().view(torch.uint8).flatten()
+    fallback_block_ids = torch.full((num_blocks,), -1, dtype=torch.int32)
+    fallback_block_ids[fallback_block] = 0
+
+    query = (0.5 + 0.01 * torch.randn(1, 32, 128)).to(torch.bfloat16)
+    block_table = torch.arange(num_blocks, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor(
+        [num_blocks * layout.block_size - 5], dtype=torch.int32
+    )
+    scale = layout.head_size**-0.5
+
+    expected = _raw_paged_decode(
+        query, key_blocks, value_blocks, block_table, seq_lens, layout, scale
+    )
+    actual = ops.byte_v2_paged_decode_attention(
+        query.cuda(),
+        kv_cache.cuda(),
+        block_table.cuda(),
+        seq_lens.cuda(),
+        scale,
+        block_size=16,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        head_size_v=layout.head_size_v,
+        page_size_bytes=layout.page_size_bytes,
+        fallback_pool=fallback_pool.cuda(),
+        fallback_block_ids=fallback_block_ids.cuda(),
+    )
+
+    torch.testing.assert_close(actual.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_byte_v2_paged_decode_attention_op_gqa_wmma_auto_split_k_cuda(
     monkeypatch,
 ):

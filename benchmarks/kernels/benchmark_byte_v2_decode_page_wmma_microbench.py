@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 from pathlib import Path
 from typing import Any
@@ -42,20 +43,35 @@ def _build_compressed_pages(
     *,
     num_pages: int,
     num_kv_heads: int,
+    payload_layout: str,
     seed: int,
 ) -> torch.Tensor:
     from vllm.v1.attention.backends.byte_v2_layout import (
         ByteV2PageLayout,
+        ByteV2PageLayoutV3,
         pack_byte_v2_kv_block_to_page,
+        pack_byte_v2_kv_block_to_page_v3,
     )
 
-    layout = ByteV2PageLayout(
-        block_size=16,
-        num_kv_heads=num_kv_heads,
-        head_size=128,
-        head_size_v=128,
-        raw_tail_bytes=0,
-    )
+    if payload_layout == "v1":
+        layout = ByteV2PageLayout(
+            block_size=16,
+            num_kv_heads=num_kv_heads,
+            head_size=128,
+            head_size_v=128,
+            raw_tail_bytes=0,
+        )
+        pack_page = pack_byte_v2_kv_block_to_page
+    elif payload_layout == "v3":
+        layout = ByteV2PageLayoutV3(
+            block_size=16,
+            num_kv_heads=num_kv_heads,
+            head_size=128,
+            head_size_v=128,
+        )
+        pack_page = pack_byte_v2_kv_block_to_page_v3
+    else:
+        raise ValueError(f"Unsupported ByteV2 payload layout: {payload_layout}")
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     key = (
@@ -84,9 +100,7 @@ def _build_compressed_pages(
     ).to(torch.bfloat16)
     kv_cache = torch.zeros(num_pages, layout.page_size_bytes, dtype=torch.uint8)
     for page_idx in range(num_pages):
-        pack_byte_v2_kv_block_to_page(
-            key[page_idx], value[page_idx], layout, page=kv_cache[page_idx]
-        )
+        pack_page(key[page_idx], value[page_idx], layout, page=kv_cache[page_idx])
     return kv_cache
 
 
@@ -95,6 +109,9 @@ def run_case(
     num_pages: int,
     num_kv_heads: int,
     kv_head: int,
+    payload_layout: str,
+    v3_warp_stripe_load: bool,
+    v3_cp_async_stage: bool,
     repeat_count: int,
     warmup: int,
     iterations: int,
@@ -103,9 +120,18 @@ def run_case(
     from vllm import _custom_ops as ops
 
     device = torch.device("cuda")
+    if v3_warp_stripe_load:
+        os.environ["VLLM_BYTE_V2_DECODE_V3_WARP_STRIPE_LOAD"] = "1"
+    else:
+        os.environ.pop("VLLM_BYTE_V2_DECODE_V3_WARP_STRIPE_LOAD", None)
+    if v3_cp_async_stage:
+        os.environ["VLLM_BYTE_V2_DECODE_V3_CP_ASYNC_STAGE"] = "1"
+    else:
+        os.environ.pop("VLLM_BYTE_V2_DECODE_V3_CP_ASYNC_STAGE", None)
     kv_cache_cpu = _build_compressed_pages(
         num_pages=num_pages,
         num_kv_heads=num_kv_heads,
+        payload_layout=payload_layout,
         seed=seed,
     )
     kv_cache = kv_cache_cpu.to(device=device, non_blocking=True)
@@ -159,6 +185,9 @@ def run_case(
         "num_pages": num_pages,
         "num_kv_heads": num_kv_heads,
         "kv_head": kv_head,
+        "payload_layout": payload_layout,
+        "v3_warp_stripe_load": v3_warp_stripe_load,
+        "v3_cp_async_stage": v3_cp_async_stage,
         "repeat_count": repeat_count,
         "warmup": warmup,
         "iterations": iterations,
@@ -172,6 +201,9 @@ def main() -> None:
     parser.add_argument("--num-pages", type=int, default=256)
     parser.add_argument("--num-kv-heads", type=int, default=1)
     parser.add_argument("--kv-head", type=int, default=0)
+    parser.add_argument("--payload-layout", choices=("v1", "v3"), default="v1")
+    parser.add_argument("--v3-warp-stripe-load", action="store_true")
+    parser.add_argument("--v3-cp-async-stage", action="store_true")
     parser.add_argument("--repeat-count", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
@@ -193,6 +225,9 @@ def main() -> None:
             num_pages=args.num_pages,
             num_kv_heads=args.num_kv_heads,
             kv_head=args.kv_head,
+            payload_layout=args.payload_layout,
+            v3_warp_stripe_load=args.v3_warp_stripe_load,
+            v3_cp_async_stage=args.v3_cp_async_stage,
             repeat_count=args.repeat_count,
             warmup=args.warmup,
             iterations=args.iterations,

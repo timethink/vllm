@@ -33,6 +33,9 @@ vllm/vllm-rs
 .Python
 build/
 !requirements/build/
+.build/
+install/
+benchmarks/profiles/
 cmake-build-*/
 CMakeUserPresets.json
 develop-eggs/

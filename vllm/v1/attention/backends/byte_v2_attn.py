@@ -37,6 +37,12 @@ from vllm.v1.attention.backends.byte_v2_layout import (
     BYTE_V2_PAGE_VALID_ROWS_OFFSET,
     BYTE_V2_TILE_SIZE,
     ByteV2PageLayout,
+    ByteV2PageLayoutV3,
+)
+from vllm.v1.attention.backends.byte_v2_outliers import (
+    byte_v2_tile_exponent_miss_counts,
+    estimate_byte_v2_outlier_storage_from_misses,
+    summarize_byte_v2_tile_miss_counts,
 )
 from vllm.v1.attention.backends.byte_v2_torch import (
     byte_v2_paged_prefill_attention_torch,
@@ -53,83 +59,6 @@ from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
 )
-
-
-def _byte_v2_bad_tile_miss_summary(
-    exp_tiles: torch.Tensor,
-) -> dict[str, int | float]:
-    """Return lossless Byte-v2 fallback stats for exponent tiles.
-
-    Args:
-        exp_tiles: Tensor shaped `[num_tiles, valid_rows * 16]`, containing
-            BF16 exponent bytes for one logical Byte-v2 tile per row.
-
-    Returns:
-        Aggregate stats for tiles whose exponents do not fit in one
-        16-exponent window.
-    """
-    num_tiles = int(exp_tiles.shape[0])
-    if num_tiles == 0:
-        return {
-            "bad_tiles": 0,
-            "sum_bad_tile_misses": 0,
-            "max_misses_per_bad_tile": 0,
-            "mean_misses_per_bad_tile": 0.0,
-            "bad_tiles_misses_le_1": 0,
-            "bad_tiles_misses_le_2": 0,
-            "bad_tiles_misses_le_4": 0,
-            "bad_tiles_misses_le_8": 0,
-            "bad_tiles_misses_gt_8": 0,
-        }
-
-    min_exp = exp_tiles.min(dim=1).values
-    max_exp = exp_tiles.max(dim=1).values
-    bad_exp_tiles = exp_tiles[(max_exp - min_exp) > 15]
-    if bad_exp_tiles.numel() == 0:
-        return {
-            "bad_tiles": 0,
-            "sum_bad_tile_misses": 0,
-            "max_misses_per_bad_tile": 0,
-            "mean_misses_per_bad_tile": 0.0,
-            "bad_tiles_misses_le_1": 0,
-            "bad_tiles_misses_le_2": 0,
-            "bad_tiles_misses_le_4": 0,
-            "bad_tiles_misses_le_8": 0,
-            "bad_tiles_misses_gt_8": 0,
-        }
-
-    tile_elems = int(bad_exp_tiles.shape[1])
-    misses_parts: list[torch.Tensor] = []
-    # Keep the temporary searchsorted tensors modest; this is a diagnostic path.
-    for offset in range(0, int(bad_exp_tiles.shape[0]), 2048):
-        chunk = bad_exp_tiles[offset : offset + 2048].to(torch.int16)
-        sorted_exp = torch.sort(chunk, dim=1).values
-        best_covered = torch.zeros(
-            sorted_exp.shape[0], device=sorted_exp.device, dtype=torch.int64
-        )
-        for start in range(tile_elems):
-            right = torch.searchsorted(
-                sorted_exp,
-                (sorted_exp[:, start] + 15).unsqueeze(1),
-                right=True,
-            ).squeeze(1)
-            best_covered = torch.maximum(best_covered, right - start)
-        misses_parts.append((tile_elems - best_covered).detach().cpu())
-
-    misses = torch.cat(misses_parts)
-    bad_tiles = int(misses.numel())
-    sum_misses = int(misses.sum().item())
-    return {
-        "bad_tiles": bad_tiles,
-        "sum_bad_tile_misses": sum_misses,
-        "max_misses_per_bad_tile": int(misses.max().item()),
-        "mean_misses_per_bad_tile": float(sum_misses / bad_tiles),
-        "bad_tiles_misses_le_1": int((misses <= 1).sum().item()),
-        "bad_tiles_misses_le_2": int((misses <= 2).sum().item()),
-        "bad_tiles_misses_le_4": int((misses <= 4).sum().item()),
-        "bad_tiles_misses_le_8": int((misses <= 8).sum().item()),
-        "bad_tiles_misses_gt_8": int((misses > 8).sum().item()),
-    }
 
 
 class ByteV2AttentionBackend(AttentionBackend):
@@ -181,12 +110,23 @@ class ByteV2AttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "byte_v2",
     ) -> tuple[int, ...]:
+        if envs.VLLM_BYTE_V2_PAYLOAD_LAYOUT == "v3" and (
+            not envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE
+            or block_size != 16
+            or num_kv_heads != 8
+            or head_size != 128
+        ):
+            raise ValueError(
+                "Byte-v2 V3 payload layout requires compressed-only "
+                "block_size=16, num_kv_heads=8, and head_size=head_size_v=128"
+            )
         spec = ByteV2FullAttentionSpec(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             head_size_v=head_size,
             dtype=torch.uint8,
+            payload_layout=envs.VLLM_BYTE_V2_PAYLOAD_LAYOUT,
             raw_tail_bytes=(
                 0 if envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE else None
             ),
@@ -245,6 +185,11 @@ class ByteV2SparseFallbackPool:
     fallback_tile_ids: torch.Tensor | None = None
     fallback_tile_next_slot: torch.Tensor | None = None
     deferred_error: torch.Tensor | None = None
+    outlier_arena: torch.Tensor | None = None
+    outlier_block_flags: torch.Tensor | None = None
+    outlier_tile_bitmap: torch.Tensor | None = None
+    outlier_tile_meta: torch.Tensor | None = None
+    outlier_next_entry: torch.Tensor | None = None
 
 
 class ByteV2MetadataBuilder(AttentionMetadataBuilder[ByteV2Metadata]):
@@ -337,6 +282,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
         7: "sparse fallback pool exhausted",
         8: "invalid Byte-v2 valid row count",
         9: "no touched token found for cache block",
+        10: "outlier arena exhausted",
     }
 
     def __init__(
@@ -444,6 +390,15 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
         )
 
     def _make_layout(self, page_size_bytes: int) -> ByteV2PageLayout:
+        v3_layout = ByteV2PageLayoutV3(
+            block_size=16,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size_v,
+        )
+        if v3_layout.page_size_bytes == page_size_bytes:
+            return v3_layout
+
         raw_overlay_layout = ByteV2PageLayout(
             block_size=16,
             num_kv_heads=self.num_kv_heads,
@@ -466,7 +421,8 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
         raise ValueError(
             "Byte-v2 page size mismatch: expected "
             f"{raw_overlay_layout.page_size_bytes} or "
-            f"{compressed_layout.page_size_bytes}, got {page_size_bytes}"
+            f"{compressed_layout.page_size_bytes} or "
+            f"{v3_layout.page_size_bytes}, got {page_size_bytes}"
         )
 
     def _get_sparse_fallback_pool(
@@ -497,7 +453,47 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
         total_tiles = layout.num_kv_heads * (
             layout.k_dim_tiles + layout.v_dim_tiles
         )
+        tile_bitmap_words = (total_tiles + 31) // 32
+        outlier_entries = 0
+        if envs.VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA:
+            entries_per_block = envs.VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK
+            if entries_per_block < 0:
+                raise ValueError(
+                    "Byte-v2 outlier arena entries per block must be >= 0"
+                )
+            min_entries = envs.VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES
+            if min_entries < 0:
+                raise ValueError(
+                    "Byte-v2 outlier arena min entries must be >= 0"
+                )
+            if entries_per_block > 0:
+                outlier_entries = max(
+                    1,
+                    min_entries,
+                    math.ceil(num_blocks * entries_per_block),
+                )
         pool = self._sparse_fallback_pool
+        outlier_shape_matches = (
+            outlier_entries == 0
+            and pool is not None
+            and pool.outlier_arena is None
+            and pool.outlier_block_flags is None
+            and pool.outlier_tile_bitmap is None
+            and pool.outlier_tile_meta is None
+            and pool.outlier_next_entry is None
+        ) or (
+            outlier_entries > 0
+            and pool is not None
+            and pool.outlier_arena is not None
+            and pool.outlier_arena.shape == (outlier_entries,)
+            and pool.outlier_block_flags is not None
+            and pool.outlier_block_flags.shape == (num_blocks,)
+            and pool.outlier_tile_bitmap is not None
+            and pool.outlier_tile_bitmap.shape == (num_blocks, tile_bitmap_words)
+            and pool.outlier_tile_meta is not None
+            and pool.outlier_tile_meta.shape == (num_blocks, total_tiles)
+            and pool.outlier_next_entry is not None
+        )
         if (
             pool is not None
             and pool.kv_cache_ptr == kv_cache_ptr
@@ -506,6 +502,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             and pool.fallback_tile_ids is not None
             and pool.fallback_tile_ids.shape == (num_blocks, total_tiles)
             and pool.fallback_tile_next_slot is not None
+            and outlier_shape_matches
         ):
             pool.deferred_error = deferred_error
             return pool
@@ -538,6 +535,38 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             dtype=torch.int32,
             device=kv_cache.device,
         )
+        outlier_arena = None
+        outlier_block_flags = None
+        outlier_tile_bitmap = None
+        outlier_tile_meta = None
+        outlier_next_entry = None
+        if outlier_entries > 0:
+            outlier_arena = torch.empty(
+                outlier_entries,
+                dtype=torch.int32,
+                device=kv_cache.device,
+            )
+            outlier_block_flags = torch.zeros(
+                num_blocks,
+                dtype=torch.int32,
+                device=kv_cache.device,
+            )
+            outlier_tile_bitmap = torch.zeros(
+                (num_blocks, tile_bitmap_words),
+                dtype=torch.int32,
+                device=kv_cache.device,
+            )
+            outlier_tile_meta = torch.full(
+                (num_blocks, total_tiles),
+                -1,
+                dtype=torch.int32,
+                device=kv_cache.device,
+            )
+            outlier_next_entry = torch.zeros(
+                1,
+                dtype=torch.int32,
+                device=kv_cache.device,
+            )
         pool = ByteV2SparseFallbackPool(
             kv_cache_ptr=kv_cache_ptr,
             fallback_pool=fallback_pool,
@@ -546,6 +575,11 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             fallback_tile_ids=fallback_tile_ids,
             fallback_tile_next_slot=fallback_tile_next_slot,
             deferred_error=deferred_error,
+            outlier_arena=outlier_arena,
+            outlier_block_flags=outlier_block_flags,
+            outlier_tile_bitmap=outlier_tile_bitmap,
+            outlier_tile_meta=outlier_tile_meta,
+            outlier_next_entry=outlier_next_entry,
         )
         self._sparse_fallback_pool = pool
         return pool
@@ -640,6 +674,11 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
         fallback_tile_ids: torch.Tensor | None = None,
         fallback_tile_next_slot: torch.Tensor | None = None,
         deferred_error: torch.Tensor | None = None,
+        outlier_arena: torch.Tensor | None = None,
+        outlier_block_flags: torch.Tensor | None = None,
+        outlier_tile_bitmap: torch.Tensor | None = None,
+        outlier_tile_meta: torch.Tensor | None = None,
+        outlier_next_entry: torch.Tensor | None = None,
     ) -> None:
         if deferred_error is None:
             deferred_error = self._maybe_get_deferred_cache_update_error(
@@ -653,6 +692,11 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             fallback_tile_ids=fallback_tile_ids,
             fallback_tile_next_slot=fallback_tile_next_slot,
             deferred_error=deferred_error,
+            outlier_arena=outlier_arena,
+            outlier_block_flags=outlier_block_flags,
+            outlier_tile_bitmap=outlier_tile_bitmap,
+            outlier_tile_meta=outlier_tile_meta,
+            outlier_next_entry=outlier_next_entry,
         )
 
     def get_sparse_fallback_pool_stats(self) -> dict[str, int | bool]:
@@ -663,6 +707,15 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
                 "capacity": 0,
                 "next_slot": 0,
                 "assigned_blocks": 0,
+                "tile_capacity": 0,
+                "tile_next_slot": 0,
+                "assigned_tiles": 0,
+                "outlier_capacity": 0,
+                "assigned_outlier_blocks": 0,
+                "assigned_outlier_bitmap_tiles": 0,
+                "outlier_next_entry": 0,
+                "assigned_outlier_tiles": 0,
+                "outlier_exhausted": False,
                 "exhausted": False,
             }
 
@@ -680,6 +733,34 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             if pool.fallback_tile_ids is None
             else int((pool.fallback_tile_ids >= 0).sum().item())
         )
+        outlier_capacity = (
+            0 if pool.outlier_arena is None else int(pool.outlier_arena.numel())
+        )
+        outlier_next_entry = (
+            0
+            if pool.outlier_next_entry is None
+            else int(pool.outlier_next_entry.item())
+        )
+        assigned_outlier_blocks = (
+            0
+            if pool.outlier_block_flags is None
+            else int((pool.outlier_block_flags != 0).sum().item())
+        )
+        assigned_outlier_bitmap_tiles = (
+            0
+            if pool.outlier_tile_bitmap is None
+            else int(
+                sum(
+                    (int(word) & 0xFFFFFFFF).bit_count()
+                    for word in pool.outlier_tile_bitmap.cpu().view(-1).tolist()
+                )
+            )
+        )
+        assigned_outlier_tiles = (
+            0
+            if pool.outlier_tile_meta is None
+            else int((pool.outlier_tile_meta >= 0).sum().item())
+        )
         return {
             "enabled": True,
             "capacity": capacity,
@@ -688,6 +769,12 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             "tile_capacity": tile_capacity,
             "tile_next_slot": tile_next_slot,
             "assigned_tiles": assigned_tiles,
+            "outlier_capacity": outlier_capacity,
+            "assigned_outlier_blocks": assigned_outlier_blocks,
+            "assigned_outlier_bitmap_tiles": assigned_outlier_bitmap_tiles,
+            "outlier_next_entry": outlier_next_entry,
+            "assigned_outlier_tiles": assigned_outlier_tiles,
+            "outlier_exhausted": outlier_next_entry > outlier_capacity,
             "exhausted": next_slot > capacity,
         }
 
@@ -739,6 +826,9 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             "full_active_blocks": full_active_blocks,
             "full_raw_fallback_blocks": full_raw_blocks,
             "partial_raw_fallback_blocks": partial_raw_blocks,
+            "full_raw_block_bad_tiles": 0,
+            "full_tile_fallback_tiles": 0,
+            "full_tile_pool_bad_tiles": 0,
             "tiles_per_block": tiles_per_block,
             "full_total_tiles": full_total_tiles,
             "raw_full_total_tiles": raw_full_total_tiles,
@@ -747,6 +837,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             "full_tile_fallback_ratio": 0.0,
             "bad_tile_ratio_within_raw_fallback_blocks": 0.0,
             "invalid_raw_fallback_slots": 0,
+            "invalid_tile_fallback_slots": 0,
             "sum_bad_tile_misses": 0,
             "max_misses_per_bad_tile": 0,
             "mean_misses_per_bad_tile": 0.0,
@@ -755,81 +846,157 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             "bad_tiles_misses_le_4": 0,
             "bad_tiles_misses_le_8": 0,
             "bad_tiles_misses_gt_8": 0,
+            "outlier_storage_estimates": (
+                estimate_byte_v2_outlier_storage_from_misses(
+                    torch.empty(0, dtype=torch.int64),
+                    total_tiles=full_total_tiles,
+                    num_blocks=full_active_blocks,
+                    raw_block_bytes=layout.raw_block_bytes,
+                )
+            ),
         }
-        if full_raw_blocks == 0:
-            return empty_summary
 
-        raw_block_ids = torch.nonzero(full_raw_mask, as_tuple=False).flatten()
+        miss_count_parts: list[torch.Tensor] = []
+        raw_bad_tiles = 0
         pool = self._sparse_fallback_pool
         invalid_slots = 0
-        if pool is not None:
-            fallback_slots = pool.fallback_block_ids[raw_block_ids].to(torch.int64)
-            valid_slot_mask = (
-                (fallback_slots >= 0)
-                & (fallback_slots < pool.fallback_pool.shape[0])
+        if full_raw_blocks > 0:
+            raw_block_ids = torch.nonzero(full_raw_mask, as_tuple=False).flatten()
+            if pool is not None:
+                fallback_slots = pool.fallback_block_ids[raw_block_ids].to(
+                    torch.int64
+                )
+                valid_slot_mask = (
+                    (fallback_slots >= 0)
+                    & (fallback_slots < pool.fallback_pool.shape[0])
+                )
+                invalid_slots = int((~valid_slot_mask).sum().item())
+                fallback_slots = fallback_slots[valid_slot_mask]
+                raw_bytes = (
+                    pool.fallback_pool[fallback_slots]
+                    if fallback_slots.numel()
+                    else None
+                )
+            elif layout.raw_tail_bytes != 0:
+                raw_bytes = kv_cache[
+                    raw_block_ids,
+                    layout.page_header_bytes : layout.page_header_bytes
+                    + layout.raw_block_bytes,
+                ]
+            else:
+                invalid_slots = full_raw_blocks
+                raw_bytes = None
+
+            if raw_bytes is not None:
+                raw_bits = raw_bytes.contiguous().view(torch.int16).to(torch.int32)
+                raw_bits = raw_bits & 0xFFFF
+                key_elems = layout.raw_key_bytes // 2
+                value_elems = layout.raw_value_bytes // 2
+                num_raw_blocks = int(raw_bits.shape[0])
+                key_bits = raw_bits[:, :key_elems].reshape(
+                    num_raw_blocks,
+                    BYTE_V2_TILE_SIZE,
+                    layout.num_kv_heads,
+                    layout.head_size,
+                )
+                value_bits = raw_bits[
+                    :, key_elems : key_elems + value_elems
+                ].reshape(
+                    num_raw_blocks,
+                    BYTE_V2_TILE_SIZE,
+                    layout.num_kv_heads,
+                    layout.head_size_v,
+                )
+
+                key_exp_tiles = ((key_bits >> 7) & 0xFF).reshape(
+                    num_raw_blocks,
+                    BYTE_V2_TILE_SIZE,
+                    layout.num_kv_heads,
+                    layout.k_dim_tiles,
+                    BYTE_V2_TILE_SIZE,
+                )
+                key_exp_tiles = key_exp_tiles.permute(0, 2, 3, 1, 4).reshape(
+                    -1, BYTE_V2_TILE_SIZE * BYTE_V2_TILE_SIZE
+                )
+                value_exp_tiles = ((value_bits >> 7) & 0xFF).reshape(
+                    num_raw_blocks,
+                    BYTE_V2_TILE_SIZE,
+                    layout.num_kv_heads,
+                    layout.v_dim_tiles,
+                    BYTE_V2_TILE_SIZE,
+                )
+                value_exp_tiles = value_exp_tiles.permute(0, 2, 3, 1, 4).reshape(
+                    -1, BYTE_V2_TILE_SIZE * BYTE_V2_TILE_SIZE
+                )
+                exp_tiles = torch.cat((key_exp_tiles, value_exp_tiles), dim=0)
+                raw_miss_counts = byte_v2_tile_exponent_miss_counts(exp_tiles)
+                miss_count_parts.append(raw_miss_counts)
+                raw_bad_tiles = int(
+                    summarize_byte_v2_tile_miss_counts(raw_miss_counts)[
+                        "bad_tiles"
+                    ]
+                )
+
+        tile_fallback_tiles = 0
+        tile_bad_tiles = 0
+        invalid_tile_slots = 0
+        if (
+            pool is not None
+            and pool.fallback_tile_ids is not None
+            and pool.fallback_pool.numel() > 0
+        ):
+            active_block_ids = torch.nonzero(
+                full_active_mask, as_tuple=False
+            ).flatten()
+            tile_slots = pool.fallback_tile_ids[active_block_ids].to(
+                torch.int64
             )
-            invalid_slots = int((~valid_slot_mask).sum().item())
-            fallback_slots = fallback_slots[valid_slot_mask]
-            if fallback_slots.numel() == 0:
-                empty_summary["invalid_raw_fallback_slots"] = invalid_slots
-                return empty_summary
-            raw_bytes = pool.fallback_pool[fallback_slots]
-        elif layout.raw_tail_bytes != 0:
-            raw_bytes = kv_cache[
-                raw_block_ids,
-                layout.page_header_bytes : layout.page_header_bytes
-                + layout.raw_block_bytes,
+            tile_slots = tile_slots.reshape(-1)
+            tile_capacity = pool.fallback_pool.numel() // (
+                BYTE_V2_TILE_SIZE * BYTE_V2_TILE_SIZE * 2
+            )
+            invalid_tile_mask = (tile_slots != -1) & (
+                (tile_slots < 0) | (tile_slots >= tile_capacity)
+            )
+            invalid_tile_slots = int(invalid_tile_mask.sum().item())
+            valid_tile_slots = tile_slots[
+                (tile_slots >= 0) & (tile_slots < tile_capacity)
             ]
-        else:
-            empty_summary["invalid_raw_fallback_slots"] = full_raw_blocks
+            tile_fallback_tiles = int(valid_tile_slots.numel())
+            if tile_fallback_tiles:
+                tile_raw_bytes = pool.fallback_pool.view(
+                    -1, BYTE_V2_TILE_SIZE * BYTE_V2_TILE_SIZE * 2
+                )[valid_tile_slots]
+                tile_bits = (
+                    tile_raw_bytes.contiguous().view(torch.int16).to(torch.int32)
+                    & 0xFFFF
+                )
+                tile_exp_tiles = (tile_bits >> 7) & 0xFF
+                tile_miss_counts = byte_v2_tile_exponent_miss_counts(
+                    tile_exp_tiles
+                )
+                miss_count_parts.append(tile_miss_counts)
+                tile_bad_tiles = int(
+                    summarize_byte_v2_tile_miss_counts(tile_miss_counts)[
+                        "bad_tiles"
+                    ]
+                )
+
+        if not miss_count_parts:
+            empty_summary["invalid_raw_fallback_slots"] = invalid_slots
+            empty_summary["invalid_tile_fallback_slots"] = invalid_tile_slots
             return empty_summary
 
-        raw_bits = raw_bytes.contiguous().view(torch.int16).to(torch.int32)
-        raw_bits = raw_bits & 0xFFFF
-        key_elems = layout.raw_key_bytes // 2
-        value_elems = layout.raw_value_bytes // 2
-        num_raw_blocks = int(raw_bits.shape[0])
-        key_bits = raw_bits[:, :key_elems].reshape(
-            num_raw_blocks,
-            BYTE_V2_TILE_SIZE,
-            layout.num_kv_heads,
-            layout.head_size,
-        )
-        value_bits = raw_bits[:, key_elems : key_elems + value_elems].reshape(
-            num_raw_blocks,
-            BYTE_V2_TILE_SIZE,
-            layout.num_kv_heads,
-            layout.head_size_v,
-        )
-
-        key_exp_tiles = ((key_bits >> 7) & 0xFF).reshape(
-            num_raw_blocks,
-            BYTE_V2_TILE_SIZE,
-            layout.num_kv_heads,
-            layout.k_dim_tiles,
-            BYTE_V2_TILE_SIZE,
-        )
-        key_exp_tiles = key_exp_tiles.permute(0, 2, 3, 1, 4).reshape(
-            -1, BYTE_V2_TILE_SIZE * BYTE_V2_TILE_SIZE
-        )
-        value_exp_tiles = ((value_bits >> 7) & 0xFF).reshape(
-            num_raw_blocks,
-            BYTE_V2_TILE_SIZE,
-            layout.num_kv_heads,
-            layout.v_dim_tiles,
-            BYTE_V2_TILE_SIZE,
-        )
-        value_exp_tiles = value_exp_tiles.permute(0, 2, 3, 1, 4).reshape(
-            -1, BYTE_V2_TILE_SIZE * BYTE_V2_TILE_SIZE
-        )
-        exp_tiles = torch.cat((key_exp_tiles, value_exp_tiles), dim=0)
-
-        miss_summary = _byte_v2_bad_tile_miss_summary(exp_tiles)
+        miss_counts = torch.cat(miss_count_parts)
+        miss_summary = summarize_byte_v2_tile_miss_counts(miss_counts)
         full_bad_tiles = int(miss_summary["bad_tiles"])
         empty_summary.update(miss_summary)
         empty_summary["full_bad_tiles"] = full_bad_tiles
+        empty_summary["full_raw_block_bad_tiles"] = raw_bad_tiles
+        empty_summary["full_tile_fallback_tiles"] = tile_fallback_tiles
+        empty_summary["full_tile_pool_bad_tiles"] = tile_bad_tiles
         empty_summary["full_good_tiles_inside_raw_fallback_blocks"] = (
-            raw_full_total_tiles - full_bad_tiles
+            raw_full_total_tiles - raw_bad_tiles
         )
         empty_summary["full_tile_fallback_ratio"] = (
             float(full_bad_tiles / full_total_tiles)
@@ -837,20 +1004,49 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
             else 0.0
         )
         empty_summary["bad_tile_ratio_within_raw_fallback_blocks"] = (
-            float(full_bad_tiles / raw_full_total_tiles)
+            float(raw_bad_tiles / raw_full_total_tiles)
             if raw_full_total_tiles > 0
             else 0.0
         )
         empty_summary["invalid_raw_fallback_slots"] = invalid_slots
+        empty_summary["invalid_tile_fallback_slots"] = invalid_tile_slots
+        empty_summary["outlier_storage_estimates"] = (
+            estimate_byte_v2_outlier_storage_from_misses(
+                miss_counts,
+                total_tiles=full_total_tiles,
+                num_blocks=full_active_blocks,
+                raw_block_bytes=layout.raw_block_bytes,
+            )
+        )
         return empty_summary
 
-    def do_kv_cache_update(
+    @staticmethod
+    def _is_pure_decode_cache_update(
+        attn_metadata: object,
+        slot_mapping: torch.Tensor,
+    ) -> bool:
+        if not isinstance(attn_metadata, ByteV2Metadata):
+            return False
+
+        num_slots = int(slot_mapping.numel())
+        return (
+            num_slots > 1
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_prefill_tokens == 0
+            and attn_metadata.max_query_len == 1
+            and attn_metadata.num_decodes == attn_metadata.num_decode_tokens
+            and attn_metadata.num_decode_tokens == num_slots
+            and attn_metadata.num_actual_tokens == num_slots
+        )
+
+    def _do_kv_cache_update(
         self,
         layer: torch.nn.Module,
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
+        decode_append_fast_path_safe: bool,
     ) -> None:
         layout = self._make_layout(kv_cache.shape[1])
         fallback_pool = self._get_sparse_fallback_pool(kv_cache, layout)
@@ -874,15 +1070,78 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
                 None if fallback_pool is None else fallback_pool.fallback_next_slot
             ),
             fallback_tile_ids=(
-                None if fallback_pool is None else fallback_pool.fallback_tile_ids
+                None
+                if fallback_pool is None
+                or envs.VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK
+                else fallback_pool.fallback_tile_ids
             ),
             fallback_tile_next_slot=(
                 None
                 if fallback_pool is None
+                or envs.VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK
                 else fallback_pool.fallback_tile_next_slot
             ),
             deferred_error=(
                 None if fallback_pool is None else fallback_pool.deferred_error
+            ),
+            outlier_arena=(
+                None if fallback_pool is None else fallback_pool.outlier_arena
+            ),
+            outlier_block_flags=(
+                None
+                if fallback_pool is None
+                or not envs.VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS
+                else fallback_pool.outlier_block_flags
+            ),
+            outlier_tile_bitmap=(
+                None
+                if fallback_pool is None
+                or not envs.VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP
+                else fallback_pool.outlier_tile_bitmap
+            ),
+            outlier_tile_meta=(
+                None if fallback_pool is None else fallback_pool.outlier_tile_meta
+            ),
+            outlier_next_entry=(
+                None if fallback_pool is None else fallback_pool.outlier_next_entry
+            ),
+            decode_append_fast_path_safe=decode_append_fast_path_safe,
+        )
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        self._do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            decode_append_fast_path_safe=False,
+        )
+
+    def do_kv_cache_update_with_metadata(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: object,
+    ) -> None:
+        self._do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            decode_append_fast_path_safe=self._is_pure_decode_cache_update(
+                attn_metadata, slot_mapping
             ),
         )
 
@@ -1067,9 +1326,30 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
                 None if fallback_pool is None else fallback_pool.fallback_block_ids
             ),
             fallback_tile_ids=(
-                None if fallback_pool is None else fallback_pool.fallback_tile_ids
+                None
+                if fallback_pool is None
+                or envs.VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK
+                else fallback_pool.fallback_tile_ids
             ),
             partial_workspace=partial_workspace,
+            outlier_arena=(
+                None if fallback_pool is None else fallback_pool.outlier_arena
+            ),
+            outlier_block_flags=(
+                None
+                if fallback_pool is None
+                or not envs.VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS
+                else fallback_pool.outlier_block_flags
+            ),
+            outlier_tile_bitmap=(
+                None
+                if fallback_pool is None
+                or not envs.VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP
+                else fallback_pool.outlier_tile_bitmap
+            ),
+            outlier_tile_meta=(
+                None if fallback_pool is None else fallback_pool.outlier_tile_meta
+            ),
         )
 
     def forward(
@@ -1126,9 +1406,30 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
                     None if fallback_pool is None else fallback_pool.fallback_block_ids
                 ),
                 fallback_tile_ids=(
-                    None if fallback_pool is None else fallback_pool.fallback_tile_ids
+                    None
+                    if fallback_pool is None
+                    or envs.VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK
+                    else fallback_pool.fallback_tile_ids
                 ),
                 partial_workspace=partial_workspace,
+                outlier_arena=(
+                    None if fallback_pool is None else fallback_pool.outlier_arena
+                ),
+                outlier_block_flags=(
+                    None
+                    if fallback_pool is None
+                    or not envs.VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS
+                    else fallback_pool.outlier_block_flags
+                ),
+                outlier_tile_bitmap=(
+                    None
+                    if fallback_pool is None
+                    or not envs.VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP
+                    else fallback_pool.outlier_tile_bitmap
+                ),
+                outlier_tile_meta=(
+                    None if fallback_pool is None else fallback_pool.outlier_tile_meta
+                ),
             )
             if output.ndim == 3:
                 output[:num_decode_tokens].copy_(decoded)
@@ -1208,6 +1509,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2Metadata]):
                     fallback_tile_ids=(
                         None
                         if fallback_pool is None
+                        or envs.VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK
                         else fallback_pool.fallback_tile_ids
                     ),
                 )

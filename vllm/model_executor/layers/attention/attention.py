@@ -577,12 +577,25 @@ class Attention(nn.Module, AttentionLayerBase):
                     "Byte-v2 KV cache does not support sliding window "
                     "attention yet."
                 )
+            if envs.VLLM_BYTE_V2_PAYLOAD_LAYOUT == "v3" and (
+                not envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE
+                or block_size != 16
+                or self.num_kv_heads != 8
+                or self.head_size != 128
+                or self.head_size_v != 128
+            ):
+                raise ValueError(
+                    "Byte-v2 V3 payload layout requires compressed-only "
+                    "block_size=16, num_kv_heads=8, "
+                    "and head_size=head_size_v=128"
+                )
             return ByteV2FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                payload_layout=envs.VLLM_BYTE_V2_PAYLOAD_LAYOUT,
                 raw_tail_bytes=(
                     0 if envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE else None
                 ),
@@ -599,6 +612,24 @@ class Attention(nn.Module, AttentionLayerBase):
                     if (
                         envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE
                         and envs.VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL
+                    )
+                    else 0
+                ),
+                outlier_arena_entries_per_block=(
+                    envs.VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK
+                    if (
+                        envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE
+                        and envs.VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL
+                        and envs.VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA
+                    )
+                    else 0.0
+                ),
+                outlier_arena_min_entries=(
+                    envs.VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES
+                    if (
+                        envs.VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE
+                        and envs.VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL
+                        and envs.VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA
                     )
                     else 0
                 ),
@@ -732,18 +763,33 @@ def unified_kv_cache_update(
     the data dependency between them to ensure torch.compile preserves ordering.
     """
     layer_name = _resolve_layer_name(layer_name)
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
-        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-            attn_layer,
-            key,
-            value,
-            kv_cache,
-            layer_slot_mapping,
+        update_with_metadata = getattr(
+            attn_layer.impl, "do_kv_cache_update_with_metadata", None
         )
+        if update_with_metadata is not None:
+            update_with_metadata(
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+                attn_metadata,
+            )
+        else:
+            attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+            )
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 

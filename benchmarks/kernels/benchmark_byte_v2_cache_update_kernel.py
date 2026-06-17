@@ -140,6 +140,7 @@ def _run_update(
     fallback_pool: torch.Tensor,
     fallback_block_ids: torch.Tensor,
     fallback_next_slot: torch.Tensor,
+    deferred_error: torch.Tensor | None = None,
 ) -> torch.Tensor:
     import vllm._custom_ops as ops
 
@@ -156,6 +157,7 @@ def _run_update(
         fallback_pool,
         fallback_block_ids,
         fallback_next_slot,
+        deferred_error=deferred_error,
     )
 
 
@@ -197,6 +199,11 @@ def _measure_prefill_case(
                 device=device,
             )
         )
+        deferred_error = (
+            torch.zeros(4, dtype=torch.int32, device=device)
+            if args.deferred_error
+            else None
+        )
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize(device)
@@ -215,6 +222,7 @@ def _measure_prefill_case(
             fallback_pool=fallback_pool,
             fallback_block_ids=fallback_block_ids,
             fallback_next_slot=fallback_next_slot,
+            deferred_error=deferred_error,
         )
         end_event.record()
         torch.cuda.synchronize(device)
@@ -245,8 +253,11 @@ def _measure_decode_append_case(
     layout: Any,
     device: torch.device,
 ) -> dict[str, Any]:
+    if args.decode_batch_size <= 0:
+        raise ValueError("decode_batch_size must be positive")
+    num_decode_tokens = decode_steps * args.decode_batch_size
     key, value = _make_compressible_kv(
-        decode_steps,
+        num_decode_tokens,
         args.num_kv_heads,
         args.head_size,
         args.head_size_v,
@@ -255,7 +266,12 @@ def _measure_decode_append_case(
         outlier_block_ratio=args.outlier_block_ratio,
         outlier_exp_scale=args.outlier_exp_scale,
     )
-    slot_mapping = torch.arange(decode_steps, dtype=torch.int64, device=device)
+    slot_mapping = torch.empty(
+        decode_steps, args.decode_batch_size, dtype=torch.int64, device=device
+    )
+    for step in range(decode_steps):
+        for batch_idx in range(args.decode_batch_size):
+            slot_mapping[step, batch_idx] = batch_idx * decode_steps + step
     fallback_pool_blocks = min(
         args.num_blocks,
         max(1, args.fallback_pool_min_blocks,
@@ -276,6 +292,11 @@ def _measure_decode_append_case(
                 device=device,
             )
         )
+        deferred_error = (
+            torch.zeros(4, dtype=torch.int32, device=device)
+            if args.deferred_error
+            else None
+        )
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         torch.cuda.synchronize(device)
@@ -283,11 +304,13 @@ def _measure_decode_append_case(
         start_event.record()
         last_packed = None
         for step in range(decode_steps):
+            token_start = step * args.decode_batch_size
+            token_end = token_start + args.decode_batch_size
             last_packed = _run_update(
-                key=key[step:step + 1],
-                value=value[step:step + 1],
+                key=key[token_start:token_end],
+                value=value[token_start:token_end],
                 kv_cache=kv_cache,
-                slot_mapping=slot_mapping[step:step + 1],
+                slot_mapping=slot_mapping[step],
                 block_size=args.block_size,
                 num_kv_heads=args.num_kv_heads,
                 head_size=args.head_size,
@@ -296,6 +319,7 @@ def _measure_decode_append_case(
                 fallback_pool=fallback_pool,
                 fallback_block_ids=fallback_block_ids,
                 fallback_next_slot=fallback_next_slot,
+                deferred_error=deferred_error,
             )
         end_event.record()
         torch.cuda.synchronize(device)
@@ -312,6 +336,7 @@ def _measure_decode_append_case(
     return {
         "mode": "decode_append",
         "decode_steps": decode_steps,
+        "decode_batch_size": args.decode_batch_size,
         "num_blocks": args.num_blocks,
         "fallback_pool_blocks": fallback_pool_blocks,
         "last_call_packed_blocks": packed_blocks,
@@ -330,6 +355,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", default="prefill,decode_append")
     parser.add_argument("--prompt-len", default="2048")
     parser.add_argument("--decode-steps", default="32")
+    parser.add_argument("--decode-batch-size", type=int, default=1)
     parser.add_argument("--num-blocks", type=int, default=8192)
     parser.add_argument("--num-kv-heads", type=int, default=8)
     parser.add_argument("--head-size", type=int, default=128)
@@ -355,6 +381,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-runs", type=int, default=20)
     parser.add_argument("--warmup-runs", type=int, default=5)
+    parser.add_argument(
+        "--deferred-error",
+        action="store_true",
+        help=(
+            "Pass a device-side sticky error tensor to isolate the production "
+            "deferred-safe decode append path."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-json", type=Path, default=None)

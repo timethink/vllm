@@ -13,6 +13,10 @@ from vllm.v1.attention.backends.byte_v2_attn import (
     ByteV2AttentionImpl,
 )
 from vllm.v1.attention.backends.byte_v2_layout import (
+    BYTE_V2_PAGE_STATUS_COMPRESSED,
+    BYTE_V2_PAGE_STATUS_OFFSET,
+    BYTE_V2_PAGE_STATUS_RAW_FALLBACK,
+    BYTE_V2_PAGE_VALID_ROWS_OFFSET,
     ByteV2PageLayout,
     unpack_byte_v2_kv_block_from_page,
 )
@@ -25,6 +29,12 @@ def _assert_bf16_bits_equal(actual: torch.Tensor, expected: torch.Tensor) -> Non
         actual.contiguous().view(torch.int16),
         expected.contiguous().view(torch.int16),
     )
+
+
+def _bf16_from_u16(bits: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+    signed = bits.to(torch.int32)
+    signed = torch.where(signed >= 0x8000, signed - 0x10000, signed)
+    return signed.to(torch.int16).contiguous().view(torch.bfloat16).reshape(shape)
 
 
 def test_byte_v2_backend_registry_resolves():
@@ -182,6 +192,115 @@ def test_byte_v2_attention_impl_sparse_fallback_pool_min_blocks(monkeypatch):
     assert pool.fallback_pool.shape == (512, layout.raw_block_bytes)
 
 
+def test_byte_v2_attention_impl_outlier_arena_pool(monkeypatch):
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO", "0.25")
+    monkeypatch.setenv("VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS", "0")
+    monkeypatch.setenv("VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA", "1")
+    monkeypatch.setenv("VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK", "2.5")
+    monkeypatch.setenv("VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES", "16")
+
+    impl = ByteV2AttentionImpl(
+        num_heads=2,
+        head_size=16,
+        scale=1.0,
+        num_kv_heads=1,
+        kv_cache_dtype="byte_v2",
+    )
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        head_size_v=16,
+        raw_tail_bytes=0,
+    )
+    kv_cache = torch.empty(8, layout.page_size_bytes, dtype=torch.uint8)
+
+    try:
+        pool = impl._get_sparse_fallback_pool(kv_cache, layout)
+        stats = impl.get_sparse_fallback_pool_stats()
+    finally:
+        envs.disable_envs_cache()
+
+    assert pool is not None
+    assert pool.fallback_pool.shape == (2, layout.raw_block_bytes)
+    assert pool.outlier_arena is not None
+    assert pool.outlier_arena.shape == (20,)
+    assert pool.outlier_block_flags is not None
+    assert pool.outlier_block_flags.shape == (8,)
+    assert int(pool.outlier_block_flags.max().item()) == 0
+    assert pool.outlier_tile_bitmap is not None
+    assert pool.outlier_tile_bitmap.shape == (8, 1)
+    assert int(pool.outlier_tile_bitmap.max().item()) == 0
+    assert pool.outlier_tile_meta is not None
+    assert pool.outlier_tile_meta.shape == (8, layout.total_tiles)
+    assert int(pool.outlier_tile_meta.max().item()) == -1
+    assert pool.outlier_next_entry is not None
+    assert int(pool.outlier_next_entry.item()) == 0
+    assert stats["outlier_capacity"] == 20
+    assert stats["assigned_outlier_blocks"] == 0
+    assert stats["assigned_outlier_bitmap_tiles"] == 0
+    assert stats["outlier_next_entry"] == 0
+    assert stats["assigned_outlier_tiles"] == 0
+    assert stats["outlier_exhausted"] is False
+
+
+def test_byte_v2_tile_fallback_stats_read_tile_pool():
+    impl = ByteV2AttentionImpl(
+        num_heads=1,
+        head_size=16,
+        scale=1.0,
+        num_kv_heads=1,
+        kv_cache_dtype="byte_v2",
+    )
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        head_size_v=16,
+        raw_tail_bytes=0,
+    )
+    kv_cache = torch.zeros(1, layout.page_size_bytes, dtype=torch.uint8)
+    kv_cache[0, BYTE_V2_PAGE_STATUS_OFFSET] = BYTE_V2_PAGE_STATUS_COMPRESSED
+    kv_cache[0, BYTE_V2_PAGE_VALID_ROWS_OFFSET] = layout.block_size
+
+    fallback_pool = torch.zeros(1, layout.raw_block_bytes, dtype=torch.uint8)
+    fallback_block_ids = torch.full((1,), -1, dtype=torch.int32)
+    fallback_next_slot = torch.zeros(1, dtype=torch.int32)
+    fallback_tile_ids = torch.full((1, layout.total_tiles), -1, dtype=torch.int32)
+    fallback_tile_next_slot = torch.ones(1, dtype=torch.int32)
+
+    exp = torch.full((16, 16), 60, dtype=torch.int32)
+    bits = exp << 7
+    bits[0, 0] = 90 << 7
+    raw_tile = _bf16_from_u16(bits, (16, 16))
+    tile_slot = 1
+    raw_tile_bytes = raw_tile.contiguous().view(torch.uint8).reshape(-1)
+    fallback_pool.view(-1, 512)[tile_slot] = raw_tile_bytes
+    fallback_tile_ids[0, 0] = tile_slot
+
+    impl.register_sparse_fallback_pool(
+        kv_cache,
+        fallback_pool,
+        fallback_block_ids,
+        fallback_next_slot,
+        fallback_tile_ids,
+        fallback_tile_next_slot,
+    )
+
+    stats = impl.get_tile_fallback_stats(kv_cache)
+    estimates = stats["outlier_storage_estimates"]
+    scenario = estimates["scenarios"]["max_outliers_1"]
+
+    assert stats["full_tile_fallback_tiles"] == 1
+    assert stats["full_tile_pool_bad_tiles"] == 1
+    assert stats["full_bad_tiles"] == 1
+    assert stats["sum_bad_tile_misses"] == 1
+    assert scenario["fit_bad_tiles"] == 1
+    assert scenario["additional_bytes"] == 4
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 def test_byte_v2_decode_partial_workspace_reuses_buffer(monkeypatch):
     envs.disable_envs_cache()
@@ -280,3 +399,111 @@ def test_byte_v2_deferred_cache_update_records_sticky_error(monkeypatch):
     finally:
         ByteV2AttentionImpl._deferred_cache_update_errors.clear()
         envs.disable_envs_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_deferred_batched_decode_append_fast_path_cuda():
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        head_size_v=16,
+        raw_tail_bytes=0,
+    )
+    key = torch.randn(2, 1, 16, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn(2, 1, 16, dtype=torch.bfloat16, device="cuda")
+    kv_cache = torch.zeros(2, layout.page_size_bytes, dtype=torch.uint8,
+                           device="cuda")
+    fallback_pool = torch.empty(2, layout.raw_block_bytes, dtype=torch.uint8,
+                                device="cuda")
+    fallback_block_ids = torch.full((2,), -1, dtype=torch.int32,
+                                    device="cuda")
+    fallback_next_slot = torch.zeros(1, dtype=torch.int32, device="cuda")
+    total_tiles = layout.num_kv_heads * (layout.k_dim_tiles +
+                                         layout.v_dim_tiles)
+    fallback_tile_ids = torch.full((2, total_tiles), -1, dtype=torch.int32,
+                                   device="cuda")
+    fallback_tile_next_slot = torch.zeros(1, dtype=torch.int32,
+                                          device="cuda")
+    deferred_error = torch.zeros(4, dtype=torch.int32, device="cuda")
+
+    result = ops.byte_v2_reshape_and_cache(
+        key,
+        value,
+        kv_cache,
+        torch.tensor([0, 16], dtype=torch.int64, device="cuda"),
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        head_size_v=16,
+        page_size_bytes=layout.page_size_bytes,
+        fallback_pool=fallback_pool,
+        fallback_block_ids=fallback_block_ids,
+        fallback_next_slot=fallback_next_slot,
+        fallback_tile_ids=fallback_tile_ids,
+        fallback_tile_next_slot=fallback_tile_next_slot,
+        deferred_error=deferred_error,
+        decode_append_fast_path_safe=True,
+    )
+    torch.cuda.synchronize()
+
+    assert result.numel() == 0
+    assert deferred_error.cpu().tolist() == [0, 0, 0, 0]
+    assert kv_cache[:, BYTE_V2_PAGE_STATUS_OFFSET].cpu().tolist() == [
+        BYTE_V2_PAGE_STATUS_RAW_FALLBACK,
+        BYTE_V2_PAGE_STATUS_RAW_FALLBACK,
+    ]
+    assert kv_cache[:, BYTE_V2_PAGE_VALID_ROWS_OFFSET].cpu().tolist() == [1, 1]
+    assert sorted(fallback_block_ids.cpu().tolist()) == [0, 1]
+    assert int(fallback_next_slot.item()) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_byte_v2_deferred_batched_duplicate_block_records_error_cuda():
+    layout = ByteV2PageLayout(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        head_size_v=16,
+        raw_tail_bytes=0,
+    )
+    key = torch.zeros(2, 1, 16, dtype=torch.bfloat16, device="cuda")
+    value = torch.zeros(2, 1, 16, dtype=torch.bfloat16, device="cuda")
+    kv_cache = torch.zeros(1, layout.page_size_bytes, dtype=torch.uint8,
+                           device="cuda")
+    fallback_pool = torch.empty(1, layout.raw_block_bytes, dtype=torch.uint8,
+                                device="cuda")
+    fallback_block_ids = torch.full((1,), -1, dtype=torch.int32,
+                                    device="cuda")
+    fallback_next_slot = torch.zeros(1, dtype=torch.int32, device="cuda")
+    total_tiles = layout.num_kv_heads * (layout.k_dim_tiles +
+                                         layout.v_dim_tiles)
+    fallback_tile_ids = torch.full((1, total_tiles), -1, dtype=torch.int32,
+                                   device="cuda")
+    fallback_tile_next_slot = torch.zeros(1, dtype=torch.int32,
+                                          device="cuda")
+    deferred_error = torch.zeros(4, dtype=torch.int32, device="cuda")
+
+    result = ops.byte_v2_reshape_and_cache(
+        key,
+        value,
+        kv_cache,
+        torch.tensor([0, 1], dtype=torch.int64, device="cuda"),
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        head_size_v=16,
+        page_size_bytes=layout.page_size_bytes,
+        fallback_pool=fallback_pool,
+        fallback_block_ids=fallback_block_ids,
+        fallback_next_slot=fallback_next_slot,
+        fallback_tile_ids=fallback_tile_ids,
+        fallback_tile_next_slot=fallback_tile_next_slot,
+        deferred_error=deferred_error,
+        decode_append_fast_path_safe=True,
+    )
+    torch.cuda.synchronize()
+
+    assert result.numel() == 0
+    assert deferred_error.cpu().tolist() == [3, 0, 0, 1]
+    assert int(fallback_next_slot.item()) == 0

@@ -6,19 +6,34 @@ import torch
 
 from vllm.v1.attention.backends.byte_v2_codec import (
     BYTE_V2_FAST_TILE_PAYLOAD_BYTES,
+    BYTE_V2_PACKED_TILE_ELEMS,
     BYTE_V2_TILE_ELEMS,
+    BYTE_V2_TILE_SIZE,
+    compress_byte_v2_tensor,
 )
 from vllm.v1.attention.backends.byte_v2_layout import (
+    BYTE_V2_PAGE_FLAG_COMPRESSED_ONLY,
+    BYTE_V2_PAGE_FLAG_HAS_TILE_FALLBACK_METADATA,
+    BYTE_V2_PAGE_HEADER_BYTES_V3,
+    BYTE_V2_PAGE_LAYOUT_FLAGS_OFFSET,
+    BYTE_V2_PAGE_LAYOUT_VERSION_OFFSET,
     BYTE_V2_PAGE_STATUS_COMPRESSED,
     BYTE_V2_PAGE_STATUS_OFFSET,
     BYTE_V2_PAGE_STATUS_RAW_FALLBACK,
     BYTE_V2_PAGE_VALID_ROWS_OFFSET,
+    BYTE_V2_PAYLOAD_LAYOUT_VERSION_V3,
+    BYTE_V2_TILE_PAYLOAD_BYTES_V3,
+    BYTE_V2_TILE_PAYLOAD_STRIPE_BYTES_V3,
+    BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3,
     ByteV2PageLayout,
+    ByteV2PageLayoutV3,
     byte_v2_reshape_and_cache_ref,
     count_byte_v2_page_statuses,
     pack_byte_v2_kv_block_to_page,
+    pack_byte_v2_kv_block_to_page_v3,
     pack_byte_v2_raw_kv_block_to_page,
     unpack_byte_v2_kv_block_from_page,
+    unpack_byte_v2_kv_block_from_page_v3,
     unpack_byte_v2_raw_kv_block_from_page,
 )
 from vllm.v1.kv_cache_interface import ByteV2FullAttentionSpec
@@ -35,6 +50,26 @@ def _bf16_from_u16(bits: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
     signed = bits.to(torch.int32)
     signed = torch.where(signed >= 0x8000, signed - 0x10000, signed)
     return signed.to(torch.int16).contiguous().view(torch.bfloat16).reshape(shape)
+
+
+def _assert_v3_tile_payload_matches(
+    page: torch.Tensor,
+    tile_offset: int,
+    low: torch.Tensor,
+    packed: torch.Tensor,
+) -> None:
+    for pair_idx in range(BYTE_V2_PACKED_TILE_ELEMS):
+        elem0 = pair_idx * 2
+        stripe = pair_idx // BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3
+        lane = pair_idx % BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3
+        stripe_offset = tile_offset + stripe * BYTE_V2_TILE_PAYLOAD_STRIPE_BYTES_V3
+        assert int(page[stripe_offset + lane].item()) == int(low[elem0].item())
+        assert int(page[stripe_offset + 32 + lane].item()) == int(
+            low[elem0 + 1].item()
+        )
+        assert int(page[stripe_offset + 64 + lane].item()) == int(
+            packed[pair_idx].item()
+        )
 
 
 def test_byte_v2_page_layout_offsets_match_spec():
@@ -61,6 +96,89 @@ def test_byte_v2_page_layout_offsets_match_spec():
     last = layout.tile_offsets("v", kv_head=1, dim_tile=0)
     assert last.base == 16 + 5 * BYTE_V2_FAST_TILE_PAYLOAD_BYTES
     assert last.code_packed + 128 == 16 + compressed_bytes
+
+
+def test_byte_v2_page_layout_v3_offsets_match_design_doc():
+    layout = ByteV2PageLayoutV3(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+    )
+
+    assert layout.page_header_bytes == BYTE_V2_PAGE_HEADER_BYTES_V3
+    assert layout.kv_head_meta_region_bytes == 256
+    assert layout.k_payload_offset == 384
+    assert layout.v_payload_offset == 24960
+    assert layout.page_size_bytes == 49536
+    assert layout.tile_payload_offset("k", kv_head=0, dim_tile=0) == 384
+    assert layout.tile_payload_offset("k", kv_head=1, dim_tile=0) == (
+        384 + 8 * BYTE_V2_TILE_PAYLOAD_BYTES_V3
+    )
+    assert layout.tile_payload_offset("v", kv_head=0, dim_tile=0) == 24960
+
+
+def test_byte_v2_page_layout_v3_pack_unpack_fast_path():
+    torch.manual_seed(31)
+    layout = ByteV2PageLayoutV3(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=32,
+        head_size_v=32,
+    )
+    key = (1.0 + 0.01 * torch.randn(16, 2, 32)).to(torch.bfloat16)
+    value = (2.0 + 0.01 * torch.randn(16, 2, 32)).to(torch.bfloat16)
+
+    page = pack_byte_v2_kv_block_to_page_v3(key, value, layout)
+    key_out, value_out = unpack_byte_v2_kv_block_from_page_v3(page, layout)
+
+    assert int(page[BYTE_V2_PAGE_STATUS_OFFSET].item()) == (
+        BYTE_V2_PAGE_STATUS_COMPRESSED
+    )
+    assert int(page[BYTE_V2_PAGE_VALID_ROWS_OFFSET].item()) == 16
+    assert int(page[BYTE_V2_PAGE_LAYOUT_VERSION_OFFSET].item()) == (
+        BYTE_V2_PAYLOAD_LAYOUT_VERSION_V3
+    )
+    flags = int(page[BYTE_V2_PAGE_LAYOUT_FLAGS_OFFSET].item())
+    assert flags & BYTE_V2_PAGE_FLAG_HAS_TILE_FALLBACK_METADATA
+    assert flags & BYTE_V2_PAGE_FLAG_COMPRESSED_ONLY
+    _assert_bf16_bits_equal(key_out, key)
+    _assert_bf16_bits_equal(value_out, value)
+
+
+def test_byte_v2_page_layout_v3_uses_kv_specific_physical_order():
+    torch.manual_seed(32)
+    layout = ByteV2PageLayoutV3(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=16,
+        head_size_v=16,
+    )
+    key = (1.0 + 0.01 * torch.randn(16, 1, 16)).to(torch.bfloat16)
+    value = (2.0 + 0.01 * torch.randn(16, 1, 16)).to(torch.bfloat16)
+
+    page = pack_byte_v2_kv_block_to_page_v3(key, value, layout)
+    meta = layout.kv_head_meta_offsets(0)
+
+    k_payload = compress_byte_v2_tensor(key[:, 0, :BYTE_V2_TILE_SIZE].t())
+    v_payload = compress_byte_v2_tensor(value[:, 0, :BYTE_V2_TILE_SIZE])
+
+    assert int(page[meta.k_base].item()) == int(k_payload.base[0].item())
+    assert int(page[meta.v_base].item()) == int(v_payload.base[0].item())
+    assert int(page[meta.k_fallback_mask].item()) == 0
+    assert int(page[meta.v_fallback_mask].item()) == 0
+    _assert_v3_tile_payload_matches(
+        page,
+        layout.tile_payload_offset("k", kv_head=0, dim_tile=0),
+        k_payload.low_bytes[0],
+        k_payload.code_packed[0],
+    )
+    _assert_v3_tile_payload_matches(
+        page,
+        layout.tile_payload_offset("v", kv_head=0, dim_tile=0),
+        v_payload.low_bytes[0],
+        v_payload.code_packed[0],
+    )
 
 
 def test_byte_v2_page_layout_raw_fallback_round_trip():

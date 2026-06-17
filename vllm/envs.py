@@ -111,14 +111,31 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_BYTE_V2_USE_NATIVE_KERNELS: bool = True
     VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE: bool = False
+    VLLM_BYTE_V2_PAYLOAD_LAYOUT: Literal["v1", "v3"] = "v1"
     VLLM_BYTE_V2_ENABLE_SPARSE_FALLBACK_POOL: bool = True
     VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_RATIO: float = 0.03
     VLLM_BYTE_V2_SPARSE_FALLBACK_POOL_MIN_BLOCKS: int = 512
     VLLM_BYTE_V2_DECODE_SPLIT_K: int = 0
     VLLM_BYTE_V2_DECODE_PAGE_FASTPATH: bool = False
     VLLM_BYTE_V2_DECODE_TILE_FASTPATH: bool = True
+    VLLM_BYTE_V2_DECODE_CUTE_STAGE1: bool = False
+    VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO: bool = False
+    VLLM_BYTE_V2_DECODE_CUTE_STAGE1_EARLY_EXIT: int = 0
+    VLLM_BYTE_V2_DECODE_V3_WARP_STRIPE_LOAD: bool = False
+    VLLM_BYTE_V2_DECODE_V3_CP_ASYNC_STAGE: bool = False
+    VLLM_BYTE_V2_DECODE_FAST_STAGE1: bool = False
+    VLLM_BYTE_V2_DECODE_FLASH_STAGE1: bool = False
+    VLLM_BYTE_V2_DECODE_V4_STAGE1: bool = False
+    VLLM_BYTE_V2_DECODE_V4_MACRO_PAGES: int = 4
     VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE: int = -1
     VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE: int = 0
+    VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA: bool = False
+    VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK: float = 0.0
+    VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES: int = 0
+    VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE: int = 0
+    VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK: bool = False
+    VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS: bool = False
+    VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP: bool = False
     VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC: bool = False
     VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC: bool = False
     VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK: bool = False
@@ -620,6 +637,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE": lambda: bool(
         int(os.getenv("VLLM_BYTE_V2_COMPRESSED_ONLY_CACHE", "0"))
     ),
+    # Experimental Byte-v2 physical payload layout. v1 is the original
+    # 386B/tile layout. v3 is the 128B-aligned metadata-SoA layout and is
+    # fail-closed to compressed-only h128/Llama-3 style experiments.
+    "VLLM_BYTE_V2_PAYLOAD_LAYOUT": lambda: os.getenv(
+        "VLLM_BYTE_V2_PAYLOAD_LAYOUT", "v1"
+    ).strip(),
     # Use a separate raw BF16 fallback pool for Byte-v2 compressed-only pages.
     # Most pages stay compressed; only blocks that cannot be represented by the
     # Byte-v2 exponent window consume raw pool slots.
@@ -653,6 +676,53 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BYTE_V2_DECODE_TILE_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_BYTE_V2_DECODE_TILE_FASTPATH", "1"))
     ),
+    # Experimental: use the fixed-shape CUTE-style split-K decode stage1 for
+    # Llama-3 8B style GQA head geometry.
+    "VLLM_BYTE_V2_DECODE_CUTE_STAGE1": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1", "0"))
+    ),
+    # Experimental: conservatively auto-enable the fixed-shape CUTE-style
+    # split-K stage1 only for metadata shapes that have shown E2E benefit.
+    "VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO", "0"))
+    ),
+    # Profile-only: stop CUTE-style split-K decode stage1 after a fixed
+    # internal phase. 0/4 run the full kernel, 1 stops after K/V load+decode,
+    # 2 after QK, and 3 after softmax. Modes 1-3 do not produce valid output.
+    "VLLM_BYTE_V2_DECODE_CUTE_STAGE1_EARLY_EXIT": lambda: int(
+        os.getenv("VLLM_BYTE_V2_DECODE_CUTE_STAGE1_EARLY_EXIT", "0")
+    ),
+    # Experimental: V3-only payload loader that has each warp load one 96B
+    # lane-striped payload stripe using 24 aligned uint32 loads plus shuffles.
+    "VLLM_BYTE_V2_DECODE_V3_WARP_STRIPE_LOAD": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_V3_WARP_STRIPE_LOAD", "0"))
+    ),
+    # Experimental: V3-only decode-page microbench path that stages compressed
+    # 384B tile payloads through shared memory using cp.async and double
+    # buffers dim-tile payload loads with decode.
+    "VLLM_BYTE_V2_DECODE_V3_CP_ASYNC_STAGE": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_V3_CP_ASYNC_STAGE", "0"))
+    ),
+    # Experimental: use a strict no-fallback fixed-shape split-K decode stage1
+    # for Llama-3 8B style GQA head geometry. This is intentionally opt-in.
+    "VLLM_BYTE_V2_DECODE_FAST_STAGE1": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_FAST_STAGE1", "0"))
+    ),
+    # Experimental: use a FlashInfer-style warp-per-query split-K decode
+    # stage1 for Llama-3 8B style GQA head geometry. This is opt-in and only
+    # valid for compressed-only pages without fallback/outlier metadata.
+    "VLLM_BYTE_V2_DECODE_FLASH_STAGE1": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_FLASH_STAGE1", "0"))
+    ),
+    # Experimental: use the standalone V4 FlashAttention-style stage1. The first
+    # implementation is V3-payload-only and requires no fallback/outlier metadata.
+    "VLLM_BYTE_V2_DECODE_V4_STAGE1": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_DECODE_V4_STAGE1", "0"))
+    ),
+    # Number of 16-token ByteV2 pages grouped by V4 macro metadata traversal.
+    "VLLM_BYTE_V2_DECODE_V4_MACRO_PAGES": lambda: int(
+        os.getenv("VLLM_BYTE_V2_DECODE_V4_MACRO_PAGES", "4")
+    ),
     # Experimental: split-K reduce mode. -1 uses the native heuristic, 0 forces
     # the serial-LSE reduce kernel, and 1 forces CTA-parallel LSE reduction.
     "VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE": lambda: int(
@@ -663,6 +733,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the window boundary, so the default remains 0 for lossless encoding.
     "VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE": lambda: int(
         os.getenv("VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE", "0")
+    ),
+    # Experimental: reserve a compact arena for lossless element-level outlier
+    # entries. It is only wired into allocation/metadata by default; native
+    # cache update/decode must opt in before consuming it.
+    "VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA", "0"))
+    ),
+    "VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK": lambda: float(
+        os.getenv("VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK", "0.0")
+    ),
+    "VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES": lambda: int(
+        os.getenv("VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES", "0")
+    ),
+    # Experimental: cache update may encode a tile with up to N lossless
+    # outlier elements in the compact outlier arena instead of raw tile fallback.
+    # Decode overlay is still separate, so this must remain opt-in.
+    "VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE": lambda: int(
+        os.getenv("VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE", "0")
+    ),
+    # Experimental: for V3 compressed pages, encode exponent-window misses into
+    # the outlier arena and fail closed instead of using tile/block fallback.
+    # This keeps decode on a no-fallback compressed-first overlay path.
+    "VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_V3_OUTLIER_ONLY_NO_FALLBACK", "0"))
+    ),
+    # Experimental: pass per-block has-outlier flags into Byte-v2 decode so
+    # blocks without compact outlier entries can skip tile metadata checks.
+    # Real Llama-3 KV often marks most blocks, so this remains opt-in.
+    "VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS", "0"))
+    ),
+    # Experimental: pass per-tile outlier bitmaps into Byte-v2 decode so most
+    # tiles without compact outlier entries skip outlier_tile_meta loads.
+    "VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP": lambda: bool(
+        int(os.getenv("VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP", "0"))
     ),
     # Experimental: skip the first Byte-v2 native prefill-direct D2H validation
     # synchronization. The final direct_result is still checked on host, so cache

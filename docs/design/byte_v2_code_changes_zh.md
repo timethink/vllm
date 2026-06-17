@@ -132,6 +132,10 @@ BYTE_V2 = "vllm.v1.attention.backends.byte_v2_attn.ByteV2AttentionBackend"
 | `VLLM_BYTE_V2_DECODE_TILE_FASTPATH` | `1` | page fast path 中 tile-level fast decoder 开关。 |
 | `VLLM_BYTE_V2_DECODE_PARALLEL_REDUCE` | `-1` | split-K reduce kernel 选择；`-1` 表示自动。 |
 | `VLLM_BYTE_V2_LOSSY_MAX_MISSES_PER_TILE` | `0` | 每个 tile 允许多少个 exponent window miss；`0` 是 lossless。 |
+| `VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA` | `0` | 是否为 lossless element-level outlier 预留 compact arena。 |
+| `VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK` | `0.0` | 每个 physical block 预留的 outlier entry 数。 |
+| `VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES` | `0` | outlier arena 最小 entry 数。 |
+| `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE` | `0` | prefill-direct native encode 每个 tile 最多写入多少个 lossless outlier；`0` 关闭。 |
 | `VLLM_BYTE_V2_PREFILL_DIRECT_SKIP_VALIDATION_SYNC` | `0` | prefill direct encode 是否跳过 host validation sync。 |
 | `VLLM_BYTE_V2_DECODE_APPEND_SKIP_VALIDATION_SYNC` | `0` | decode append 是否跳过 host validation sync。 |
 | `VLLM_BYTE_V2_DEFERRED_CACHE_UPDATE_ERROR_CHECK` | `0` | 用 device-side sticky error flag 延迟报告 cache update 错误。 |
@@ -694,6 +698,116 @@ torch::stable::Tensor byte_v2_paged_decode_attention(...)
   -> decode attention 调 byte_v2_paged_decode_attention native CUDA
 ```
 
+## 12.1 tile fallback / outlier 诊断代码
+
+本节记录 Step 34 新增的诊断和 reference 代码。它用于评估后续 compact
+outlier pool 的可行性，当前不改变 production CUDA decode/cache update 主路径。
+
+- `vllm/v1/attention/backends/byte_v2_outliers.py`
+  - `compress_byte_v2_tile_with_outliers()`：
+    单个 16x16 BF16 tile 的 reference outlier codec。
+  - `decompress_byte_v2_tile_with_outliers()`：
+    将 compressed payload + outlier entries 还原为 BF16 tile。
+  - `byte_v2_tile_exponent_miss_counts()`：
+    统计每个 tile 超出 ByteV2 exponent window 的元素数量。
+  - `estimate_byte_v2_outlier_storage_from_misses()`：
+    估算不同 `max_outliers_per_tile` 下的 outlier list bytes、overflow raw tile
+    bytes 和等价 pool slot。
+- `ByteV2AttentionImpl.get_tile_fallback_stats()`
+  - 除 raw block fallback 外，现在也读取 `fallback_tile_ids` 指向的 raw tile
+    fallback pool。
+  - 输出 `full_tile_fallback_tiles`、`full_tile_pool_bad_tiles`、
+    `invalid_tile_fallback_slots` 和 `outlier_storage_estimates`。
+- `WorkerBase.get_byte_v2_tile_fallback_stats()`
+  - 聚合 raw block fallback 和 tile fallback 的全局计数。
+- `benchmarks/byte_v2_tile_fallback_stats.py`
+  - 合并多 worker/layer 的 `outlier_storage_estimates`，用于真实模型统计。
+- `tests/v1/attention/test_byte_v2_outliers.py`
+  - 覆盖 outlier codec、miss 统计和 storage estimate。
+- `tests/v1/attention/test_byte_v2_backend.py`
+  - 增加 tile fallback stats 从 fallback pool 读取 raw tile 的覆盖。
+
+## 12.2 compact outlier arena allocator 和 prefill-direct encode
+
+Step 35 已预埋 compact outlier arena 的 allocator、注册和 stats 通路。后续又补上
+native CUDA cache update 的 prefill-direct opt-in 分支：少量 exponent-window miss
+的 tile 可以写成 compressed payload + outlier entries，而不是 raw tile fallback。
+Step 37 已补 native paged decode overlay，主 decode 路径可以读取 outlier arena 并
+覆盖 shared/register 中对应 BF16 元素。
+
+- `vllm/envs.py`
+  - `VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA`
+  - `VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK`
+  - `VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES`
+  - `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE`
+- `ByteV2FullAttentionSpec`
+  - 新增 outlier arena entry 数量、entry bytes、tile metadata bytes 和
+    next-entry bytes。
+  - `allocation_size_bytes()` 现在按如下顺序计入内存：
+    `main pages -> raw fallback pool -> outlier arena -> sparse metadata ->
+    outlier metadata`。
+  - `outlier_arena_start_bytes()` 和 `metadata_start_bytes()` 保证 int32
+    alignment。
+- `vllm/model_executor/layers/attention/attention.py`
+  - 只在 compressed-only + sparse fallback + outlier arena env 同时开启时，把
+    outlier arena 参数写入 `ByteV2FullAttentionSpec`。
+- `vllm/v1/worker/gpu/attn_utils.py`
+- `vllm/v1/worker/gpu_model_runner.py`
+  - 从同一块 raw KV allocation 中切出：
+    - `outlier_arena: int32[num_entries]`
+    - `outlier_tile_meta: int32[num_blocks, tiles_per_block]`
+    - `outlier_next_entry: int32[1]`
+  - 初始化 `outlier_tile_meta=-1`，`outlier_next_entry=0`。
+- `ByteV2AttentionImpl.register_sparse_fallback_pool()`
+  - 接收并保存 outlier arena tensors。
+- `ByteV2AttentionImpl.get_sparse_fallback_pool_stats()`
+  - 输出 outlier capacity、next entry、assigned tile 数和 exhausted 标记。
+- `vllm/_custom_ops.py`
+- `vllm/v1/attention/backends/byte_v2_ops.py`
+- `vllm/v1/attention/backends/byte_v2_attn.py`
+- `csrc/libtorch_stable/ops.h`
+- `csrc/libtorch_stable/torch_bindings.cpp`
+  - `byte_v2_reshape_and_cache()` 新增可选参数：
+    - `outlier_arena: int32[num_entries]`
+    - `outlier_tile_meta: int32[num_blocks, tiles_per_block]`
+    - `outlier_next_entry: int32[1]`
+  - `byte_v2_paged_decode_attention()` 新增可选参数：
+    - `outlier_arena: int32[num_entries]`
+    - `outlier_tile_meta: int32[num_blocks, tiles_per_block]`
+- `csrc/libtorch_stable/cache_kernels.cu`
+  - prefill-direct native encode 在
+    `VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE > 0` 且 outlier arena 存在时启用。
+  - 若 tile 的 miss count 满足
+    `lossy_max_misses_per_tile < miss_count <= outlier_max_per_tile`：
+    - compressed payload 中将 outlier exponent clamp 到 base window；
+    - raw BF16 bits 和 tile element index 写入 compact arena；
+    - `outlier_tile_meta` 记录 arena offset/count；
+    - `fallback_tile_ids` 保持 `-1`，不占 raw tile fallback pool。
+  - 若超过阈值或 arena 容量不足，仍回退当前 raw tile fallback 路径。
+  - native paged decode 在 compressed tile 解压后读取 `outlier_tile_meta`，
+    将少量 raw BF16 outlier 覆盖到 element loader 或 split-K WMMA shared memory。
+  - CUTE stage1 暂未支持 overlay；outlier arena 存在时会禁用 CUTE stage1。
+
+当前 outlier metadata pack 方式：
+
+```text
+outlier entry int32:
+bits[7:0]   = tile 内元素 index
+bits[23:8]  = raw BF16 bits
+bits[31:24] = reserved
+
+outlier tile meta int32:
+bits[7:0]   = outlier count
+bits[30:8]  = arena offset
+bit[31]     = 0；无 outlier tile 使用 -1
+```
+
+注意：当前 native prefill-direct encode 和 native paged decode overlay 已能跑通
+8B E2E correctness smoke。但 `byte_v2_decompress_page_to_raw_block()` 仍未读取
+outlier arena，因此 continuation prefill / partial-page decode append / general
+touched-block compress path 涉及已带 outlier 的 compressed page 时还需要继续补保真
+处理。
+
 ## 13. 当前限制和注意事项
 
 - ByteV2 只支持 decoder full attention，不支持 sliding window attention。
@@ -761,3 +875,449 @@ torch::stable::Tensor byte_v2_paged_decode_attention(...)
   tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_decode_append_fallback_pool_exhaustion_cuda \
   -q
 ```
+
+## 15. per-block has-outlier flag 实验改动
+
+本轮为 compact outlier arena 增加了 block 粒度的 has-outlier flag，但默认不启用
+decode 使用，避免真实 Llama-3 8B 场景下无收益的 metadata 读和分支。
+
+核心链路：
+
+- `ByteV2FullAttentionSpec.outlier_block_flag_bytes=4`
+  - `outlier_metadata_bytes()` 计入 `num_blocks * 4`。
+- allocator 切片：
+  - `vllm/v1/worker/gpu/attn_utils.py`
+  - `vllm/v1/worker/gpu_model_runner.py`
+  - 布局为 sparse fallback metadata 后接
+    `outlier_block_flags -> outlier_tile_bitmap -> outlier_tile_meta -> outlier_next_entry`。
+- backend pool：
+  - `ByteV2SparseFallbackPool.outlier_block_flags`
+  - `get_sparse_fallback_pool_stats()` 输出 `assigned_outlier_blocks`。
+- Python/native op 参数：
+  - `vllm/_custom_ops.py`
+  - `vllm/v1/attention/backends/byte_v2_ops.py`
+  - `csrc/libtorch_stable/ops.h`
+  - `csrc/libtorch_stable/torch_bindings.cpp`
+  - `csrc/libtorch_stable/cache_kernels.cu`
+- CUDA 行为：
+  - prefill-direct encode 写 `outlier_block_flags[block_id]`。
+  - decode append / touched-block compress 清对应 flag。
+  - decode kernel 在 flag 为 0 时跳过该 block 的 outlier arena/tile meta。
+
+启用方式：
+
+```bash
+VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS=1
+```
+
+benchmark 显式参数：
+
+```bash
+--use-outlier-block-flags
+```
+
+实验结论：合成低 outlier-block 场景下 stage1 kernel 约有 5% 改善；真实 Llama-3
+8B prompt 下多数 block 都有 outlier，E2E 没有明显收益，因此默认关闭。
+
+## 16. tile-level has-outlier bitmap 实验改动
+
+本轮在 compact outlier arena 上继续增加 tile 粒度 bitmap。它解决的是 block 级
+flag 过粗的问题：真实 prompt 中多数 block 有 outlier，但同一 block 内多数 tile
+没有 outlier，因此 decode 可以在 tile 粒度跳过 `outlier_tile_meta` 读取。
+
+核心链路：
+
+- `ByteV2FullAttentionSpec`
+  - 新增 `outlier_tile_bitmap_word_bytes=4`。
+  - 新增 `outlier_tile_bitmap_words_per_block = ceil(total_tiles / 32)`。
+  - `outlier_metadata_bytes()` 额外计入
+    `num_blocks * outlier_tile_bitmap_words_per_block * 4`。
+- allocator 切片：
+  - `vllm/v1/worker/gpu/attn_utils.py`
+  - `vllm/v1/worker/gpu_model_runner.py`
+  - outlier metadata 顺序为
+    `outlier_block_flags -> outlier_tile_bitmap -> outlier_tile_meta -> outlier_next_entry`。
+- backend pool：
+  - `ByteV2SparseFallbackPool.outlier_tile_bitmap`
+  - `get_sparse_fallback_pool_stats()` 输出
+    `assigned_outlier_bitmap_tiles`。
+- Python/native op 参数：
+  - `vllm/_custom_ops.py`
+  - `vllm/v1/attention/backends/byte_v2_ops.py`
+  - `csrc/libtorch_stable/ops.h`
+  - `csrc/libtorch_stable/torch_bindings.cpp`
+  - 参数顺序为
+    `outlier_block_flags -> outlier_tile_bitmap -> outlier_tile_meta`。
+- CUDA 行为：
+  - prefill-direct encode 每个 block 先清零 bitmap words；成功写入 compact
+    outlier arena 的 tile 才置位。
+  - decode append / touched-block compress 清零对应 block 的 bitmap，避免 stale
+    metadata 被误用。
+  - decode kernel 在 block flag 之后再按 tile bitmap gate
+    `outlier_tile_meta` 读取。
+
+启用方式：
+
+```bash
+VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP=1
+```
+
+decode-only benchmark 显式参数：
+
+```bash
+--use-outlier-tile-bitmap
+```
+
+已验证：
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/envs.py \
+  vllm/v1/kv_cache_interface.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/_custom_ops.py \
+  vllm/v1/attention/backends/byte_v2_ops.py \
+  vllm/v1/worker/gpu/attn_utils.py \
+  vllm/v1/worker/gpu_model_runner.py \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_ops.py \
+  tests/v1/attention/test_byte_v2_backend.py \
+  tests/v1/test_byte_v2_kv_cache_spec.py
+
+.venv/bin/python -m ruff check \
+  vllm/envs.py \
+  vllm/v1/kv_cache_interface.py \
+  vllm/v1/attention/backends/byte_v2_attn.py \
+  vllm/_custom_ops.py \
+  vllm/v1/attention/backends/byte_v2_ops.py \
+  vllm/v1/worker/gpu/attn_utils.py \
+  vllm/v1/worker/gpu_model_runner.py \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_ops.py \
+  tests/v1/attention/test_byte_v2_backend.py \
+  tests/v1/test_byte_v2_kv_cache_spec.py
+
+uv pip install --python .venv/bin/python -e . --torch-backend=auto
+
+CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m pytest \
+  tests/v1/test_byte_v2_kv_cache_spec.py::test_byte_v2_full_attention_spec_outlier_arena_allocation_size \
+  tests/v1/attention/test_byte_v2_backend.py::test_byte_v2_attention_impl_outlier_arena_pool \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_prefill_direct_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_outlier_arena_decode_overlay_cuda \
+  tests/v1/attention/test_byte_v2_ops.py::test_byte_v2_native_tile_fallback_pool_cuda \
+  -q -s
+```
+
+结果：Python/ruff 通过，native rebuild 成功，CUDA 单测 `5 passed`。
+
+E2E smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1 \
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=4 \
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=4096 \
+VLLM_BYTE_V2_USE_OUTLIER_TILE_BITMAP=1 \
+VLLM_BYTE_V2_USE_OUTLIER_BLOCK_FLAGS=1 \
+.venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --modes byte_v2_compressed_only \
+  --prompt-len 128 \
+  --decode-lens 8 \
+  --batch-size 1 \
+  --num-runs 1 \
+  --warmup-decode-len 1 \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --gpu-memory-utilization 0.85 \
+  --enforce-eager \
+  --disable-prefix-caching
+```
+
+结果：`decode_len=8`，median output throughput `14.72 tok/s`；
+`any_exhausted=false`，`any_outlier_exhausted=false`；
+`total_assigned_outlier_tiles=1574`，`total_outlier_next_entry=1574`，bitmap stats
+非零。
+
+当前性能结论：decode-only A/B 未观察到稳定收益，bitmap 默认保持关闭。该实现主要
+提供 correctness gate 和后续 CUTE/independent stage1 overlay 改造的 metadata 基础。
+
+## 17. CUTE stage1 metadata 支持
+
+本轮目标是继续优化 decode attention stage1。先尝试了一个 generic
+compressed-only hotpath，只通过编译期模板去掉 fallback/outlier metadata 分支；该
+方案 decode-only 没有收益，已移除，不作为保留代码。
+
+保留的改动是让 CUTE-style split-K stage1 支持 metadata：
+
+- `csrc/libtorch_stable/cache_kernels.cu`
+  - `byte_v2_paged_decode_attention_gqa_cute_split_stage1_kernel` 增加
+    `metadata_fastpath` 模板参数。
+  - `metadata_fastpath=false` 保持原 no-metadata CUTE fast path。
+  - `metadata_fastpath=true` 支持 sparse fallback pool、tile fallback pool、
+    compact outlier arena、outlier block flag 和 outlier tile bitmap。
+  - host launch 在 `VLLM_BYTE_V2_DECODE_CUTE_STAGE1=1` 且 Llama-3 8B 形状
+    (`32 heads / 8 KV heads / head_size=128`) 时选择 CUTE；是否有 metadata
+    决定实例化哪个模板版本。
+- `benchmarks/kernels/benchmark_byte_v2_decode_kernel.py`
+  - 新增 `--cute-stage1` 参数，并自动启用 page fastpath。
+- `vllm/envs.py`
+  - 新增 `VLLM_BYTE_V2_DECODE_CUTE_STAGE1`。
+- `tests/v1/attention/test_byte_v2_decode.py`
+  - 新增 `test_byte_v2_paged_decode_attention_op_cute_stage1_metadata_cuda`，
+    覆盖 compressed-only page size + fallback pool raw block。
+
+验证：
+
+```bash
+.venv/bin/python -m py_compile \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_decode.py \
+  vllm/envs.py
+
+.venv/bin/python -m ruff check \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_decode.py \
+  vllm/envs.py
+
+git diff --check -- \
+  csrc/libtorch_stable/cache_kernels.cu \
+  benchmarks/kernels/benchmark_byte_v2_decode_kernel.py \
+  tests/v1/attention/test_byte_v2_decode.py \
+  vllm/envs.py
+
+uv pip install --python .venv/bin/python -e . --torch-backend=auto
+
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_cute_stage1_metadata_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_gqa_wmma_split_k_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_page_fastpath_split_k_cuda \
+  tests/v1/attention/test_byte_v2_decode.py::test_byte_v2_paged_decode_attention_op_tile_fastpath_cuda \
+  -q -s
+```
+
+结果：检查通过，native rebuild 成功，CUDA 单测 `5 passed`。
+
+E2E smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1 \
+VLLM_BYTE_V2_DECODE_CUTE_STAGE1=1 \
+VLLM_BYTE_V2_ENABLE_OUTLIER_ARENA=1 \
+VLLM_BYTE_V2_OUTLIER_MAX_PER_TILE=1 \
+VLLM_BYTE_V2_OUTLIER_ARENA_ENTRIES_PER_BLOCK=4 \
+VLLM_BYTE_V2_OUTLIER_ARENA_MIN_ENTRIES=4096 \
+.venv/bin/python benchmarks/benchmark_byte_v2_decode_e2e.py \
+  --model /mnt/sda1/yxz/byte_v2/Meta-Llama-3-8B-Instruct \
+  --modes byte_v2_compressed_only \
+  --prompt-len 128 \
+  --decode-lens 8 \
+  --batch-size 1 \
+  --num-runs 1 \
+  --warmup-decode-len 1 \
+  --max-model-len 256 \
+  --max-num-batched-tokens 256 \
+  --gpu-memory-utilization 0.85 \
+  --enforce-eager \
+  --disable-prefix-caching
+```
+
+结果：`decode_len=8`，median output throughput `14.83 tok/s`，median elapsed
+`0.539s`；outlier arena 和 sparse fallback pool 均未耗尽。
+
+decode-only metadata 场景结果：
+
+| seq_len | split_k | page-fastpath | CUTE metadata |
+| ---: | ---: | ---: | ---: |
+| 1024 | 16 | 1046.53 us | 1015.81 us |
+| 1024 | 32 | 1084.42 us | 992.26 us |
+| 2048 | 16 | 1231.87 us | 1171.46 us |
+| 2048 | 32 | 1155.07 us | 1114.59 us |
+
+结论：CUTE metadata 在该 decode-only 场景下稳定降低 stage1/reduce 总 latency，后续
+需要做 Llama-3 8B E2E 对比，确认该 opt-in 路径是否能转化为端到端收益。
+
+## 18. independent no-fallback fast stage1 v1
+
+本节记录 `docs/design/byte_v2_new_optimization.md` 中 Step B 的第一轮实现。
+
+### 18.1 native kernel
+
+文件：[csrc/libtorch_stable/cache_kernels.cu](/mnt/sda1/yxz/byte_v2/vllm/csrc/libtorch_stable/cache_kernels.cu)
+
+新增：
+
+- `byte_v2_decode_k_transposed_tile_to_shared_no_fallback_full_rows()`
+- `byte_v2_decode_v_rowmajor_tile_to_shared_no_fallback_full_rows()`
+- `byte_v2_paged_decode_attention_gqa4_h128_fast_split_stage1_kernel()`
+
+dispatch 条件：
+
+```text
+VLLM_BYTE_V2_DECODE_FAST_STAGE1=1
+split-K path
+compressed-only page size
+num_heads=32
+num_kv_heads=8
+head_size=head_size_v=128
+q_per_kv=4
+no sparse fallback metadata
+no tile fallback metadata
+no outlier arena / block flags / tile bitmap
+```
+
+该路径只用于 no-fallback decode-only 实验，不进入默认 E2E 主路径。
+
+### 18.2 Python/env/benchmark
+
+文件：
+
+- [vllm/envs.py](/mnt/sda1/yxz/byte_v2/vllm/vllm/envs.py)
+- [benchmarks/kernels/benchmark_byte_v2_decode_kernel.py](/mnt/sda1/yxz/byte_v2/vllm/benchmarks/kernels/benchmark_byte_v2_decode_kernel.py)
+- [benchmarks/benchmark_byte_v2_decode_e2e.py](/mnt/sda1/yxz/byte_v2/vllm/benchmarks/benchmark_byte_v2_decode_e2e.py)
+
+新增：
+
+- `VLLM_BYTE_V2_DECODE_FAST_STAGE1`
+- decode-only benchmark 参数 `--fast-stage1`
+- E2E benchmark JSON 记录 `VLLM_BYTE_V2_DECODE_FAST_STAGE1`
+
+### 18.3 tests
+
+文件：[tests/v1/attention/test_byte_v2_decode.py](/mnt/sda1/yxz/byte_v2/vllm/tests/v1/attention/test_byte_v2_decode.py)
+
+新增：
+
+- `test_byte_v2_paged_decode_attention_op_fast_stage1_cuda`
+
+### 18.4 实验结论
+
+decode-only fallback=0、`seq_len=1024,2048`、`split_k=16,64`：
+
+| seq_len | split_k | page-fastpath | CUTE no-metadata | fast stage1 v1 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1024 | 16 | 1038.26 us | 1009.15 us | 1004.54 us |
+| 1024 | 64 | 1116.16 us | 994.30 us | 994.30 us |
+| 2048 | 16 | 1201.15 us | 1131.52 us | 1125.38 us |
+| 2048 | 64 | 1137.66 us | 1107.44 us | 1104.90 us |
+
+fast stage1 v1 相比已有 CUTE no-metadata 只有 `0.0%-0.55%` 收益，未达到
+设计文档的 8%-10% 门槛。因此：
+
+- 保持 opt-in。
+- 不默认启用。
+- 仅作为后续 lane-major/layout-v3 loader 实验 scaffold。
+
+## 19. no-arena 稳定基线与 CUTE metadata auto heuristic
+
+本节记录为了固定生产安全对照、避免 outlier arena 噪声而新增的保守 auto 路径。
+
+### 19.1 dispatch/env
+
+文件：
+
+- [csrc/libtorch_stable/cache_kernels.cu](/mnt/sda1/yxz/byte_v2/vllm/csrc/libtorch_stable/cache_kernels.cu)
+- [vllm/envs.py](/mnt/sda1/yxz/byte_v2/vllm/vllm/envs.py)
+
+新增：
+
+- `VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO`
+
+auto 条件：
+
+```text
+VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO=1
+split-K GQA WMMA path
+compressed-only page size
+VLLM_BYTE_V2_DECODE_PAGE_FASTPATH=1
+num_heads=32
+num_kv_heads=8
+head_size=head_size_v=128
+q_per_kv=4
+active_head_groups = num_decode_tokens * num_kv_heads >= 32
+has sparse fallback metadata or outlier arena metadata
+no outlier arena
+no outlier block flags
+no outlier tile bitmap
+```
+
+设计意图：
+
+- batch1/small active head groups 不自动启用，避免之前小 batch 场景的退化。
+- no-arena sparse fallback metadata 的 batch4 Llama-3 8B 场景会自动启用，这是
+  当前观测到有 E2E 正收益的生产候选路径。
+- `VLLM_BYTE_V2_DECODE_CUTE_STAGE1=1` 仍然是强制实验开关，不受 auto 条件收紧。
+
+### 19.2 benchmark/test
+
+文件：
+
+- [benchmarks/kernels/benchmark_byte_v2_decode_kernel.py](/mnt/sda1/yxz/byte_v2/vllm/benchmarks/kernels/benchmark_byte_v2_decode_kernel.py)
+- [benchmarks/benchmark_byte_v2_decode_e2e.py](/mnt/sda1/yxz/byte_v2/vllm/benchmarks/benchmark_byte_v2_decode_e2e.py)
+- [tests/v1/attention/test_byte_v2_decode.py](/mnt/sda1/yxz/byte_v2/vllm/tests/v1/attention/test_byte_v2_decode.py)
+
+新增：
+
+- decode-only benchmark 参数 `--cute-stage1-auto`
+- E2E benchmark JSON 记录：
+  - `VLLM_BYTE_V2_DECODE_CUTE_STAGE1`
+  - `VLLM_BYTE_V2_DECODE_CUTE_STAGE1_AUTO`
+- CUDA 单测：
+  - `test_byte_v2_paged_decode_attention_op_cute_stage1_auto_metadata_cuda`
+
+### 19.3 固定 no-arena baseline
+
+固定对照文件：
+
+```text
+benchmarks/profiles/bytev2_no_arena_baseline_p512_b4_d128_256_r3.json
+```
+
+| mode | decode_len | median output tok/s | ByteV2/raw |
+| --- | ---: | ---: | ---: |
+| raw | 128 | 133.60 | 100.00% |
+| raw | 256 | 133.45 | 100.00% |
+| ByteV2 no-arena baseline | 128 | 123.19 | 92.21% |
+| ByteV2 no-arena baseline | 256 | 123.78 | 92.75% |
+
+### 19.4 CUTE auto E2E
+
+auto 结果文件：
+
+```text
+benchmarks/profiles/bytev2_no_arena_cute_auto_p512_b4_d128_256_r3.json
+```
+
+| mode | decode_len | median output tok/s | vs no-arena baseline | ByteV2/raw |
+| --- | ---: | ---: | ---: | ---: |
+| ByteV2 no-arena + CUTE auto | 128 | 126.27 | +2.50% | 94.51% |
+| ByteV2 no-arena + CUTE auto | 256 | 125.36 | +1.27% | 93.93% |
+
+该结果与强制 `VLLM_BYTE_V2_DECODE_CUTE_STAGE1=1` 基本一致，说明 auto 在
+batch4/no-arena metadata 场景触发了预期路径。
+
+pool 状态：
+
+```text
+any_exhausted=false
+total_assigned_blocks=896
+total_assigned_tiles=22892
+```
+
+batch1 guard decode-only 复测：
+
+```text
+benchmarks/profiles/bytev2_cute_auto_b1_guard_base_repeat_p1024_s16_fb003.json
+benchmarks/profiles/bytev2_cute_auto_b1_guard_auto_repeat_p1024_s16_fb003.json
+```
+
+| batch_size | seq_len | split_k | fallback_ratio | auto | median latency |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 1 | 1024 | 16 | 0.03 | off | 1034.24 us |
+| 1 | 1024 | 16 | 0.03 | on | 1031.17 us |
+
+batch1 的 `active_head_groups=8`，不满足 auto 门槛；repeat 结果持平，说明保守
+heuristic 没有把小 batch 自动切到 CUTE metadata 路径。

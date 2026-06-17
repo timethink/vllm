@@ -39,7 +39,9 @@ def _generate_token_ids(kv_cache_dtype: str) -> tuple[list[int], list[int]]:
         max_model_len=64,
         max_num_seqs=1,
         max_num_batched_tokens=64,
-        gpu_memory_utilization=0.2,
+        gpu_memory_utilization=float(
+            os.environ.get("BYTE_V2_E2E_GPU_MEMORY_UTILIZATION", "0.2")
+        ),
         trust_remote_code=False,
     )
     outputs = llm.generate(

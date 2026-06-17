@@ -765,7 +765,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        Tensor!? fallback_next_slot=None,"
       "                        Tensor!? fallback_tile_ids=None,"
       "                        Tensor!? fallback_tile_next_slot=None,"
-      "                        Tensor!? deferred_error=None) -> Tensor");
+      "                        Tensor!? deferred_error=None,"
+      "                        Tensor? outlier_arena=None,"
+      "                        Tensor!? outlier_block_flags=None,"
+      "                        Tensor!? outlier_tile_bitmap=None,"
+      "                        Tensor!? outlier_tile_meta=None,"
+      "                        Tensor!? outlier_next_entry=None,"
+      "                        bool decode_append_fast_path_safe=False)"
+      "                        -> Tensor");
 
   ops.def(
       "byte_v2_paged_decode_attention("
@@ -782,7 +789,28 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        Tensor? fallback_pool=None,"
       "                        Tensor? fallback_block_ids=None,"
       "                        Tensor? fallback_tile_ids=None,"
-      "                        Tensor? partial_workspace=None) -> Tensor");
+      "                        Tensor? partial_workspace=None,"
+      "                        Tensor? outlier_arena=None,"
+      "                        Tensor? outlier_block_flags=None,"
+      "                        Tensor? outlier_tile_bitmap=None,"
+      "                        Tensor? outlier_tile_meta=None) -> Tensor");
+
+  ops.def(
+      "byte_v2_decompress_cache_to_bf16("
+      "                        Tensor kv_cache,"
+      "                        Tensor! key_cache,"
+      "                        Tensor! value_cache,"
+      "                        int block_size,"
+      "                        int num_kv_heads,"
+      "                        int head_size,"
+      "                        int head_size_v,"
+      "                        int page_size_bytes,"
+      "                        Tensor? fallback_pool=None,"
+      "                        Tensor? fallback_block_ids=None,"
+      "                        Tensor? fallback_tile_ids=None,"
+      "                        Tensor? outlier_arena=None,"
+      "                        Tensor? outlier_tile_bitmap=None,"
+      "                        Tensor? outlier_tile_meta=None) -> ()");
 
   ops.def(
       "byte_v2_wmma_layout_microbench("
@@ -910,6 +938,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
            TORCH_BOX(&byte_v2_reshape_and_cache));
   ops.impl("byte_v2_paged_decode_attention",
            TORCH_BOX(&byte_v2_paged_decode_attention));
+  ops.impl("byte_v2_decompress_cache_to_bf16",
+           TORCH_BOX(&byte_v2_decompress_cache_to_bf16));
   ops.impl("byte_v2_wmma_layout_microbench",
            TORCH_BOX(&byte_v2_wmma_layout_microbench));
   ops.impl("byte_v2_decode_page_wmma_microbench",

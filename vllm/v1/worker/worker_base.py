@@ -156,6 +156,18 @@ class WorkerBase:
             "total_assigned_blocks": sum(
                 int(layer["assigned_blocks"]) for layer in enabled_layers
             ),
+            "total_outlier_capacity": sum(
+                int(layer.get("outlier_capacity", 0))
+                for layer in enabled_layers
+            ),
+            "total_outlier_next_entry": sum(
+                int(layer.get("outlier_next_entry", 0))
+                for layer in enabled_layers
+            ),
+            "total_assigned_outlier_tiles": sum(
+                int(layer.get("assigned_outlier_tiles", 0))
+                for layer in enabled_layers
+            ),
             "max_next_slot": max(
                 (int(layer["next_slot"]) for layer in enabled_layers),
                 default=0,
@@ -166,6 +178,10 @@ class WorkerBase:
             ),
             "any_exhausted": any(
                 bool(layer["exhausted"]) for layer in enabled_layers
+            ),
+            "any_outlier_exhausted": any(
+                bool(layer.get("outlier_exhausted", False))
+                for layer in enabled_layers
             ),
             "layers": layers,
         }
@@ -195,6 +211,9 @@ class WorkerBase:
         total_bad_tiles = sum(
             int(layer["full_bad_tiles"]) for layer in enabled_layers
         )
+        total_raw_block_bad_tiles = sum(
+            int(layer["full_raw_block_bad_tiles"]) for layer in enabled_layers
+        )
         total_sum_misses = sum(
             int(layer["sum_bad_tile_misses"]) for layer in enabled_layers
         )
@@ -212,6 +231,15 @@ class WorkerBase:
                 int(layer["partial_raw_fallback_blocks"])
                 for layer in enabled_layers
             ),
+            "total_full_raw_block_bad_tiles": total_raw_block_bad_tiles,
+            "total_full_tile_fallback_tiles": sum(
+                int(layer["full_tile_fallback_tiles"])
+                for layer in enabled_layers
+            ),
+            "total_full_tile_pool_bad_tiles": sum(
+                int(layer["full_tile_pool_bad_tiles"])
+                for layer in enabled_layers
+            ),
             "total_full_tiles": total_full_tiles,
             "total_raw_full_tiles": total_raw_full_tiles,
             "total_full_bad_tiles": total_bad_tiles,
@@ -225,7 +253,7 @@ class WorkerBase:
                 else 0.0
             ),
             "total_bad_tile_ratio_within_raw_fallback_blocks": (
-                float(total_bad_tiles / total_raw_full_tiles)
+                float(total_raw_block_bad_tiles / total_raw_full_tiles)
                 if total_raw_full_tiles > 0
                 else 0.0
             ),
@@ -259,6 +287,10 @@ class WorkerBase:
             ),
             "invalid_raw_fallback_slots": sum(
                 int(layer["invalid_raw_fallback_slots"])
+                for layer in enabled_layers
+            ),
+            "invalid_tile_fallback_slots": sum(
+                int(layer["invalid_tile_fallback_slots"])
                 for layer in enabled_layers
             ),
             "layers": layers,

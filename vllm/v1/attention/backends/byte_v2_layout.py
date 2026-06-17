@@ -32,6 +32,22 @@ BYTE_V2_PAGE_STATUS_RAW_FALLBACK = 2
 BYTE_V2_PAGE_STATUS_OFFSET = 0
 BYTE_V2_PAGE_VALID_ROWS_OFFSET = 1
 BYTE_V2_BF16_BYTES = 2
+BYTE_V2_PAYLOAD_LAYOUT_VERSION_V1 = 1
+BYTE_V2_PAYLOAD_LAYOUT_VERSION_V3 = 3
+BYTE_V2_PAGE_LAYOUT_VERSION_OFFSET = 2
+BYTE_V2_PAGE_LAYOUT_FLAGS_OFFSET = 3
+BYTE_V2_PAGE_HEADER_BYTES_V3 = 128
+BYTE_V2_KV_HEAD_META_BYTES_V3 = 32
+BYTE_V2_TILE_PAYLOAD_BYTES_V3 = 384
+BYTE_V2_TILE_PAYLOAD_STRIPE_BYTES_V3 = 96
+BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3 = 32
+BYTE_V2_PAGE_FLAG_HAS_TILE_FALLBACK_METADATA = 1 << 0
+BYTE_V2_PAGE_FLAG_HAS_OUTLIER_METADATA = 1 << 1
+BYTE_V2_PAGE_FLAG_COMPRESSED_ONLY = 1 << 2
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
 
 
 @dataclass(frozen=True)
@@ -40,6 +56,16 @@ class ByteV2TileOffsets:
     fallback: int
     low_bytes: int
     code_packed: int
+
+
+@dataclass(frozen=True)
+class ByteV2KvHeadMetaOffsetsV3:
+    k_base: int
+    v_base: int
+    k_fallback_mask: int
+    v_fallback_mask: int
+    k_outlier_mask: int
+    v_outlier_mask: int
 
 
 @dataclass(frozen=True)
@@ -178,6 +204,153 @@ class ByteV2PageLayout:
         return self.page_header_bytes + self.raw_key_bytes, self.raw_value_bytes
 
 
+@dataclass(frozen=True)
+class ByteV2PageLayoutV3:
+    """Experimental Byte-v2 V3 compressed page layout.
+
+    V3 keeps the same 16x16 Byte-v2 codec tile, but moves per-tile metadata into
+    a per-KV-head metadata block and stores each tile payload as four
+    lane-striped 96B stripes. The default page is compressed-only; callers can
+    reserve an optional raw tail for CPU/reference fallback tests.
+    """
+
+    block_size: int
+    num_kv_heads: int
+    head_size: int
+    head_size_v: int
+    page_header_bytes: int = BYTE_V2_PAGE_HEADER_BYTES_V3
+    kv_head_meta_bytes: int = BYTE_V2_KV_HEAD_META_BYTES_V3
+    tile_payload_bytes: int = BYTE_V2_TILE_PAYLOAD_BYTES_V3
+    raw_tail_bytes: int = 0
+
+    def __post_init__(self):
+        if self.block_size != BYTE_V2_TILE_SIZE:
+            raise ValueError("Byte-v2 V3 page layout currently requires block_size=16")
+        if self.head_size % BYTE_V2_TILE_SIZE:
+            raise ValueError("Byte-v2 V3 layout head_size must be a multiple of 16")
+        if self.head_size_v % BYTE_V2_TILE_SIZE:
+            raise ValueError("Byte-v2 V3 layout head_size_v must be a multiple of 16")
+        if self.page_header_bytes != BYTE_V2_PAGE_HEADER_BYTES_V3:
+            raise ValueError("Byte-v2 V3 layout requires a 128B page header")
+        if self.kv_head_meta_bytes != BYTE_V2_KV_HEAD_META_BYTES_V3:
+            raise ValueError("Byte-v2 V3 layout requires 32B per-KV-head metadata")
+        if self.tile_payload_bytes != BYTE_V2_TILE_PAYLOAD_BYTES_V3:
+            raise ValueError("Byte-v2 V3 layout requires 384B tile payloads")
+        if self.raw_tail_bytes < 0:
+            raise ValueError("Byte-v2 V3 raw_tail_bytes must be non-negative")
+
+    @property
+    def k_dim_tiles(self) -> int:
+        return self.head_size // BYTE_V2_TILE_SIZE
+
+    @property
+    def v_dim_tiles(self) -> int:
+        return self.head_size_v // BYTE_V2_TILE_SIZE
+
+    @property
+    def tiles_per_head(self) -> int:
+        return self.k_dim_tiles + self.v_dim_tiles
+
+    @property
+    def total_tiles(self) -> int:
+        return self.num_kv_heads * self.tiles_per_head
+
+    @property
+    def kv_head_meta_region_bytes(self) -> int:
+        return _align_up(self.num_kv_heads * self.kv_head_meta_bytes, 128)
+
+    @property
+    def k_payload_offset(self) -> int:
+        return self.page_header_bytes + self.kv_head_meta_region_bytes
+
+    @property
+    def k_payload_bytes(self) -> int:
+        return self.num_kv_heads * self.k_dim_tiles * self.tile_payload_bytes
+
+    @property
+    def v_payload_offset(self) -> int:
+        return self.k_payload_offset + self.k_payload_bytes
+
+    @property
+    def v_payload_bytes(self) -> int:
+        return self.num_kv_heads * self.v_dim_tiles * self.tile_payload_bytes
+
+    @property
+    def compressed_payload_bytes(self) -> int:
+        return (
+            self.kv_head_meta_region_bytes
+            + self.k_payload_bytes
+            + self.v_payload_bytes
+        )
+
+    @property
+    def compressed_page_bytes(self) -> int:
+        return self.page_header_bytes + self.compressed_payload_bytes
+
+    @property
+    def raw_key_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * BYTE_V2_BF16_BYTES
+        )
+
+    @property
+    def raw_value_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size_v
+            * BYTE_V2_BF16_BYTES
+        )
+
+    @property
+    def raw_block_bytes(self) -> int:
+        return self.raw_key_bytes + self.raw_value_bytes
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.compressed_page_bytes + self.raw_tail_bytes
+
+    def kv_head_meta_offsets(self, kv_head: int) -> ByteV2KvHeadMetaOffsetsV3:
+        if kv_head < 0 or kv_head >= self.num_kv_heads:
+            raise ValueError("kv_head is out of range")
+        base = self.page_header_bytes + kv_head * self.kv_head_meta_bytes
+        return ByteV2KvHeadMetaOffsetsV3(
+            k_base=base,
+            v_base=base + 8,
+            k_fallback_mask=base + 16,
+            v_fallback_mask=base + 18,
+            k_outlier_mask=base + 20,
+            v_outlier_mask=base + 22,
+        )
+
+    def tile_payload_offset(
+        self, kind: ByteV2KVKind, kv_head: int, dim_tile: int
+    ) -> int:
+        if kv_head < 0 or kv_head >= self.num_kv_heads:
+            raise ValueError("kv_head is out of range")
+        max_dim_tiles = self.k_dim_tiles if kind == "k" else self.v_dim_tiles
+        if dim_tile < 0 or dim_tile >= max_dim_tiles:
+            raise ValueError("dim_tile is out of range")
+        if kind == "k":
+            tile_index = kv_head * self.k_dim_tiles + dim_tile
+            return self.k_payload_offset + tile_index * self.tile_payload_bytes
+        tile_index = kv_head * self.v_dim_tiles + dim_tile
+        return self.v_payload_offset + tile_index * self.tile_payload_bytes
+
+    def raw_offsets(self, kind: ByteV2KVKind) -> tuple[int, int]:
+        if self.raw_tail_bytes < self.raw_block_bytes:
+            raise NotImplementedError(
+                "Byte-v2 V3 page does not reserve enough raw tail storage"
+            )
+        raw_offset = self.compressed_page_bytes
+        if kind == "k":
+            return raw_offset, self.raw_key_bytes
+        return raw_offset + self.raw_key_bytes, self.raw_value_bytes
+
+
 def _validate_block(
     block: torch.Tensor,
     *,
@@ -245,6 +418,20 @@ def _validate_kv_cache(
             f"[num_blocks, {layout.page_size_bytes}], got {tuple(kv_cache.shape)}"
         )
     return kv_cache.cpu()
+
+
+def _load_u16_le(page: torch.Tensor, offset: int) -> int:
+    return int(page[offset].item()) | (int(page[offset + 1].item()) << 8)
+
+
+def _store_u16_le(page: torch.Tensor, offset: int, value: int) -> None:
+    page[offset] = value & 0xFF
+    page[offset + 1] = (value >> 8) & 0xFF
+
+
+def _store_u32_le(page: torch.Tensor, offset: int, value: int) -> None:
+    for byte_idx in range(4):
+        page[offset + byte_idx] = (value >> (8 * byte_idx)) & 0xFF
 
 
 def count_byte_v2_page_statuses(
@@ -323,6 +510,119 @@ def _store_fast_tile(
     return True
 
 
+def _store_v3_header(page: torch.Tensor, layout: ByteV2PageLayoutV3) -> None:
+    page[BYTE_V2_PAGE_STATUS_OFFSET] = BYTE_V2_PAGE_STATUS_COMPRESSED
+    page[BYTE_V2_PAGE_VALID_ROWS_OFFSET] = layout.block_size
+    page[BYTE_V2_PAGE_LAYOUT_VERSION_OFFSET] = BYTE_V2_PAYLOAD_LAYOUT_VERSION_V3
+    page[BYTE_V2_PAGE_LAYOUT_FLAGS_OFFSET] = (
+        BYTE_V2_PAGE_FLAG_HAS_TILE_FALLBACK_METADATA
+        | BYTE_V2_PAGE_FLAG_COMPRESSED_ONLY
+    )
+    _store_u32_le(page, 8, layout.k_payload_offset)
+    _store_u32_le(page, 12, layout.k_payload_offset)
+    _store_u32_le(page, 16, layout.v_payload_offset)
+    _store_u32_le(page, 20, layout.tile_payload_bytes)
+    _store_u32_le(page, 24, layout.page_header_bytes)
+    _store_u32_le(page, 28, layout.kv_head_meta_region_bytes)
+
+
+def _store_v3_striped_tile(
+    page: torch.Tensor,
+    layout: ByteV2PageLayoutV3,
+    kind: ByteV2KVKind,
+    kv_head: int,
+    dim_tile: int,
+    tile: torch.Tensor,
+) -> bool:
+    payload_tile = tile.t().contiguous() if kind == "k" else tile
+    payload = compress_byte_v2_tensor(payload_tile)
+    meta_offsets = layout.kv_head_meta_offsets(kv_head)
+    fallback_mask_offset = (
+        meta_offsets.k_fallback_mask
+        if kind == "k"
+        else meta_offsets.v_fallback_mask
+    )
+    base_offset = (
+        meta_offsets.k_base + dim_tile
+        if kind == "k"
+        else meta_offsets.v_base + dim_tile
+    )
+    page[base_offset] = payload.base[0]
+
+    if payload.fallback_tiles:
+        mask = _load_u16_le(page, fallback_mask_offset)
+        _store_u16_le(page, fallback_mask_offset, mask | (1 << dim_tile))
+        return False
+
+    tile_offset = layout.tile_payload_offset(kind, kv_head, dim_tile)
+    low = payload.low_bytes[0]
+    packed = payload.code_packed[0]
+    for pair_idx in range(BYTE_V2_PACKED_TILE_ELEMS):
+        elem0 = pair_idx * 2
+        stripe = pair_idx // BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3
+        lane = pair_idx % BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3
+        stripe_offset = tile_offset + stripe * BYTE_V2_TILE_PAYLOAD_STRIPE_BYTES_V3
+        page[stripe_offset + lane] = low[elem0]
+        page[stripe_offset + 32 + lane] = low[elem0 + 1]
+        page[stripe_offset + 64 + lane] = packed[pair_idx]
+    return True
+
+
+def pack_byte_v2_kv_block_to_page_v3(
+    key_block: torch.Tensor,
+    value_block: torch.Tensor,
+    layout: ByteV2PageLayoutV3,
+    page: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pack one full K/V block into an experimental Byte-v2 V3 page."""
+    key_block = _validate_block(
+        key_block,
+        block_size=layout.block_size,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size,
+        name="key_block",
+    )
+    value_block = _validate_block(
+        value_block,
+        block_size=layout.block_size,
+        num_kv_heads=layout.num_kv_heads,
+        head_size=layout.head_size_v,
+        name="value_block",
+    )
+    if page is None:
+        page = torch.zeros(layout.page_size_bytes, dtype=torch.uint8)
+    else:
+        page = _validate_page(page, layout)
+        page.zero_()
+
+    _store_v3_header(page, layout)
+    saw_fallback_tile = False
+    for kv_head in range(layout.num_kv_heads):
+        for dim_tile in range(layout.k_dim_tiles):
+            d0 = dim_tile * BYTE_V2_TILE_SIZE
+            tile = key_block[:, kv_head, d0 : d0 + BYTE_V2_TILE_SIZE]
+            saw_fallback_tile |= not _store_v3_striped_tile(
+                page, layout, "k", kv_head, dim_tile, tile
+            )
+        for dim_tile in range(layout.v_dim_tiles):
+            d0 = dim_tile * BYTE_V2_TILE_SIZE
+            tile = value_block[:, kv_head, d0 : d0 + BYTE_V2_TILE_SIZE]
+            saw_fallback_tile |= not _store_v3_striped_tile(
+                page, layout, "v", kv_head, dim_tile, tile
+            )
+
+    if saw_fallback_tile:
+        if layout.raw_tail_bytes >= layout.raw_block_bytes:
+            return pack_byte_v2_raw_kv_block_to_page(
+                key_block, value_block, layout.block_size, layout, page=page
+            )
+        raise NotImplementedError(
+            "Byte-v2 V3 reference pack requires compressible tiles unless a "
+            "raw tail is reserved"
+        )
+    return page
+
+
 def pack_byte_v2_kv_block_to_page(
     key_block: torch.Tensor,
     value_block: torch.Tensor,
@@ -340,6 +640,11 @@ def pack_byte_v2_kv_block_to_page(
     Returns:
         The written page tensor.
     """
+    if isinstance(layout, ByteV2PageLayoutV3):
+        return pack_byte_v2_kv_block_to_page_v3(
+            key_block, value_block, layout, page=page
+        )
+
     key_block = _validate_block(
         key_block,
         block_size=layout.block_size,
@@ -487,6 +792,9 @@ def unpack_byte_v2_kv_block_from_page(
     layout: ByteV2PageLayout,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unpack one Byte-v2 page into BF16 K/V block tensors."""
+    if isinstance(layout, ByteV2PageLayoutV3):
+        return unpack_byte_v2_kv_block_from_page_v3(page, layout)
+
     page = _validate_page(page, layout)
     status = int(page[BYTE_V2_PAGE_STATUS_OFFSET].item())
     if status == BYTE_V2_PAGE_STATUS_RAW_FALLBACK:
@@ -515,6 +823,93 @@ def unpack_byte_v2_kv_block_from_page(
                 page, layout, "v", kv_head, dim_tile
             )
 
+    return key_block, value_block
+
+
+def _load_v3_striped_tile(
+    page: torch.Tensor,
+    layout: ByteV2PageLayoutV3,
+    kind: ByteV2KVKind,
+    kv_head: int,
+    dim_tile: int,
+) -> torch.Tensor:
+    meta_offsets = layout.kv_head_meta_offsets(kv_head)
+    fallback_mask_offset = (
+        meta_offsets.k_fallback_mask
+        if kind == "k"
+        else meta_offsets.v_fallback_mask
+    )
+    fallback_mask = _load_u16_le(page, fallback_mask_offset)
+    if fallback_mask & (1 << dim_tile):
+        raise NotImplementedError(
+            "Byte-v2 V3 tile fallback decoding requires an external fallback pool"
+        )
+
+    base_offset = (
+        meta_offsets.k_base + dim_tile
+        if kind == "k"
+        else meta_offsets.v_base + dim_tile
+    )
+    low = torch.empty(BYTE_V2_TILE_ELEMS, dtype=torch.uint8)
+    packed = torch.empty(BYTE_V2_PACKED_TILE_ELEMS, dtype=torch.uint8)
+    tile_offset = layout.tile_payload_offset(kind, kv_head, dim_tile)
+    for pair_idx in range(BYTE_V2_PACKED_TILE_ELEMS):
+        elem0 = pair_idx * 2
+        stripe = pair_idx // BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3
+        lane = pair_idx % BYTE_V2_TILE_PAYLOAD_STRIPE_PAIRS_V3
+        stripe_offset = tile_offset + stripe * BYTE_V2_TILE_PAYLOAD_STRIPE_BYTES_V3
+        low[elem0] = page[stripe_offset + lane]
+        low[elem0 + 1] = page[stripe_offset + 32 + lane]
+        packed[pair_idx] = page[stripe_offset + 64 + lane]
+
+    payload = ByteV2TensorPayload(
+        base=page[base_offset : base_offset + 1].clone(),
+        fallback=torch.zeros(1, dtype=torch.uint8),
+        low_bytes=low.reshape(1, BYTE_V2_TILE_ELEMS),
+        code_packed=packed.reshape(1, BYTE_V2_PACKED_TILE_ELEMS),
+        fallback_raw=torch.zeros(1, BYTE_V2_TILE_ELEMS, dtype=torch.bfloat16),
+        original_shape=(BYTE_V2_TILE_SIZE, BYTE_V2_TILE_SIZE),
+        fallback_tiles=0,
+        logical_compressed_bytes=0,
+    )
+    tile = decompress_byte_v2_tensor(payload)
+    return tile.t().contiguous() if kind == "k" else tile
+
+
+def unpack_byte_v2_kv_block_from_page_v3(
+    page: torch.Tensor,
+    layout: ByteV2PageLayoutV3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack one experimental Byte-v2 V3 page into BF16 K/V block tensors."""
+    page = _validate_page(page, layout)
+    status = int(page[BYTE_V2_PAGE_STATUS_OFFSET].item())
+    if status == BYTE_V2_PAGE_STATUS_RAW_FALLBACK:
+        return unpack_byte_v2_raw_kv_block_from_page(page, layout)
+    if status != BYTE_V2_PAGE_STATUS_COMPRESSED:
+        raise NotImplementedError(
+            f"Byte-v2 V3 page status {status} is not supported"
+        )
+    layout_version = int(page[BYTE_V2_PAGE_LAYOUT_VERSION_OFFSET].item())
+    if layout_version != BYTE_V2_PAYLOAD_LAYOUT_VERSION_V3:
+        raise ValueError(f"Byte-v2 V3 page has layout version {layout_version}")
+
+    key_block = torch.empty(
+        layout.block_size, layout.num_kv_heads, layout.head_size, dtype=torch.bfloat16
+    )
+    value_block = torch.empty(
+        layout.block_size, layout.num_kv_heads, layout.head_size_v, dtype=torch.bfloat16
+    )
+    for kv_head in range(layout.num_kv_heads):
+        for dim_tile in range(layout.k_dim_tiles):
+            d0 = dim_tile * BYTE_V2_TILE_SIZE
+            key_block[:, kv_head, d0 : d0 + BYTE_V2_TILE_SIZE] = (
+                _load_v3_striped_tile(page, layout, "k", kv_head, dim_tile)
+            )
+        for dim_tile in range(layout.v_dim_tiles):
+            d0 = dim_tile * BYTE_V2_TILE_SIZE
+            value_block[:, kv_head, d0 : d0 + BYTE_V2_TILE_SIZE] = (
+                _load_v3_striped_tile(page, layout, "v", kv_head, dim_tile)
+            )
     return key_block, value_block
 
 

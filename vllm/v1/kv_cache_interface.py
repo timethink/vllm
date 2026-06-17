@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, fields, replace
 from enum import Enum, IntEnum
 from math import prod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from typing_extensions import Self
@@ -365,6 +365,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
     tile_head_size: int = 16
     fast_tile_payload_bytes: int = 386
     page_header_bytes: int = 16
+    payload_layout: Literal["v1", "v3"] = "v1"
     raw_tail_bytes: int | None = None
     fallback_pool_bytes: int = 0
     sparse_fallback_pool_ratio: float = 0.0
@@ -373,9 +374,30 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
     sparse_fallback_next_slot_bytes: int = 4
     sparse_fallback_tile_id_bytes: int = 4
     sparse_fallback_tile_next_slot_bytes: int = 4
+    outlier_arena_entries_per_block: float = 0.0
+    outlier_arena_min_entries: int = 0
+    outlier_arena_entry_bytes: int = 4
+    outlier_tile_meta_bytes: int = 4
+    outlier_next_entry_bytes: int = 4
+    outlier_block_flag_bytes: int = 4
+    outlier_tile_bitmap_word_bytes: int = 4
 
     def __post_init__(self):
         super().__post_init__()
+        if self.payload_layout not in ("v1", "v3"):
+            raise ValueError(
+                "Byte-v2 payload_layout must be 'v1' or 'v3', got "
+                f"{self.payload_layout!r}."
+            )
+        if self.payload_layout == "v3":
+            if self.fast_tile_payload_bytes == 386:
+                object.__setattr__(self, "fast_tile_payload_bytes", 384)
+            if self.page_header_bytes == 16:
+                object.__setattr__(self, "page_header_bytes", 128)
+            if self.fast_tile_payload_bytes != 384:
+                raise ValueError("Byte-v2 V3 requires 384B tile payloads")
+            if self.page_header_bytes != 128:
+                raise ValueError("Byte-v2 V3 requires a 128B page header")
         if self.block_size % self.tile_token_size != 0:
             raise ValueError(
                 "Byte-v2 KV cache block_size must be a multiple of "
@@ -403,12 +425,56 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
             raise ValueError(
                 "Byte-v2 sparse fallback pool min blocks must be >= 0"
             )
+        if self.outlier_arena_entries_per_block < 0:
+            raise ValueError(
+                "Byte-v2 outlier arena entries per block must be >= 0"
+            )
+        if (
+            self.outlier_arena_entries_per_block > 0
+            and self.sparse_fallback_pool_ratio <= 0
+        ):
+            raise ValueError(
+                "Byte-v2 outlier arena currently requires sparse fallback pool"
+            )
+        if self.outlier_arena_min_entries < 0:
+            raise ValueError(
+                "Byte-v2 outlier arena min entries must be >= 0"
+            )
+        if self.outlier_arena_entry_bytes != 4:
+            raise ValueError(
+                "Byte-v2 outlier arena currently packs each entry in 4 bytes"
+            )
+        if self.outlier_tile_meta_bytes != 4:
+            raise ValueError(
+                "Byte-v2 outlier tile metadata currently uses int32 slots"
+            )
+        if self.outlier_next_entry_bytes != 4:
+            raise ValueError(
+                "Byte-v2 outlier next-entry metadata currently uses int32"
+            )
+        if self.outlier_block_flag_bytes != 4:
+            raise ValueError(
+                "Byte-v2 outlier block flags currently use int32 slots"
+            )
+        if self.outlier_tile_bitmap_word_bytes != 4:
+            raise ValueError(
+                "Byte-v2 outlier tile bitmap currently uses int32 words"
+            )
 
     @property
     def _compressed_payload_bytes(self) -> int:
         token_tiles = self.block_size // self.tile_token_size
         k_dim_tiles = self.head_size // self.tile_head_size
         v_dim_tiles = self.head_size_v // self.tile_head_size
+        if self.payload_layout == "v3":
+            kv_head_meta_bytes = round_up(self.num_kv_heads * 32, 128)
+            return (
+                kv_head_meta_bytes
+                + token_tiles
+                * self.num_kv_heads
+                * (k_dim_tiles + v_dim_tiles)
+                * self.fast_tile_payload_bytes
+            )
         compressed_tiles = (
             token_tiles * self.num_kv_heads * (k_dim_tiles + v_dim_tiles)
         )
@@ -419,6 +485,10 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
         k_dim_tiles = self.head_size // self.tile_head_size
         v_dim_tiles = self.head_size_v // self.tile_head_size
         return self.num_kv_heads * (k_dim_tiles + v_dim_tiles)
+
+    @property
+    def outlier_tile_bitmap_words_per_block(self) -> int:
+        return (self.tile_fallback_tiles_per_block + 31) // 32
 
     @property
     def raw_block_bytes(self) -> int:
@@ -467,13 +537,58 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
             + self.sparse_fallback_tile_next_slot_bytes
         )
 
-    def allocation_size_bytes(self, num_blocks: int) -> int:
-        main_cache_bytes = num_blocks * self.main_page_size_bytes
-        fallback_pool_bytes = (
-            self.sparse_fallback_pool_blocks(num_blocks) * self.raw_block_bytes
+    def sparse_fallback_pool_bytes(self, num_blocks: int) -> int:
+        return self.sparse_fallback_pool_blocks(num_blocks) * self.raw_block_bytes
+
+    def outlier_arena_entries(self, num_blocks: int) -> int:
+        if self.outlier_arena_entries_per_block <= 0 or num_blocks <= 0:
+            return 0
+        return max(
+            1,
+            self.outlier_arena_min_entries,
+            math.ceil(num_blocks * self.outlier_arena_entries_per_block),
         )
-        metadata_start = round_up(main_cache_bytes + fallback_pool_bytes, 4)
-        return metadata_start + self.sparse_fallback_metadata_bytes(num_blocks)
+
+    def outlier_arena_bytes(self, num_blocks: int) -> int:
+        return (
+            self.outlier_arena_entries(num_blocks)
+            * self.outlier_arena_entry_bytes
+        )
+
+    def outlier_arena_start_bytes(self, num_blocks: int) -> int:
+        main_cache_bytes = num_blocks * self.main_page_size_bytes
+        return round_up(
+            main_cache_bytes + self.sparse_fallback_pool_bytes(num_blocks),
+            4,
+        )
+
+    def outlier_metadata_bytes(self, num_blocks: int) -> int:
+        if self.outlier_arena_entries(num_blocks) == 0:
+            return 0
+        return (
+            num_blocks * self.outlier_block_flag_bytes
+            + num_blocks
+            * self.outlier_tile_bitmap_words_per_block
+            * self.outlier_tile_bitmap_word_bytes
+            + num_blocks
+            * self.tile_fallback_tiles_per_block
+            * self.outlier_tile_meta_bytes
+            + self.outlier_next_entry_bytes
+        )
+
+    def metadata_start_bytes(self, num_blocks: int) -> int:
+        return round_up(
+            self.outlier_arena_start_bytes(num_blocks)
+            + self.outlier_arena_bytes(num_blocks),
+            4,
+        )
+
+    def allocation_size_bytes(self, num_blocks: int) -> int:
+        return (
+            self.metadata_start_bytes(num_blocks)
+            + self.sparse_fallback_metadata_bytes(num_blocks)
+            + self.outlier_metadata_bytes(num_blocks)
+        )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
@@ -491,6 +606,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
             "tile_head_size",
             "fast_tile_payload_bytes",
             "page_header_bytes",
+            "payload_layout",
             "raw_tail_bytes",
             "fallback_pool_bytes",
             "sparse_fallback_pool_ratio",
@@ -499,6 +615,13 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
             "sparse_fallback_next_slot_bytes",
             "sparse_fallback_tile_id_bytes",
             "sparse_fallback_tile_next_slot_bytes",
+            "outlier_arena_entries_per_block",
+            "outlier_arena_min_entries",
+            "outlier_arena_entry_bytes",
+            "outlier_tile_meta_bytes",
+            "outlier_next_entry_bytes",
+            "outlier_block_flag_bytes",
+            "outlier_tile_bitmap_word_bytes",
         )
         for field_name in byte_v2_fields:
             assert all(

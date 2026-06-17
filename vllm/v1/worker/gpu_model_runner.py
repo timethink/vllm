@@ -7159,10 +7159,25 @@ class GPUModelRunner(
                             )
                         )
                         fallback_pool_bytes = (
-                            fallback_pool_blocks * kv_cache_spec.raw_block_bytes
+                            kv_cache_spec.sparse_fallback_pool_bytes(
+                                kernel_num_blocks
+                            )
                         )
-                        metadata_start = round_up(
-                            main_cache_bytes + fallback_pool_bytes, 4
+                        outlier_arena_entries = (
+                            kv_cache_spec.outlier_arena_entries(
+                                kernel_num_blocks
+                            )
+                        )
+                        outlier_arena_bytes = (
+                            kv_cache_spec.outlier_arena_bytes(kernel_num_blocks)
+                        )
+                        outlier_arena_start = (
+                            kv_cache_spec.outlier_arena_start_bytes(
+                                kernel_num_blocks
+                            )
+                        )
+                        metadata_start = kv_cache_spec.metadata_start_bytes(
+                            kernel_num_blocks
                         )
                         fallback_block_ids_bytes = (
                             kernel_num_blocks
@@ -7179,12 +7194,41 @@ class GPUModelRunner(
                         fallback_tile_next_slot_bytes = (
                             kv_cache_spec.sparse_fallback_tile_next_slot_bytes
                         )
+                        outlier_tile_meta_bytes = (
+                            kernel_num_blocks
+                            * kv_cache_spec.tile_fallback_tiles_per_block
+                            * kv_cache_spec.outlier_tile_meta_bytes
+                            if outlier_arena_entries
+                            else 0
+                        )
+                        outlier_block_flags_bytes = (
+                            kernel_num_blocks
+                            * kv_cache_spec.outlier_block_flag_bytes
+                            if outlier_arena_entries
+                            else 0
+                        )
+                        outlier_tile_bitmap_bytes = (
+                            kernel_num_blocks
+                            * kv_cache_spec.outlier_tile_bitmap_words_per_block
+                            * kv_cache_spec.outlier_tile_bitmap_word_bytes
+                            if outlier_arena_entries
+                            else 0
+                        )
+                        outlier_next_entry_bytes = (
+                            kv_cache_spec.outlier_next_entry_bytes
+                            if outlier_arena_entries
+                            else 0
+                        )
                         expected_bytes = (
                             metadata_start
                             + fallback_block_ids_bytes
                             + fallback_next_slot_bytes
                             + fallback_tile_ids_bytes
                             + fallback_tile_next_slot_bytes
+                            + outlier_block_flags_bytes
+                            + outlier_tile_bitmap_bytes
+                            + outlier_tile_meta_bytes
+                            + outlier_next_entry_bytes
                         )
                         assert raw_bytes.numel() == expected_bytes
 
@@ -7193,44 +7237,97 @@ class GPUModelRunner(
                             main_cache_bytes : main_cache_bytes
                             + fallback_pool_bytes
                         ].view(fallback_pool_blocks, kv_cache_spec.raw_block_bytes)
+                        outlier_arena = (
+                            raw_bytes[
+                                outlier_arena_start : outlier_arena_start
+                                + outlier_arena_bytes
+                            ].view(torch.int32)
+                            if outlier_arena_entries
+                            else None
+                        )
+                        metadata_offset = metadata_start
                         fallback_block_ids = raw_bytes[
-                            metadata_start : metadata_start
+                            metadata_offset : metadata_offset
                             + fallback_block_ids_bytes
                         ].view(torch.int32)
+                        metadata_offset += fallback_block_ids_bytes
                         fallback_next_slot = raw_bytes[
-                            metadata_start
-                            + fallback_block_ids_bytes : metadata_start
-                            + fallback_block_ids_bytes
+                            metadata_offset : metadata_offset
                             + fallback_next_slot_bytes
                         ].view(torch.int32)
+                        metadata_offset += fallback_next_slot_bytes
                         fallback_tile_ids = raw_bytes[
-                            metadata_start
-                            + fallback_block_ids_bytes
-                            + fallback_next_slot_bytes : metadata_start
-                            + fallback_block_ids_bytes
-                            + fallback_next_slot_bytes
+                            metadata_offset : metadata_offset
                             + fallback_tile_ids_bytes
                         ].view(torch.int32)
+                        metadata_offset += fallback_tile_ids_bytes
                         fallback_tile_ids = fallback_tile_ids.view(
                             kernel_num_blocks,
                             kv_cache_spec.tile_fallback_tiles_per_block,
                         )
                         fallback_tile_next_slot = raw_bytes[
-                            metadata_start
-                            + fallback_block_ids_bytes
-                            + fallback_next_slot_bytes
-                            + fallback_tile_ids_bytes : expected_bytes
+                            metadata_offset : metadata_offset
+                            + fallback_tile_next_slot_bytes
                         ].view(torch.int32)
+                        metadata_offset += fallback_tile_next_slot_bytes
+                        outlier_tile_meta = None
+                        outlier_block_flags = None
+                        outlier_tile_bitmap = None
+                        outlier_next_entry = None
+                        if outlier_arena_entries:
+                            outlier_block_flags = raw_bytes[
+                                metadata_offset : metadata_offset
+                                + outlier_block_flags_bytes
+                            ].view(torch.int32)
+                            metadata_offset += outlier_block_flags_bytes
+                            outlier_tile_bitmap = raw_bytes[
+                                metadata_offset : metadata_offset
+                                + outlier_tile_bitmap_bytes
+                            ].view(torch.int32)
+                            metadata_offset += outlier_tile_bitmap_bytes
+                            outlier_tile_bitmap = outlier_tile_bitmap.view(
+                                kernel_num_blocks,
+                                kv_cache_spec.outlier_tile_bitmap_words_per_block,
+                            )
+                            outlier_tile_meta = raw_bytes[
+                                metadata_offset : metadata_offset
+                                + outlier_tile_meta_bytes
+                            ].view(torch.int32)
+                            metadata_offset += outlier_tile_meta_bytes
+                            outlier_tile_meta = outlier_tile_meta.view(
+                                kernel_num_blocks,
+                                kv_cache_spec.tile_fallback_tiles_per_block,
+                            )
+                            outlier_next_entry = raw_bytes[
+                                metadata_offset : metadata_offset
+                                + outlier_next_entry_bytes
+                            ].view(torch.int32)
+                            metadata_offset += outlier_next_entry_bytes
+                        assert metadata_offset == expected_bytes
                         fallback_block_ids.fill_(-1)
                         fallback_next_slot.zero_()
                         fallback_tile_ids.fill_(-1)
                         fallback_tile_next_slot.zero_()
+                        if outlier_tile_meta is not None:
+                            outlier_tile_meta.fill_(-1)
+                        if outlier_block_flags is not None:
+                            outlier_block_flags.zero_()
+                        if outlier_tile_bitmap is not None:
+                            outlier_tile_bitmap.zero_()
+                        if outlier_next_entry is not None:
+                            outlier_next_entry.zero_()
                         byte_v2_sparse_pool = (
                             fallback_pool,
                             fallback_block_ids,
                             fallback_next_slot,
                             fallback_tile_ids,
                             fallback_tile_next_slot,
+                            None,
+                            outlier_arena,
+                            outlier_block_flags,
+                            outlier_tile_bitmap,
+                            outlier_tile_meta,
+                            outlier_next_entry,
                         )
                     elif kv_cache_spec.page_size_padded is not None:
                         # Use strided view to handle page_size_bytes that

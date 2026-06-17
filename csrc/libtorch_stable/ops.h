@@ -487,7 +487,13 @@ torch::stable::Tensor byte_v2_reshape_and_cache(
     std::optional<torch::stable::Tensor> fallback_next_slot = std::nullopt,
     std::optional<torch::stable::Tensor> fallback_tile_ids = std::nullopt,
     std::optional<torch::stable::Tensor> fallback_tile_next_slot = std::nullopt,
-    std::optional<torch::stable::Tensor> deferred_error = std::nullopt);
+    std::optional<torch::stable::Tensor> deferred_error = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_arena = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_block_flags = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_tile_bitmap = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_tile_meta = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_next_entry = std::nullopt,
+    bool decode_append_fast_path_safe = false);
 
 torch::stable::Tensor byte_v2_paged_decode_attention(
     torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
@@ -497,7 +503,23 @@ torch::stable::Tensor byte_v2_paged_decode_attention(
     std::optional<torch::stable::Tensor> fallback_pool = std::nullopt,
     std::optional<torch::stable::Tensor> fallback_block_ids = std::nullopt,
     std::optional<torch::stable::Tensor> fallback_tile_ids = std::nullopt,
-    std::optional<torch::stable::Tensor> partial_workspace = std::nullopt);
+    std::optional<torch::stable::Tensor> partial_workspace = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_arena = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_block_flags = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_tile_bitmap = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_tile_meta = std::nullopt);
+
+void byte_v2_decompress_cache_to_bf16(
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor& key_cache,
+    torch::stable::Tensor& value_cache, int64_t block_size,
+    int64_t num_kv_heads, int64_t head_size, int64_t head_size_v,
+    int64_t page_size_bytes,
+    std::optional<torch::stable::Tensor> fallback_pool = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_block_ids = std::nullopt,
+    std::optional<torch::stable::Tensor> fallback_tile_ids = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_arena = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_tile_bitmap = std::nullopt,
+    std::optional<torch::stable::Tensor> outlier_tile_meta = std::nullopt);
 
 torch::stable::Tensor byte_v2_wmma_layout_microbench(
     torch::stable::Tensor& query, torch::stable::Tensor& key,
