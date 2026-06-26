@@ -23,6 +23,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     register_all_kvcache_specs,
 )
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -84,6 +85,7 @@ class _TrulyUnregisteredSpec(KVCacheSpec):
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     TQFullAttentionSpec: FullAttentionManager,
+    ByteV2FullAttentionSpec: FullAttentionManager,
     MLAAttentionSpec: FullAttentionManager,
     HiddenStateCacheSpec: FullAttentionManager,
     SlidingWindowSpec: SlidingWindowManager,
@@ -97,6 +99,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
 spec_uniform_base_map: dict[type[KVCacheSpec], type[KVCacheSpec]] = {
     FullAttentionSpec: FullAttentionSpec,
     TQFullAttentionSpec: FullAttentionSpec,
+    ByteV2FullAttentionSpec: FullAttentionSpec,
     MLAAttentionSpec: FullAttentionSpec,
     HiddenStateCacheSpec: FullAttentionSpec,
     SlidingWindowSpec: SlidingWindowSpec,
@@ -117,6 +120,12 @@ spec_args_map: dict[type[KVCacheSpec], dict[str, Any]] = {
         head_size=128,
         dtype=torch.bfloat16,
         tq_slot_size=256,
+    ),
+    ByteV2FullAttentionSpec: dict(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.uint8,
     ),
     MLAAttentionSpec: dict(
         block_size=64, num_kv_heads=1, head_size=128, dtype=torch.bfloat16

@@ -567,6 +567,32 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int tp_rank, int blocksparse_local_blocks,"
       "    int blocksparse_vert_stride, int blocksparse_block_size,"
       "    int blocksparse_head_sliding_step) -> ()");
+
+  ops.def(
+      "byte_v2_paged_decode_attention("
+      "    Tensor! output, Tensor query, Tensor kv_cache,"
+      "    Tensor block_tables, Tensor seq_lens, float scale,"
+      "    int num_kv_heads, int block_size, int max_seq_len,"
+      "    int[] tile_policy) -> ()");
+  ops.def(
+      "byte_v2_paged_decode_attention_split_k("
+      "    Tensor! output, Tensor! exp_sums, Tensor! max_logits,"
+      "    Tensor! tmp_out, Tensor query, Tensor kv_cache,"
+      "    Tensor block_tables, Tensor seq_lens, float scale,"
+      "    int num_kv_heads, int block_size, int max_seq_len,"
+      "    int partition_size, int[] tile_policy) -> ()");
+  ops.def(
+      "byte_v2_paged_decode_attention_split_k_guarded("
+      "    Tensor! output, Tensor! exp_sums, Tensor! max_logits,"
+      "    Tensor! tmp_out, Tensor query, Tensor kv_cache,"
+      "    Tensor page_unsafe_flags, Tensor block_tables, Tensor seq_lens,"
+      "    float scale, int num_kv_heads, int block_size, int max_seq_len,"
+      "    int partition_size, int[] tile_policy) -> ()");
+  ops.def(
+      "byte_v2_prefill_attention("
+      "    Tensor! output, Tensor query, Tensor key, Tensor value,"
+      "    Tensor query_start_loc, int max_query_len, float scale,"
+      "    int num_kv_heads, bool causal, int[] tile_policy) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
@@ -689,6 +715,13 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 
   ops.impl("paged_attention_v1", TORCH_BOX(&paged_attention_v1));
   ops.impl("paged_attention_v2", TORCH_BOX(&paged_attention_v2));
+  ops.impl("byte_v2_paged_decode_attention",
+           TORCH_BOX(&byte_v2_paged_decode_attention));
+  ops.impl("byte_v2_paged_decode_attention_split_k",
+           TORCH_BOX(&byte_v2_paged_decode_attention_split_k));
+  ops.impl("byte_v2_paged_decode_attention_split_k_guarded",
+           TORCH_BOX(&byte_v2_paged_decode_attention_split_k_guarded));
+  ops.impl("byte_v2_prefill_attention", TORCH_BOX(&byte_v2_prefill_attention));
 }
 
 // TODO: Remove this once ROCm upgrade to torch 2.11.
@@ -762,6 +795,78 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        Tensor slot_mapping,"
       "                        str kv_cache_dtype,"
       "                        Tensor k_scale, Tensor v_scale) -> ()");
+
+  ops.def(
+      "byte_v2_reshape_and_cache(Tensor key, Tensor value,"
+      "                          Tensor! kv_cache, Tensor slot_mapping,"
+      "                          int codec_token_block,"
+      "                          int codec_dim_block,"
+      "                          int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_update_cache_single_token("
+      "                          Tensor key, Tensor value,"
+      "                          Tensor! kv_cache, Tensor slot_mapping,"
+      "                          int codec_token_block,"
+      "                          int codec_dim_block,"
+      "                          int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_append_raw_staging(Tensor key, Tensor value,"
+      "                           Tensor! raw_staging, Tensor slot_mapping,"
+      "                           Tensor block_to_staging_slot,"
+      "                           int codec_token_block,"
+      "                           int codec_dim_block,"
+      "                           int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_prepare_raw_staging("
+      "                           Tensor slot_mapping,"
+      "                           Tensor! block_to_staging_slot,"
+      "                           Tensor! staging_to_physical_block,"
+      "                           Tensor! valid_rows,"
+      "                           Tensor! next_staging_slot,"
+      "                           Tensor! overflow,"
+      "                           int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_hydrate_raw_staging_from_cache("
+      "                           Tensor! raw_staging, Tensor kv_cache,"
+      "                           Tensor staging_to_physical_block,"
+      "                           Tensor valid_rows,"
+      "                           int codec_token_block,"
+      "                           int codec_dim_block,"
+      "                           int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_release_raw_staging("
+      "                           Tensor! block_to_staging_slot,"
+      "                           Tensor! staging_to_physical_block,"
+      "                           Tensor! valid_rows,"
+      "                           Tensor! next_staging_slot,"
+      "                           Tensor! overflow) -> ()");
+
+  ops.def(
+      "byte_v2_commit_raw_staging_to_cache("
+      "                           Tensor raw_staging, Tensor! kv_cache,"
+      "                           Tensor staging_to_physical_block,"
+      "                           Tensor valid_rows,"
+      "                           int codec_token_block,"
+      "                           int codec_dim_block,"
+      "                           int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_collect_cache_stats("
+      "                           Tensor! stats, Tensor kv_cache,"
+      "                           Tensor block_tables, Tensor seq_lens,"
+      "                           int max_seq_len,"
+      "                           int[] tile_policy) -> ()");
+
+  ops.def(
+      "byte_v2_update_cache_unsafe_flags("
+      "                           Tensor! page_unsafe_flags, Tensor kv_cache,"
+      "                           Tensor slot_mapping,"
+      "                           int[] tile_policy) -> ()");
 
   // Concat kv_c and k_pe and cache them.
   ops.def(
@@ -868,6 +973,23 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("swap_blocks", TORCH_BOX(&swap_blocks));
   ops.impl("reshape_and_cache", TORCH_BOX(&reshape_and_cache));
   ops.impl("reshape_and_cache_flash", TORCH_BOX(&reshape_and_cache_flash));
+  ops.impl("byte_v2_reshape_and_cache", TORCH_BOX(&byte_v2_reshape_and_cache));
+  ops.impl("byte_v2_update_cache_single_token",
+           TORCH_BOX(&byte_v2_update_cache_single_token));
+  ops.impl("byte_v2_append_raw_staging",
+           TORCH_BOX(&byte_v2_append_raw_staging));
+  ops.impl("byte_v2_prepare_raw_staging",
+           TORCH_BOX(&byte_v2_prepare_raw_staging));
+  ops.impl("byte_v2_hydrate_raw_staging_from_cache",
+           TORCH_BOX(&byte_v2_hydrate_raw_staging_from_cache));
+  ops.impl("byte_v2_release_raw_staging",
+           TORCH_BOX(&byte_v2_release_raw_staging));
+  ops.impl("byte_v2_commit_raw_staging_to_cache",
+           TORCH_BOX(&byte_v2_commit_raw_staging_to_cache));
+  ops.impl("byte_v2_collect_cache_stats",
+           TORCH_BOX(&byte_v2_collect_cache_stats));
+  ops.impl("byte_v2_update_cache_unsafe_flags",
+           TORCH_BOX(&byte_v2_update_cache_unsafe_flags));
   ops.impl("concat_and_cache_mla", TORCH_BOX(&concat_and_cache_mla));
   ops.impl("concat_and_cache_mla_rope_fused",
            TORCH_BOX(&concat_and_cache_mla_rope_fused));

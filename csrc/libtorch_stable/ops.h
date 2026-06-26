@@ -3,6 +3,8 @@
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
 
+#include <vector>
+
 void per_token_group_quant_fp8(const torch::stable::Tensor& input,
                                torch::stable::Tensor& output_q,
                                torch::stable::Tensor& output_s,
@@ -452,6 +454,29 @@ void paged_attention_v2(
     const int64_t blocksparse_vert_stride, const int64_t blocksparse_block_size,
     const int64_t blocksparse_head_sliding_step);
 
+void byte_v2_paged_decode_attention(torch::stable::Tensor& output,
+                                    torch::stable::Tensor& query,
+                                    torch::stable::Tensor& kv_cache,
+                                    torch::stable::Tensor& block_tables,
+                                    torch::stable::Tensor& seq_lens,
+                                    double scale, int64_t num_kv_heads,
+                                    int64_t block_size, int64_t max_seq_len,
+                                    const std::vector<int64_t>& tile_policy);
+
+void byte_v2_paged_decode_attention_split_k(
+    torch::stable::Tensor& output, torch::stable::Tensor& exp_sums,
+    torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
+    double scale, int64_t num_kv_heads, int64_t block_size, int64_t max_seq_len,
+    int64_t partition_size, const std::vector<int64_t>& tile_policy);
+
+void byte_v2_prefill_attention(
+    torch::stable::Tensor& output, torch::stable::Tensor& query,
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& query_start_loc, int64_t max_query_len, double scale,
+    int64_t num_kv_heads, bool causal, const std::vector<int64_t>& tile_policy);
+
 // Cache ops (shared CUDA/ROCm)
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,
@@ -476,6 +501,74 @@ void reshape_and_cache_flash(
     torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
     torch::stable::Tensor& slot_mapping, const std::string& kv_cache_dtype,
     torch::stable::Tensor& k_scale, torch::stable::Tensor& v_scale);
+
+void byte_v2_reshape_and_cache(torch::stable::Tensor& key,
+                               torch::stable::Tensor& value,
+                               torch::stable::Tensor& kv_cache,
+                               torch::stable::Tensor& slot_mapping,
+                               int64_t codec_token_block,
+                               int64_t codec_dim_block,
+                               int64_t alloc_block_tokens);
+
+void byte_v2_update_cache_single_token(torch::stable::Tensor& key,
+                                       torch::stable::Tensor& value,
+                                       torch::stable::Tensor& kv_cache,
+                                       torch::stable::Tensor& slot_mapping,
+                                       int64_t codec_token_block,
+                                       int64_t codec_dim_block,
+                                       int64_t alloc_block_tokens);
+
+void byte_v2_append_raw_staging(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& block_to_staging_slot, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens);
+
+void byte_v2_prepare_raw_staging(
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow, int64_t alloc_block_tokens);
+
+void byte_v2_hydrate_raw_staging_from_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens);
+
+void byte_v2_release_raw_staging(
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow);
+
+void byte_v2_commit_raw_staging_to_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens);
+
+void byte_v2_collect_cache_stats(torch::stable::Tensor& stats,
+                                 torch::stable::Tensor& kv_cache,
+                                 torch::stable::Tensor& block_tables,
+                                 torch::stable::Tensor& seq_lens,
+                                 int64_t max_seq_len,
+                                 const std::vector<int64_t>& tile_policy);
+
+void byte_v2_update_cache_unsafe_flags(torch::stable::Tensor& page_unsafe_flags,
+                                       torch::stable::Tensor& kv_cache,
+                                       torch::stable::Tensor& slot_mapping,
+                                       const std::vector<int64_t>& tile_policy);
+
+void byte_v2_paged_decode_attention_split_k_guarded(
+    torch::stable::Tensor& output, torch::stable::Tensor& exp_sums,
+    torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& page_unsafe_flags,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
+    double scale, int64_t num_kv_heads, int64_t block_size, int64_t max_seq_len,
+    int64_t partition_size, const std::vector<int64_t>& tile_policy);
 
 void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           torch::stable::Tensor& k_pe,

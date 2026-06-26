@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.attention.backends.byte_v2_layout import ByteV2TilePolicy
 
 logger = init_logger(__name__)
 
@@ -347,6 +348,124 @@ class TQFullAttentionSpec(FullAttentionSpec):
             "All TQ layers in the same KV cache group must use the same tq_slot_size."
         )
         return replace(merged, tq_slot_size=specs[0].tq_slot_size)
+
+
+def _default_byte_v2_tile_policy() -> ByteV2TilePolicy:
+    from vllm.v1.attention.backends.byte_v2_layout import (
+        byte_v2_tile_policy_from_env,
+    )
+
+    return byte_v2_tile_policy_from_env()
+
+
+@dataclass(frozen=True, kw_only=True)
+class ByteV2FullAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec with ByteV2 byte-page layout sizing.
+
+    ByteV2 stores compressed K/V payloads plus per-page metadata in a custom
+    byte layout. The raw KV allocation therefore uses ``torch.uint8`` and the
+    page size comes from ``ByteV2PageLayoutV4`` instead of the normal
+    ``head_size * dtype`` formula.
+    """
+
+    tile_policy: ByteV2TilePolicy = field(default_factory=_default_byte_v2_tile_policy)
+    codec_low_bytes_per_elem: int = 1
+    codec_exponent_code_bits: int = 4
+    page_header_bytes: int = 128
+    kv_head_meta_bytes: int = 64
+    alignment_bytes: int = 128
+    outlier_value_bits: int = 8
+    outlier_entries_per_tile: int = 256
+    include_raw_payload: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.dtype != torch.uint8:
+            raise ValueError("ByteV2FullAttentionSpec requires dtype=torch.uint8")
+        if self.kv_quant_mode != KVQuantMode.NONE:
+            raise ValueError("ByteV2FullAttentionSpec does not use vLLM KVQuantMode")
+        if self.head_size_v != self.head_size:
+            raise ValueError("ByteV2 currently requires head_size_v == head_size")
+        object.__setattr__(
+            self,
+            "tile_policy",
+            self.tile_policy.with_updates(
+                alloc_block_tokens=self.block_size,
+                head_dim=self.head_size,
+                head_dim_v=self.head_size_v,
+            ),
+        )
+
+    def _page_layout(self):
+        from vllm.v1.attention.backends.byte_v2_layout import (
+            ByteV2CodecPayloadPolicy,
+            ByteV2PageLayoutV4,
+        )
+
+        return ByteV2PageLayoutV4(
+            tile_policy=self.tile_policy,
+            codec_payload_policy=ByteV2CodecPayloadPolicy(
+                low_bytes_per_elem=self.codec_low_bytes_per_elem,
+                exponent_code_bits=self.codec_exponent_code_bits,
+            ),
+            num_kv_heads=self.num_kv_heads,
+            page_header_bytes=self.page_header_bytes,
+            kv_head_meta_bytes=self.kv_head_meta_bytes,
+            alignment_bytes=self.alignment_bytes,
+            outlier_value_bits=self.outlier_value_bits,
+            outlier_entries_per_tile=self.outlier_entries_per_tile,
+            include_raw_payload=self.include_raw_payload,
+        )
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self._page_layout().page_size_bytes
+
+    def copy_with_new_block_size(self, block_size: int) -> Self:
+        return replace(
+            self,
+            block_size=block_size,
+            tile_policy=self.tile_policy.with_updates(alloc_block_tokens=block_size),
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        first = specs[0]
+        assert all(isinstance(s, ByteV2FullAttentionSpec) for s in specs), (
+            "All ByteV2 layers in the same KV cache group must use "
+            "ByteV2FullAttentionSpec."
+        )
+        for spec in specs[1:]:
+            assert spec.tile_policy == first.tile_policy, (
+                "All ByteV2 layers in the same KV cache group must use the "
+                "same tile policy."
+            )
+            assert (
+                spec.codec_low_bytes_per_elem == first.codec_low_bytes_per_elem
+                and spec.codec_exponent_code_bits == first.codec_exponent_code_bits
+                and spec.page_header_bytes == first.page_header_bytes
+                and spec.kv_head_meta_bytes == first.kv_head_meta_bytes
+                and spec.alignment_bytes == first.alignment_bytes
+                and spec.outlier_value_bits == first.outlier_value_bits
+                and spec.outlier_entries_per_tile == first.outlier_entries_per_tile
+                and spec.include_raw_payload == first.include_raw_payload
+            ), (
+                "All ByteV2 layers in the same KV cache group must use the "
+                "same page layout policy."
+            )
+        return replace(
+            merged,
+            tile_policy=first.tile_policy,
+            codec_low_bytes_per_elem=first.codec_low_bytes_per_elem,
+            codec_exponent_code_bits=first.codec_exponent_code_bits,
+            page_header_bytes=first.page_header_bytes,
+            kv_head_meta_bytes=first.kv_head_meta_bytes,
+            alignment_bytes=first.alignment_bytes,
+            outlier_value_bits=first.outlier_value_bits,
+            outlier_entries_per_tile=first.outlier_entries_per_tile,
+            include_raw_payload=first.include_raw_payload,
+        )
 
 
 @dataclass(frozen=True, kw_only=True)

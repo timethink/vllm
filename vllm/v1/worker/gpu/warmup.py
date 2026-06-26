@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -8,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -17,6 +19,20 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+logger = init_logger(__name__)
+
+
+def _byte_v2_debug_enabled() -> bool:
+    return bool(
+        os.environ.get("BYTE_V2_DEBUG_WARMUP")
+        or os.environ.get("VLLM_BYTE_V2_DEBUG_WARMUP")
+    )
+
+
+def _byte_v2_debug(message: str, *args: object) -> None:
+    if _byte_v2_debug_enabled():
+        logger.warning("[ByteV2 warmup] %s", message % args if args else message)
 
 
 @torch.inference_mode()
@@ -44,6 +60,12 @@ def warmup_kernels(
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
+    _byte_v2_debug(
+        "start num_spec_steps=%s prompt_len=%s num_kv_cache_groups=%s",
+        num_spec_steps,
+        prompt_len,
+        num_kv_cache_groups,
+    )
 
     # Compute per-request block counts for each KV cache group.
     group_block_sizes = [g.kv_cache_spec.block_size for g in kv_cache_groups]
@@ -60,6 +82,12 @@ def warmup_kernels(
         // max(prompt_len, 1 + num_spec_steps),
         # Reserve block 0 (null block) and ensure we have enough blocks.
         max(1, (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req),
+    )
+    _byte_v2_debug(
+        "resolved num_reqs=%s num_blocks=%s max_blocks_per_req=%s",
+        num_reqs,
+        model_runner.kv_cache_config.num_blocks,
+        max_blocks_per_req,
     )
 
     req_ids = [f"_warmup_{i}_" for i in range(num_reqs)]
@@ -97,7 +125,9 @@ def warmup_kernels(
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
+    _byte_v2_debug("prefill execute start")
     worker_execute_model(prefill_output)
+    _byte_v2_debug("prefill execute done")
 
     if not model_runner.is_pooling_model:
         # Warm up sampler and perform a decode step for non-pooling models.
@@ -115,7 +145,9 @@ def warmup_kernels(
                 structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
             )
 
+        _byte_v2_debug("prefill sample start")
         worker_sample_tokens(grammar_output)
+        _byte_v2_debug("prefill sample done")
 
         # Step 2: Decode all requests with 1 + num_spec_steps tokens each.
         cached_req_data = CachedRequestData.make_empty()
@@ -142,12 +174,19 @@ def warmup_kernels(
         )
         decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
 
+        _byte_v2_debug("decode execute start")
         worker_execute_model(decode_output)
+        _byte_v2_debug("decode execute done")
+        _byte_v2_debug("decode sample start")
         worker_sample_tokens(None)
+        _byte_v2_debug("decode sample done")
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
+    _byte_v2_debug("cleanup execute start")
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
+    _byte_v2_debug("synchronize start")
     torch.accelerator.synchronize()
+    _byte_v2_debug("done")

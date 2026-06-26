@@ -39,6 +39,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
@@ -569,6 +570,16 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        if self.attn_backend.get_name() == "BYTE_V2":
+            if self.sliding_window is not None:
+                raise ValueError("ByteV2 does not support sliding window attention.")
+            return ByteV2FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=torch.uint8,
+            )
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
