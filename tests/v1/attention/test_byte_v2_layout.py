@@ -160,7 +160,7 @@ def _decode_current_byte_v2_payload(
             ),
         ]
     )
-    high = base + code
+    high = ((code >> 3) << 7) | (base + (code & 0x07))
 
     outlier_mask = _load_u32_bytes(
         cache,

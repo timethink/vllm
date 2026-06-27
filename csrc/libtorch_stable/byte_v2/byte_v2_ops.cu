@@ -313,16 +313,35 @@ bool byte_v2_use_gqa_fa2_direct(const std::vector<int64_t>& tile_policy) {
 }
 
 __device__ __forceinline__ uint8_t byte_v2_code_nibble(uint16_t bits) {
-  // Phase-1 provisional codec: preserve the low byte and retain a compact
-  // 4-bit code from the high byte. The no-outlier decode kernel will consume
-  // this through the V4 layout helpers, so the wire-format arithmetic is
-  // already fixed even while the numerical codec remains intentionally simple.
-  return static_cast<uint8_t>((bits >> 8) & 0x0f);
+  const uint8_t high = static_cast<uint8_t>(bits >> 8);
+  const uint8_t sign = static_cast<uint8_t>(high >> 7);
+  const uint8_t high7 = static_cast<uint8_t>(high & 0x7f);
+  return static_cast<uint8_t>((sign << 3) | (high7 & 0x07));
 }
 
 __device__ __forceinline__ uint8_t byte_v2_delta_code_nibble(uint16_t bits,
                                                              int base) {
-  return static_cast<uint8_t>(((bits >> 8) - base) & 0x0f);
+  const uint8_t high = static_cast<uint8_t>(bits >> 8);
+  const uint8_t sign = static_cast<uint8_t>(high >> 7);
+  const uint8_t high7 = static_cast<uint8_t>(high & 0x7f);
+  return static_cast<uint8_t>((sign << 3) | ((high7 - base) & 0x07));
+}
+
+__device__ __forceinline__ uint8_t byte_v2_high7(uint16_t bits) {
+  return static_cast<uint8_t>((bits >> 8) & 0x7f);
+}
+
+__device__ __forceinline__ uint8_t
+byte_v2_high_byte_from_base_and_code(uint8_t base, uint8_t code) {
+  const uint8_t sign = static_cast<uint8_t>(code >> 3);
+  const uint8_t delta = static_cast<uint8_t>(code & 0x07);
+  return static_cast<uint8_t>((sign << 7) | (base + delta));
+}
+
+__device__ __forceinline__ bool byte_v2_high7_in_window(uint16_t bits,
+                                                        int base) {
+  const int high7 = static_cast<int>(byte_v2_high7(bits));
+  return high7 >= base && high7 < base + 8;
 }
 
 __device__ __forceinline__ float byte_v2_bf16_bits_to_float(uint16_t bits) {
@@ -467,7 +486,7 @@ __device__ __forceinline__ float byte_v2_load_payload_elem(
   const uint8_t base =
       IsValue ? page[Layout::v_base_offset(kv_head, dim_tile, token_tile)]
               : page[Layout::k_base_offset(kv_head, dim_tile, token_tile)];
-  uint8_t high = base + code;
+  uint8_t high = byte_v2_high_byte_from_base_and_code(base, code);
 
   const uint32_t outlier_mask =
       IsValue
@@ -545,7 +564,7 @@ byte_v2_load_payload_elem_no_fallback_no_outlier_bits(
   const uint8_t base =
       IsValue ? page[Layout::v_base_offset(kv_head, dim_tile, token_tile)]
               : page[Layout::k_base_offset(kv_head, dim_tile, token_tile)];
-  const uint8_t high = base + code;
+  const uint8_t high = byte_v2_high_byte_from_base_and_code(base, code);
 
   return (static_cast<uint16_t>(high) << 8) | low;
 }
@@ -565,8 +584,10 @@ byte_v2_load_k_payload_elem_pair_from_fixed_tile_no_outlier_bits(
       byte_v2_load_aligned_u16(page, tile_offset + elem_idx);
   const uint8_t packed_code =
       page[tile_offset + kCodecTileElems + elem_idx / 2];
-  const uint8_t high0 = base + (packed_code & 0x0f);
-  const uint8_t high1 = base + (packed_code >> 4);
+  const uint8_t high0 =
+      byte_v2_high_byte_from_base_and_code(base, packed_code & 0x0f);
+  const uint8_t high1 =
+      byte_v2_high_byte_from_base_and_code(base, packed_code >> 4);
 
   bits0 = (static_cast<uint16_t>(high0) << 8) | (low_pair & 0x00ff);
   bits1 = (static_cast<uint16_t>(high1) << 8) | (low_pair >> 8);
@@ -712,7 +733,7 @@ __device__ __forceinline__ float byte_v2_load_payload_elem_from_tile_descriptor(
       desc.page[desc.payload_offset + kCodecTileElems + elem_idx / 2];
   const uint8_t code =
       (elem_idx & 1) ? (packed_code >> 4) : (packed_code & 0x0f);
-  uint8_t high = desc.base + code;
+  uint8_t high = byte_v2_high_byte_from_base_and_code(desc.base, code);
 
   if (desc.outlier_hit) {
     if (desc.outlier_count == Layout::OutlierEntriesPerTileValue - 1 ||
@@ -763,7 +784,7 @@ byte_v2_load_payload_elem_from_safe_tile_descriptor_fixed_dim_bits(
       desc.page[desc.payload_offset + kCodecTileElems + code_offset];
   const uint8_t code =
       (dim_in_tile & 1) ? (packed_code >> 4) : (packed_code & 0x0f);
-  const uint8_t high = desc.base + code;
+  const uint8_t high = byte_v2_high_byte_from_base_and_code(desc.base, code);
   return (static_cast<uint16_t>(high) << 8) | low;
 }
 
@@ -785,8 +806,10 @@ byte_v2_load_payload_elem_pair_from_safe_tile_descriptor_fixed_dim_bits(
       byte_v2_load_aligned_u16(desc.page, desc.payload_offset + low_offset);
   const uint8_t packed_code =
       desc.page[desc.payload_offset + kCodecTileElems + code_offset];
-  const uint8_t high0 = desc.base + (packed_code & 0x0f);
-  const uint8_t high1 = desc.base + (packed_code >> 4);
+  const uint8_t high0 =
+      byte_v2_high_byte_from_base_and_code(desc.base, packed_code & 0x0f);
+  const uint8_t high1 =
+      byte_v2_high_byte_from_base_and_code(desc.base, packed_code >> 4);
 
   bits0 = (static_cast<uint16_t>(high0) << 8) | (low_pair & 0x00ff);
   bits1 = (static_cast<uint16_t>(high1) << 8) | (low_pair >> 8);
@@ -801,8 +824,10 @@ byte_v2_make_payload_bits_from_low_and_codes(uint64_t low_chunk,
   static_assert(CodeElem >= 0 && CodeElem < 16);
   const uint16_t low =
       static_cast<uint16_t>((low_chunk >> (LowElem * 8)) & 0xffULL);
-  const uint16_t high = static_cast<uint16_t>(
-      base + ((packed_codes >> (CodeElem * 4)) & 0x0fULL));
+  const uint8_t code =
+      static_cast<uint8_t>((packed_codes >> (CodeElem * 4)) & 0x0fULL);
+  const uint16_t high =
+      static_cast<uint16_t>(byte_v2_high_byte_from_base_and_code(base, code));
   return static_cast<uint16_t>((high << 8) | low);
 }
 
@@ -864,6 +889,100 @@ byte_v2_load_payload_elem_hex_from_safe_tile_descriptor_fixed_dim_bits(
       low1, packed_codes, desc.base);
   bits15 = byte_v2_make_payload_bits_from_low_and_codes<7, 15>(
       low1, packed_codes, desc.base);
+}
+
+template <typename Layout>
+__device__ __forceinline__ uint16_t
+byte_v2_outlier_high_bits_from_entry(uint16_t entry) {
+  const uint16_t high = static_cast<uint16_t>(
+      Layout::OutlierEntryPolicy::decode_value_bits(entry));
+  return static_cast<uint16_t>(high << 8);
+}
+
+template <typename Layout>
+__device__ __forceinline__ void
+byte_v2_patch_payload_elem_hex_outliers_from_tile_descriptor_bits(
+    const ByteV2PayloadTileDescriptor<Layout>& desc, int row,
+    int dim_in_tile_hex, uint16_t& bits0, uint16_t& bits1, uint16_t& bits2,
+    uint16_t& bits3, uint16_t& bits4, uint16_t& bits5, uint16_t& bits6,
+    uint16_t& bits7, uint16_t& bits8, uint16_t& bits9, uint16_t& bits10,
+    uint16_t& bits11, uint16_t& bits12, uint16_t& bits13, uint16_t& bits14,
+    uint16_t& bits15) {
+  using Policy = typename Layout::TilePolicy;
+  static_assert(Policy::AllocBlockTokens == Policy::CodecTokenBlock);
+  static_assert(Policy::CodecDimBlock % 16 == 0);
+
+  constexpr int kCodecDimBlock = Policy::CodecDimBlock;
+  const int elem_start = row * kCodecDimBlock + dim_in_tile_hex;
+  const int elem_end = elem_start + 16;
+
+  // Cache writers append outlier entries in elem_idx order.
+#pragma unroll 1
+  for (int entry_idx = 0; entry_idx < desc.outlier_count; ++entry_idx) {
+    const uint16_t entry = byte_v2_load_u16_bytes(
+        desc.page,
+        desc.outlier_payload_offset + entry_idx * Layout::OutlierEntryBytes);
+    const int elem_idx =
+        static_cast<int>(Layout::OutlierEntryPolicy::decode_elem_index(entry));
+    if (elem_idx < elem_start) {
+      continue;
+    }
+    if (elem_idx >= elem_end) {
+      break;
+    }
+    const uint16_t patched =
+        byte_v2_outlier_high_bits_from_entry<Layout>(entry);
+    switch (elem_idx - elem_start) {
+      case 0:
+        bits0 = static_cast<uint16_t>((patched & 0xff00) | (bits0 & 0x00ff));
+        break;
+      case 1:
+        bits1 = static_cast<uint16_t>((patched & 0xff00) | (bits1 & 0x00ff));
+        break;
+      case 2:
+        bits2 = static_cast<uint16_t>((patched & 0xff00) | (bits2 & 0x00ff));
+        break;
+      case 3:
+        bits3 = static_cast<uint16_t>((patched & 0xff00) | (bits3 & 0x00ff));
+        break;
+      case 4:
+        bits4 = static_cast<uint16_t>((patched & 0xff00) | (bits4 & 0x00ff));
+        break;
+      case 5:
+        bits5 = static_cast<uint16_t>((patched & 0xff00) | (bits5 & 0x00ff));
+        break;
+      case 6:
+        bits6 = static_cast<uint16_t>((patched & 0xff00) | (bits6 & 0x00ff));
+        break;
+      case 7:
+        bits7 = static_cast<uint16_t>((patched & 0xff00) | (bits7 & 0x00ff));
+        break;
+      case 8:
+        bits8 = static_cast<uint16_t>((patched & 0xff00) | (bits8 & 0x00ff));
+        break;
+      case 9:
+        bits9 = static_cast<uint16_t>((patched & 0xff00) | (bits9 & 0x00ff));
+        break;
+      case 10:
+        bits10 = static_cast<uint16_t>((patched & 0xff00) | (bits10 & 0x00ff));
+        break;
+      case 11:
+        bits11 = static_cast<uint16_t>((patched & 0xff00) | (bits11 & 0x00ff));
+        break;
+      case 12:
+        bits12 = static_cast<uint16_t>((patched & 0xff00) | (bits12 & 0x00ff));
+        break;
+      case 13:
+        bits13 = static_cast<uint16_t>((patched & 0xff00) | (bits13 & 0x00ff));
+        break;
+      case 14:
+        bits14 = static_cast<uint16_t>((patched & 0xff00) | (bits14 & 0x00ff));
+        break;
+      default:
+        bits15 = static_cast<uint16_t>((patched & 0xff00) | (bits15 & 0x00ff));
+        break;
+    }
+  }
 }
 
 __device__ __forceinline__ uint4 byte_v2_pack_8_bf16_bits(
@@ -1944,20 +2063,99 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
           page_is_unsafe = page_unsafe_flags[physical_block] != 0;
         }
         if (page_is_unsafe) {
+          constexpr int kDimHexes = Policy::HeadDim / 16;
+          static_assert(Policy::HeadDim % 16 == 0);
+          static_assert(Policy::CodecDimBlock == 16);
+          static_assert((kDimHexes & (kDimHexes - 1)) == 0);
+          static_assert(NumThreads % kDimHexes == 0);
+          const int dim_hex = threadIdx.x & (kDimHexes - 1);
+          const int q_dim = dim_hex * 16;
+          const int dim_tile = q_dim / Policy::CodecDimBlock;
+          const int dim_in_tile = q_dim % Policy::CodecDimBlock;
+          const auto k_desc0 =
+              byte_v2_make_payload_tile_descriptor<Layout, false>(
+                  page, k_payload_base_offset, kv_head_idx, dim_tile, true);
+          const auto v_desc0 =
+              byte_v2_make_payload_tile_descriptor<Layout, true>(
+                  page, v_payload_base_offset, kv_head_idx, dim_tile, true);
 #pragma unroll 1
-          for (int elem = threadIdx.x; elem < staged_rows * Policy::HeadDim;
-               elem += NumThreads) {
-            const int row_rel = elem / Policy::HeadDim;
-            const int q_dim = elem - row_rel * Policy::HeadDim;
+          for (int row_rel = threadIdx.x / kDimHexes; row_rel < staged_rows;
+               row_rel += NumThreads / kDimHexes) {
             const int row = row_start + row_rel;
             const int32_t tile_offset =
                 block_token_start + row - direct_tile_start;
-            const float k_value = byte_v2_load_payload_elem<Layout, false>(
-                page, k_payload_base_offset, kv_head_idx, row, q_dim);
-            const float v_value = byte_v2_load_payload_elem<Layout, true>(
-                page, v_payload_base_offset, kv_head_idx, row, q_dim);
-            sK(tile_offset, q_dim) = byte_v2_float_to_cutlass_bfloat16(k_value);
-            sV(tile_offset, q_dim) = byte_v2_float_to_cutlass_bfloat16(v_value);
+            uint16_t bits0;
+            uint16_t bits1;
+            uint16_t bits2;
+            uint16_t bits3;
+            uint16_t bits4;
+            uint16_t bits5;
+            uint16_t bits6;
+            uint16_t bits7;
+            uint16_t bits8;
+            uint16_t bits9;
+            uint16_t bits10;
+            uint16_t bits11;
+            uint16_t bits12;
+            uint16_t bits13;
+            uint16_t bits14;
+            uint16_t bits15;
+            if (k_desc0.fallback_hit) {
+#pragma unroll
+              for (int col = 0; col < 16; ++col) {
+                const int dim = q_dim + col;
+                const float k_value =
+                    byte_v2_load_payload_elem_from_tile_descriptor<Layout,
+                                                                   false>(
+                        k_desc0, kv_head_idx, row, dim, dim_in_tile + col);
+                sK(tile_offset, dim) =
+                    byte_v2_float_to_cutlass_bfloat16(k_value);
+              }
+            } else {
+              byte_v2_load_payload_elem_hex_from_safe_tile_descriptor_fixed_dim_bits<
+                  Layout>(k_desc0, row, dim_in_tile, bits0, bits1, bits2, bits3,
+                          bits4, bits5, bits6, bits7, bits8, bits9, bits10,
+                          bits11, bits12, bits13, bits14, bits15);
+              if (k_desc0.outlier_hit) {
+                byte_v2_patch_payload_elem_hex_outliers_from_tile_descriptor_bits<
+                    Layout>(k_desc0, row, dim_in_tile, bits0, bits1, bits2,
+                            bits3, bits4, bits5, bits6, bits7, bits8, bits9,
+                            bits10, bits11, bits12, bits13, bits14, bits15);
+              }
+              byte_v2_store_16_bf16_bits_to_smem(
+                  &shared_k_cute[0],
+                  typename CuteDirectQkTraits::SmemLayoutKV{}, tile_offset,
+                  q_dim, bits0, bits1, bits2, bits3, bits4, bits5, bits6, bits7,
+                  bits8, bits9, bits10, bits11, bits12, bits13, bits14, bits15);
+            }
+            if (v_desc0.fallback_hit) {
+#pragma unroll
+              for (int col = 0; col < 16; ++col) {
+                const int dim = q_dim + col;
+                const float v_value =
+                    byte_v2_load_payload_elem_from_tile_descriptor<Layout,
+                                                                   true>(
+                        v_desc0, kv_head_idx, row, dim, dim_in_tile + col);
+                sV(tile_offset, dim) =
+                    byte_v2_float_to_cutlass_bfloat16(v_value);
+              }
+            } else {
+              byte_v2_load_payload_elem_hex_from_safe_tile_descriptor_fixed_dim_bits<
+                  Layout>(v_desc0, row, dim_in_tile, bits0, bits1, bits2, bits3,
+                          bits4, bits5, bits6, bits7, bits8, bits9, bits10,
+                          bits11, bits12, bits13, bits14, bits15);
+              if (v_desc0.outlier_hit) {
+                byte_v2_patch_payload_elem_hex_outliers_from_tile_descriptor_bits<
+                    Layout>(v_desc0, row, dim_in_tile, bits0, bits1, bits2,
+                            bits3, bits4, bits5, bits6, bits7, bits8, bits9,
+                            bits10, bits11, bits12, bits13, bits14, bits15);
+              }
+              byte_v2_store_16_bf16_bits_to_smem(
+                  &shared_v_full[0],
+                  typename CuteDirectPvTraits::SmemLayoutKV{}, tile_offset,
+                  q_dim, bits0, bits1, bits2, bits3, bits4, bits5, bits6, bits7,
+                  bits8, bits9, bits10, bits11, bits12, bits13, bits14, bits15);
+            }
           }
         } else {
           constexpr int kDimHexes = Policy::HeadDim / 16;
@@ -3642,8 +3840,8 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
   __shared__ int shared_fallback;
 
   if (threadIdx.x == 0) {
-    int high_counts[256];
-    for (int i = 0; i < 256; ++i) {
+    int high_counts[128];
+    for (int i = 0; i < 128; ++i) {
       high_counts[i] = 0;
     }
     int elem_count = 0;
@@ -3667,17 +3865,16 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
       for (int dim_offset = 0; dim_offset < kCodecDimBlock; ++dim_offset) {
         const int dim = dim_tile * kCodecDimBlock + dim_offset;
         const uint16_t bits = src[row_src_base + dim * stride_dim];
-        const int high = static_cast<int>(bits >> 8);
-        ++high_counts[high];
+        ++high_counts[byte_v2_high7(bits)];
         ++elem_count;
       }
     }
     if (first_valid_physical_block >= 0) {
       int best_base = 0;
       int best_count = -1;
-      for (int base = 0; base <= 240; ++base) {
+      for (int base = 0; base <= 120; ++base) {
         int window_count = 0;
-        for (int delta = 0; delta < 16; ++delta) {
+        for (int delta = 0; delta < 8; ++delta) {
           window_count += high_counts[base + delta];
         }
         if (window_count > best_count) {
@@ -3751,7 +3948,7 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
             const int dim = dim_tile * kCodecDimBlock + dim_offset;
             const uint16_t bits = src[row_src_base + dim * stride_dim];
             const int high = static_cast<int>(bits >> 8);
-            if (high >= best_base && high < best_base + 16) {
+            if (byte_v2_high7_in_window(bits, best_base)) {
               continue;
             }
             const int elem_idx = row_in_tile * kCodecDimBlock + dim_offset;
@@ -4099,8 +4296,8 @@ __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
   __shared__ int shared_fallback;
 
   if (threadIdx.x == 0) {
-    int high_counts[256];
-    for (int i = 0; i < 256; ++i) {
+    int high_counts[128];
+    for (int i = 0; i < 128; ++i) {
       high_counts[i] = 0;
     }
     int elem_count = 0;
@@ -4115,16 +4312,15 @@ __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
                 : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row,
                                                               dim);
         const uint16_t bits = byte_v2_load_u16_bytes(staging, offset);
-        const int high = static_cast<int>(bits >> 8);
-        ++high_counts[high];
+        ++high_counts[byte_v2_high7(bits)];
         ++elem_count;
       }
     }
     int best_base = 0;
     int best_count = -1;
-    for (int base = 0; base <= 240; ++base) {
+    for (int base = 0; base <= 120; ++base) {
       int window_count = 0;
-      for (int delta = 0; delta < 16; ++delta) {
+      for (int delta = 0; delta < 8; ++delta) {
         window_count += high_counts[base + delta];
       }
       if (window_count > best_count) {
@@ -4189,7 +4385,7 @@ __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
                                  head_idx, row, dim);
           const uint16_t bits = byte_v2_load_u16_bytes(staging, offset);
           const int high = static_cast<int>(bits >> 8);
-          if (high >= best_base && high < best_base + 16) {
+          if (byte_v2_high7_in_window(bits, best_base)) {
             continue;
           }
           const int elem_idx = row * kCodecDimBlock + dim_offset;
@@ -4420,9 +4616,28 @@ __global__ void byte_v2_update_cache_single_token_kernel(
     int outlier_count;
     uint32_t previous_outlier_mask = 0;
     if (update_row == 0) {
-      const int first_dim = dim_tile * kCodecDimBlock;
-      const uint16_t first_bits = src[src_base + first_dim * stride_dim];
-      base = min(static_cast<int>(first_bits >> 8), 240);
+      int high_counts[128];
+      for (int i = 0; i < 128; ++i) {
+        high_counts[i] = 0;
+      }
+      for (int dim_offset = 0; dim_offset < kCodecDimBlock; ++dim_offset) {
+        const int dim = dim_tile * kCodecDimBlock + dim_offset;
+        const uint16_t bits = src[src_base + dim * stride_dim];
+        ++high_counts[byte_v2_high7(bits)];
+      }
+      int best_base = 0;
+      int best_count = -1;
+      for (int candidate_base = 0; candidate_base <= 120; ++candidate_base) {
+        int window_count = 0;
+        for (int delta = 0; delta < 8; ++delta) {
+          window_count += high_counts[candidate_base + delta];
+        }
+        if (window_count > best_count) {
+          best_count = window_count;
+          best_base = candidate_base;
+        }
+      }
+      base = best_base;
       outlier_count = 0;
       page[base_offset] = static_cast<uint8_t>(base);
     } else {
@@ -4448,7 +4663,7 @@ __global__ void byte_v2_update_cache_single_token_kernel(
 
     for (int dim_offset = 0; dim_offset < kCodecDimBlock; ++dim_offset) {
       const int high = row_highs[dim_offset];
-      if (high >= base && high < base + 16) {
+      if ((high & 0x7f) >= base && (high & 0x7f) < base + 8) {
         continue;
       }
       if (outlier_count < ByteV2DefaultLayout::OutlierEntriesPerTileValue) {

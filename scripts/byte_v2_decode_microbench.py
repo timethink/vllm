@@ -57,6 +57,14 @@ def parse_args() -> argparse.Namespace:
         help="Construct ByteV2 inputs whose codec tiles do not need outliers.",
     )
     parser.add_argument(
+        "--force-outlier-inputs",
+        action="store_true",
+        help=(
+            "Construct inputs that exercise ByteV2 outlier overlays even when "
+            "--assume-no-outlier is set for guarded fast-path dispatch."
+        ),
+    )
+    parser.add_argument(
         "--assume-no-outlier",
         action="store_true",
         help=(
@@ -196,7 +204,9 @@ def _make_inputs(args: argparse.Namespace, seq_len: int) -> dict[str, Any]:
         dtype=torch.float32,
         device=device,
     )
-    use_no_outlier_inputs = args.no_outlier_inputs or args.assume_no_outlier
+    use_no_outlier_inputs = (
+        args.no_outlier_inputs or args.assume_no_outlier
+    ) and not args.force_outlier_inputs
     key_values = (
         ((token_base % 255) + 1) / 1024
         if use_no_outlier_inputs
@@ -636,7 +646,9 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                 if partition_size is not None
                 else None,
                 "compute_block_n": compute_block_n,
-                "no_outlier_inputs": args.no_outlier_inputs or args.assume_no_outlier,
+                "no_outlier_inputs": (args.no_outlier_inputs or args.assume_no_outlier)
+                and not args.force_outlier_inputs,
+                "force_outlier_inputs": args.force_outlier_inputs,
                 "assume_no_outlier": args.assume_no_outlier,
                 "gqa_packed": args.gqa_packed,
                 "gqa_fa2_like": args.gqa_fa2_like,
@@ -662,7 +674,9 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                 "block_size": args.block_size,
                 "partition_size": partition_size,
                 "compute_block_n": compute_block_n,
-                "no_outlier_inputs": args.no_outlier_inputs or args.assume_no_outlier,
+                "no_outlier_inputs": (args.no_outlier_inputs or args.assume_no_outlier)
+                and not args.force_outlier_inputs,
+                "force_outlier_inputs": args.force_outlier_inputs,
                 "assume_no_outlier": args.assume_no_outlier,
                 "gqa_packed": args.gqa_packed,
                 "gqa_fa2_like": args.gqa_fa2_like,
@@ -691,9 +705,9 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
     print(
         "seq_len,name,median_ms,mean_ms,min_ms,p90_ms,partition_size,"
         "num_partitions,compute_block_n,no_outlier_inputs,"
-        "assume_no_outlier,gqa_packed,gqa_fa2_like,gqa_fa2_qk_mma,"
-        "gqa_fa2_mainloop,gqa_fa2_multiwarp,gqa_fa2_direct,guarded_split,"
-        "workspace_mib,"
+        "force_outlier_inputs,assume_no_outlier,gqa_packed,gqa_fa2_like,"
+        "gqa_fa2_qk_mma,gqa_fa2_mainloop,gqa_fa2_multiwarp,gqa_fa2_direct,"
+        "guarded_split,workspace_mib,"
         "max_abs_diff_vs_first,error"
     )
     for row in rows:
@@ -704,6 +718,7 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
             f"{row.get('partition_size', '')},{row.get('num_partitions', '')},"
             f"{row.get('compute_block_n', '')},"
             f"{row.get('no_outlier_inputs', '')},"
+            f"{row.get('force_outlier_inputs', '')},"
             f"{row.get('assume_no_outlier', '')},"
             f"{row.get('gqa_packed', '')},"
             f"{row.get('gqa_fa2_like', '')},"
@@ -725,6 +740,8 @@ def main() -> None:
     args = parse_args()
     if args.gqa_packed and not args.assume_no_outlier:
         raise ValueError("--gqa-packed requires --assume-no-outlier")
+    if args.force_outlier_inputs and args.no_outlier_inputs:
+        raise ValueError("--force-outlier-inputs conflicts with --no-outlier-inputs")
     if args.gqa_fa2_like and not args.gqa_packed:
         raise ValueError("--gqa-fa2-like requires --gqa-packed")
     if args.gqa_fa2_qk_mma and not args.gqa_fa2_like:

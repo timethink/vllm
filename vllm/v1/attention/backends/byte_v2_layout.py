@@ -151,7 +151,9 @@ def byte_v2_tile_policy_from_env(
 class ByteV2CodecPayloadPolicy:
     """Payload sizing for one codec subtile.
 
-    The default assumes one low byte per element and 4-bit exponent codes.
+    The default assumes one low byte per element and a 4-bit sign-aware high
+    code. The field name remains historical because this class only computes
+    payload byte sizes.
     """
 
     low_bytes_per_elem: int = 1
@@ -736,12 +738,12 @@ def _page_u32(page: Sequence[int], offset: int) -> int:
 
 
 def _best_high_byte_window_outliers(high_bytes: list[int]) -> int:
-    counts = [0] * 256
+    counts = [0] * 128
     for high_byte in high_bytes:
-        counts[high_byte] += 1
+        counts[high_byte & 0x7F] += 1
     best_in_window = 0
-    for base in range(241):
-        best_in_window = max(best_in_window, sum(counts[base : base + 16]))
+    for base in range(121):
+        best_in_window = max(best_in_window, sum(counts[base : base + 8]))
     return len(high_bytes) - best_in_window
 
 
