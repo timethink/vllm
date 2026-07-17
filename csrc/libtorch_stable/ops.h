@@ -510,13 +510,25 @@ void byte_v2_reshape_and_cache(torch::stable::Tensor& key,
                                int64_t codec_dim_block,
                                int64_t alloc_block_tokens);
 
-void byte_v2_update_cache_single_token(torch::stable::Tensor& key,
-                                       torch::stable::Tensor& value,
-                                       torch::stable::Tensor& kv_cache,
-                                       torch::stable::Tensor& slot_mapping,
-                                       int64_t codec_token_block,
-                                       int64_t codec_dim_block,
-                                       int64_t alloc_block_tokens);
+void byte_v2_reshape_and_cache_high_byte(torch::stable::Tensor& key,
+                                         torch::stable::Tensor& value,
+                                         torch::stable::Tensor& kv_cache,
+                                         torch::stable::Tensor& slot_mapping,
+                                         int64_t codec_token_block,
+                                         int64_t codec_dim_block,
+                                         int64_t alloc_block_tokens);
+
+void byte_v2_reshape_and_cache_sideband_high(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor& slot_mapping,
+    int64_t codec_token_block, int64_t codec_dim_block,
+    int64_t alloc_block_tokens);
+
+void byte_v2_update_cache_single_token(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& page_unsafe_flags, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens);
 
 void byte_v2_append_raw_staging(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
@@ -543,11 +555,29 @@ void byte_v2_release_raw_staging(
     torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
     torch::stable::Tensor& overflow);
 
+void byte_v2_release_raw_staging_and_update_flags(
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow, torch::stable::Tensor& page_unsafe_flags,
+    torch::stable::Tensor& kv_cache, const std::vector<int64_t>& tile_policy);
+
 void byte_v2_commit_raw_staging_to_cache(
     torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
     torch::stable::Tensor& staging_to_physical_block,
     torch::stable::Tensor& valid_rows, int64_t codec_token_block,
     int64_t codec_dim_block, int64_t alloc_block_tokens);
+
+void byte_v2_update_cache_raw_staging(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow, torch::stable::Tensor& page_unsafe_flags,
+    const std::vector<int64_t>& tile_policy, bool fuse_metadata_clear,
+    bool bypass_serial_metadata, bool warp_parallel_histogram);
 
 void byte_v2_collect_cache_stats(torch::stable::Tensor& stats,
                                  torch::stable::Tensor& kv_cache,
@@ -569,6 +599,25 @@ void byte_v2_paged_decode_attention_split_k_guarded(
     torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
     double scale, int64_t num_kv_heads, int64_t block_size, int64_t max_seq_len,
     int64_t partition_size, const std::vector<int64_t>& tile_policy);
+
+void byte_v2_speculative_verify_q4(
+    torch::stable::Tensor& output, torch::stable::Tensor& exp_sums,
+    torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& page_unsafe_flags,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
+    double scale, int64_t num_kv_heads, int64_t block_size, int64_t max_seq_len,
+    int64_t partition_size, const std::vector<int64_t>& tile_policy);
+
+void byte_v2_speculative_verify_gqa(
+    torch::stable::Tensor& output, torch::stable::Tensor& exp_sums,
+    torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& page_unsafe_flags,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
+    int64_t speculative_query_len, double scale, int64_t num_kv_heads,
+    int64_t block_size, int64_t max_seq_len, int64_t partition_size,
+    const std::vector<int64_t>& tile_policy);
 
 void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           torch::stable::Tensor& k_pe,

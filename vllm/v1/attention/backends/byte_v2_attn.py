@@ -30,7 +30,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.byte_v2_layout import (
     DEFAULT_BYTE_V2_TILE_POLICY,
-    ByteV2PageLayoutV4,
+    ByteV2PageLayoutV5,
     ByteV2RawStagingLayout,
     ByteV2TilePolicy,
     byte_v2_tile_policy_from_env,
@@ -47,13 +47,17 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_prefill_attention,
     byte_v2_prepare_raw_staging,
     byte_v2_release_raw_staging,
+    byte_v2_release_raw_staging_and_update_flags,
     byte_v2_reshape_and_cache,
+    byte_v2_speculative_verify_gqa,
+    byte_v2_update_cache_raw_staging,
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
 )
 
 _BYTE_V2_KERNELS_NOT_READY = "ByteV2 native CUDA kernels are not registered yet"
 _BYTE_V2_MAX_RAW_STAGING_TOKENS = 1024
+_BYTE_V2_UNNORMALIZED_PARTITION_OUTPUT_MODE = 27
 logger = init_logger(__name__)
 
 
@@ -104,6 +108,13 @@ def _decode_gqa_fa2_direct_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _decode_unnormalized_partition_output_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_DECODE_UNNORMALIZED_PARTITION_OUTPUT")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 def _decode_validate_no_outlier_enabled() -> bool:
     value = os.environ.get("BYTE_V2_DECODE_VALIDATE_NO_OUTLIER")
     if value is None:
@@ -118,10 +129,59 @@ def _decode_page_unsafe_flags_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _fused_staging_release_flags_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_FUSED_STAGING_RELEASE_FLAGS")
+    if value is None:
+        return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _native_raw_staging_update_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_NATIVE_RAW_STAGING_UPDATE")
+    if value is None:
+        return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _fused_commit_metadata_clear_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_FUSED_COMMIT_METADATA_CLEAR")
+    if value is None:
+        return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _warp_parallel_commit_histogram_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_WARP_PARALLEL_COMMIT_HISTOGRAM")
+    if value is None:
+        return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 def _decode_split_k_enabled() -> bool:
     value = os.environ.get("BYTE_V2_DECODE_SPLIT_K")
     if value is None:
         return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _speculative_verify_q4_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_SPECULATIVE_VERIFY_Q4")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _speculative_verify_gqa_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_SPECULATIVE_VERIFY_GQA")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _cached_prefix_q16_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_CACHED_PREFIX_Q16")
+    if value is None:
+        return False
     return value.lower() not in ("0", "false", "no", "off")
 
 
@@ -165,6 +225,7 @@ class ByteV2AttentionMetadata(AttentionMetadata):
     max_query_len: int
     query_start_loc: torch.Tensor
     query_start_loc_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor | None
     max_seq_len: int
     seq_lens: torch.Tensor
     block_table: torch.Tensor
@@ -212,6 +273,7 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu=getattr(common_attn_metadata, "_seq_lens_cpu", None),
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
@@ -275,7 +337,7 @@ class ByteV2AttentionBackend(AttentionBackend):
             head_dim=head_size,
             head_dim_v=head_size,
         )
-        layout = ByteV2PageLayoutV4(
+        layout = ByteV2PageLayoutV5(
             tile_policy=tile_policy,
             num_kv_heads=num_kv_heads,
         )
@@ -425,19 +487,53 @@ class ByteV2RawStagingManager:
         self.next_staging_slot.zero_()
         self.overflow.zero_()
 
-    def _release_allocator_state(self) -> None:
+    def _release_allocator_state(
+        self,
+        kv_cache: torch.Tensor | None = None,
+        page_unsafe_flags: torch.Tensor | None = None,
+        active_slot_capacity: int | None = None,
+    ) -> bool:
         assert self.block_to_staging_slot is not None
         assert self.staging_to_physical_block is not None
         assert self.valid_rows is not None
         assert self.next_staging_slot is not None
         assert self.overflow is not None
+        staging_to_physical_block = self.staging_to_physical_block
+        valid_rows = self.valid_rows
+        if active_slot_capacity is not None:
+            staging_to_physical_block = staging_to_physical_block[:active_slot_capacity]
+            valid_rows = valid_rows[:active_slot_capacity]
+        if (
+            kv_cache is not None
+            and page_unsafe_flags is not None
+            and _fused_staging_release_flags_enabled()
+        ):
+            byte_v2_release_raw_staging_and_update_flags(
+                self.block_to_staging_slot,
+                staging_to_physical_block,
+                valid_rows,
+                self.next_staging_slot,
+                self.overflow,
+                page_unsafe_flags,
+                kv_cache,
+                tile_policy=(
+                    self.tile_policy.codec_token_block,
+                    self.tile_policy.codec_dim_block,
+                    self.tile_policy.alloc_block_tokens,
+                    self.tile_policy.compute_block_n,
+                    self.tile_policy.head_dim,
+                    self.tile_policy.head_dim_v,
+                ),
+            )
+            return True
         byte_v2_release_raw_staging(
             self.block_to_staging_slot,
-            self.staging_to_physical_block,
-            self.valid_rows,
+            staging_to_physical_block,
+            valid_rows,
             self.next_staging_slot,
             self.overflow,
         )
+        return False
 
     def update(
         self,
@@ -446,9 +542,10 @@ class ByteV2RawStagingManager:
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
-    ) -> bool:
+        page_unsafe_flags: torch.Tensor | None = None,
+    ) -> tuple[bool, bool]:
         if slot_mapping.shape[0] == 0:
-            return True
+            return True, False
         if slot_mapping.shape[0] == 1 and slot_mapping.is_cuda:
             try:
                 byte_v2_update_cache_single_token(
@@ -456,17 +553,18 @@ class ByteV2RawStagingManager:
                     value,
                     kv_cache,
                     slot_mapping,
+                    page_unsafe_flags=page_unsafe_flags,
                     codec_token_block=self.tile_policy.codec_token_block,
                     codec_dim_block=self.tile_policy.codec_dim_block,
                     alloc_block_tokens=self.tile_policy.alloc_block_tokens,
                 )
-                return True
+                return True, page_unsafe_flags is not None
             except NotImplementedError:
                 pass
         if not self._should_stage(slot_mapping):
-            return False
+            return False, False
         if not self._ensure_capacity(kv_cache, slot_mapping):
-            return False
+            return False, False
 
         assert self.raw_staging is not None
         assert self.block_to_staging_slot is not None
@@ -475,17 +573,59 @@ class ByteV2RawStagingManager:
         assert self.next_staging_slot is not None
         assert self.overflow is not None
 
+        active_slot_capacity = min(kv_cache.shape[0], slot_mapping.shape[0])
+        raw_staging = self.raw_staging[:active_slot_capacity]
+        staging_to_physical_block = self.staging_to_physical_block[
+            :active_slot_capacity
+        ]
+        valid_rows = self.valid_rows[:active_slot_capacity]
+
+        if (
+            page_unsafe_flags is not None
+            and _fused_staging_release_flags_enabled()
+            and _native_raw_staging_update_enabled()
+            and not _debug_warmup_enabled()
+        ):
+            try:
+                byte_v2_update_cache_raw_staging(
+                    key,
+                    value,
+                    raw_staging,
+                    kv_cache,
+                    slot_mapping,
+                    self.block_to_staging_slot,
+                    staging_to_physical_block,
+                    valid_rows,
+                    self.next_staging_slot,
+                    self.overflow,
+                    page_unsafe_flags,
+                    tile_policy=(
+                        self.tile_policy.codec_token_block,
+                        self.tile_policy.codec_dim_block,
+                        self.tile_policy.alloc_block_tokens,
+                        self.tile_policy.compute_block_n,
+                        self.tile_policy.head_dim,
+                        self.tile_policy.head_dim_v,
+                    ),
+                    fuse_metadata_clear=_fused_commit_metadata_clear_enabled(),
+                    warp_parallel_histogram=(_warp_parallel_commit_histogram_enabled()),
+                )
+                return True, True
+            except NotImplementedError:
+                pass
+
         try:
             _debug_warmup(
-                "raw staging prepare start slot_mapping=%s raw_staging=%s",
+                "raw staging prepare start slot_mapping=%s raw_staging=%s capacity=%s",
                 tuple(slot_mapping.shape),
+                tuple(raw_staging.shape),
                 tuple(self.raw_staging.shape),
             )
             byte_v2_prepare_raw_staging(
                 slot_mapping,
                 self.block_to_staging_slot,
-                self.staging_to_physical_block,
-                self.valid_rows,
+                staging_to_physical_block,
+                valid_rows,
                 self.next_staging_slot,
                 self.overflow,
                 alloc_block_tokens=self.tile_policy.alloc_block_tokens,
@@ -494,10 +634,10 @@ class ByteV2RawStagingManager:
             _debug_warmup("raw staging prepare done")
             _debug_warmup("raw staging hydrate start")
             byte_v2_hydrate_raw_staging_from_cache(
-                self.raw_staging,
+                raw_staging,
                 kv_cache,
-                self.staging_to_physical_block,
-                self.valid_rows,
+                staging_to_physical_block,
+                valid_rows,
                 codec_token_block=self.tile_policy.codec_token_block,
                 codec_dim_block=self.tile_policy.codec_dim_block,
                 alloc_block_tokens=self.tile_policy.alloc_block_tokens,
@@ -508,7 +648,7 @@ class ByteV2RawStagingManager:
             byte_v2_append_raw_staging(
                 key,
                 value,
-                self.raw_staging,
+                raw_staging,
                 slot_mapping,
                 self.block_to_staging_slot,
                 codec_token_block=self.tile_policy.codec_token_block,
@@ -519,10 +659,10 @@ class ByteV2RawStagingManager:
             _debug_warmup("raw staging append done")
             _debug_warmup("raw staging commit start")
             byte_v2_commit_raw_staging_to_cache(
-                self.raw_staging,
+                raw_staging,
                 kv_cache,
-                self.staging_to_physical_block,
-                self.valid_rows,
+                staging_to_physical_block,
+                valid_rows,
                 codec_token_block=self.tile_policy.codec_token_block,
                 codec_dim_block=self.tile_policy.codec_dim_block,
                 alloc_block_tokens=self.tile_policy.alloc_block_tokens,
@@ -530,13 +670,17 @@ class ByteV2RawStagingManager:
             _debug_sync("raw staging commit")
             _debug_warmup("raw staging commit done")
             _debug_warmup("raw staging release start")
-            self._release_allocator_state()
+            flags_updated = self._release_allocator_state(
+                kv_cache,
+                page_unsafe_flags,
+                active_slot_capacity,
+            )
             _debug_sync("raw staging release")
             _debug_warmup("raw staging release done")
         except NotImplementedError:
             self._initialize_allocator_state()
-            return False
-        return True
+            return False, False
+        return True, flags_updated
 
 
 class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
@@ -579,8 +723,14 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         self.decode_gqa_packed = _decode_gqa_packed_enabled()
         self.decode_gqa_fa2_like = _decode_gqa_fa2_like_enabled()
         self.decode_gqa_fa2_direct = _decode_gqa_fa2_direct_enabled()
+        self.decode_unnormalized_partition_output = (
+            _decode_unnormalized_partition_output_enabled()
+        )
         self.decode_validate_no_outlier = _decode_validate_no_outlier_enabled()
         self.decode_page_unsafe_flags = _decode_page_unsafe_flags_enabled()
+        self.speculative_verify_q4 = _speculative_verify_q4_enabled()
+        self.speculative_verify_gqa = _speculative_verify_gqa_enabled()
+        self.cached_prefix_q16 = _cached_prefix_q16_enabled()
         if self.decode_gqa_packed and not self.decode_assume_no_outlier:
             logger.warning(
                 "[ByteV2] disabling BYTE_V2_DECODE_GQA_PACKED because it "
@@ -679,12 +829,18 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         *,
         assume_no_outlier: bool | None = None,
         use_gqa_packed: bool | None = None,
+        use_unnormalized_partition_output: bool | None = None,
     ) -> tuple[int, ...]:
         if assume_no_outlier is None:
             assume_no_outlier = self.decode_assume_no_outlier
         if use_gqa_packed is None:
             use_gqa_packed = self._use_gqa_packed_decode(max_seq_len)
-        policy = (
+        if use_unnormalized_partition_output is None:
+            use_unnormalized_partition_output = self._use_unnormalized_partition_output(
+                max_seq_len,
+                use_gqa_packed=use_gqa_packed,
+            )
+        policy: tuple[int, ...] = (
             self.tile_policy.codec_token_block,
             self.tile_policy.codec_dim_block,
             self.tile_policy.alloc_block_tokens,
@@ -697,9 +853,35 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         )
         if self.decode_gqa_fa2_like and use_gqa_packed:
             if self.decode_gqa_fa2_direct:
-                return policy + (1, 1, 0, 0, 1)
+                policy += (1, 1, 0, 0, 1)
+                if use_unnormalized_partition_output:
+                    policy += (_BYTE_V2_UNNORMALIZED_PARTITION_OUTPUT_MODE,)
+                return policy
             return policy + (1,)
         return policy
+
+    def _use_unnormalized_partition_output(
+        self,
+        max_seq_len: int,
+        *,
+        num_decode_tokens: int = 1,
+        use_gqa_packed: bool | None = None,
+    ) -> bool:
+        if not self.decode_unnormalized_partition_output:
+            return False
+        if not self.decode_gqa_fa2_like or not self.decode_gqa_fa2_direct:
+            return False
+        if self.num_heads != self.num_kv_heads * 4:
+            return False
+        if use_gqa_packed is None:
+            use_gqa_packed = self._use_gqa_packed_decode(max_seq_len)
+        if not use_gqa_packed:
+            return False
+        return self._use_split_k_decode(
+            max_seq_len,
+            num_decode_tokens=num_decode_tokens,
+            use_gqa_packed=use_gqa_packed,
+        )
 
     def _decode_partition_size(
         self,
@@ -798,22 +980,95 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         max_seq_len: int,
         num_decode_tokens: int,
     ) -> int:
-        # FA2-direct now runs multiple 64-token tiles inside a CTA. Keep small
-        # partitions when decode batch already supplies CTAs; increase at
-        # single-token long context to reduce split/reduce overhead.
-        if num_decode_tokens >= 4:
+        num_splits = self._auto_gqa_fa2_direct_num_splits(
+            max_seq_len,
+            num_decode_tokens,
+        )
+        return self._partition_size_from_num_splits(max_seq_len, num_splits)
+
+    def _speculative_gqa_partition_size(
+        self,
+        max_seq_len: int,
+        query_len: int,
+    ) -> int:
+        assert query_len in (2, 4, 8, 16)
+        if self.decode_gqa_packed_partition_size_explicit:
+            return self.decode_gqa_packed_partition_size
+        if query_len == 16:
+            if max_seq_len >= 8192:
+                return 512
             if max_seq_len >= 4096:
+                return 256
+            if max_seq_len >= 2048:
                 return 128
             return 64
-        if num_decode_tokens >= 2:
-            if max_seq_len >= 4096:
-                return 128
-            return 64
+        if query_len == 8 and max_seq_len >= 8192:
+            return 512
+        if max_seq_len >= 16384:
+            return 512
         if max_seq_len >= 4096:
             return 256
         if max_seq_len >= 2048:
             return 128
         return 64
+
+    def _speculative_q4_partition_size(self, max_seq_len: int) -> int:
+        return self._speculative_gqa_partition_size(max_seq_len, 4)
+
+    def _auto_gqa_fa2_direct_num_splits(
+        self,
+        max_seq_len: int,
+        num_decode_tokens: int,
+    ) -> int:
+        # FA2-direct now runs multiple 64-token tiles inside a CTA. Keep small
+        # split counts for medium context, then increase once per-CTA tile-loop
+        # work dominates split/reduce overhead. This mirrors FA2's strategy of
+        # choosing split count first, while using ByteV2-measured breakpoints.
+        if num_decode_tokens >= 4:
+            if max_seq_len >= 32768:
+                return 64
+            if max_seq_len >= 16384:
+                return 32
+            if max_seq_len >= 8192:
+                return 32
+            if max_seq_len >= 4096:
+                return 4
+            if max_seq_len >= 2048:
+                return 4
+            return max(1, (max_seq_len + 63) // 64)
+        if num_decode_tokens >= 2:
+            if max_seq_len >= 32768:
+                return 64
+            if max_seq_len >= 16384:
+                return 64
+            if max_seq_len >= 8192:
+                return 8
+            if max_seq_len >= 4096:
+                return 8
+            if max_seq_len >= 2048:
+                return 8
+            return max(1, (max_seq_len + 63) // 64)
+        if max_seq_len >= 32768:
+            return 16
+        if max_seq_len >= 16384:
+            return 16
+        if max_seq_len >= 8192:
+            return 16
+        if max_seq_len >= 4096:
+            return 16
+        if max_seq_len >= 2048:
+            return 16
+        return max(1, (max_seq_len + 63) // 64)
+
+    def _partition_size_from_num_splits(
+        self,
+        max_seq_len: int,
+        num_splits: int,
+    ) -> int:
+        block = self.tile_policy.alloc_block_tokens
+        num_splits = max(num_splits, 1)
+        split_size = max(1, (max_seq_len + num_splits - 1) // num_splits)
+        return max(block, ((split_size + block - 1) // block) * block)
 
     def _use_split_k_decode(
         self,
@@ -878,7 +1133,15 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        if not (self.decode_page_unsafe_flags and self.decode_assume_no_outlier):
+        if not (
+            self.decode_page_unsafe_flags
+            and (
+                self.decode_assume_no_outlier
+                or self.speculative_verify_q4
+                or self.speculative_verify_gqa
+                or self.cached_prefix_q16
+            )
+        ):
             return
         if not (kv_cache.is_cuda and slot_mapping.is_cuda):
             return
@@ -929,23 +1192,23 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, bool]:
         assume_no_outlier = self.decode_assume_no_outlier
         use_gqa_packed = self._use_gqa_packed_decode(max_seq_len)
         if not assume_no_outlier:
-            return False, False
+            return False, False, False
         if not self.decode_validate_no_outlier:
-            return assume_no_outlier, use_gqa_packed
+            return assume_no_outlier, use_gqa_packed, False
         if not (kv_cache.is_cuda and block_table.is_cuda and seq_lens.is_cuda):
-            return False, False
+            return False, False, False
         if self._decode_cache_has_fallback_or_outlier(
             kv_cache,
             block_table,
             seq_lens,
             max_seq_len,
         ):
-            return False, False
-        return assume_no_outlier, use_gqa_packed
+            return False, False, False
+        return assume_no_outlier, use_gqa_packed, True
 
     def _get_split_k_workspace(
         self,
@@ -954,15 +1217,25 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         *,
         num_decode_tokens: int,
         use_gqa_packed: bool | None = None,
+        use_unnormalized_partition_output: bool | None = None,
+        partition_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        partition_size = self._decode_partition_size(
-            max_seq_len,
-            num_decode_tokens=num_decode_tokens,
-            use_gqa_packed=use_gqa_packed,
-        )
+        if partition_size is None:
+            partition_size = self._decode_partition_size(
+                max_seq_len,
+                num_decode_tokens=num_decode_tokens,
+                use_gqa_packed=use_gqa_packed,
+            )
         num_partitions = max(1, (max_seq_len + partition_size - 1) // partition_size)
         stats_shape = (output.shape[0], self.num_heads, num_partitions)
         tmp_shape = (*stats_shape, self.head_size)
+        if use_unnormalized_partition_output is None:
+            use_unnormalized_partition_output = self._use_unnormalized_partition_output(
+                max_seq_len,
+                num_decode_tokens=num_decode_tokens,
+                use_gqa_packed=use_gqa_packed,
+            )
+        max_logits_shape = stats_shape if use_unnormalized_partition_output else (0,)
 
         needs_alloc = (
             self._decode_exp_sums is None
@@ -982,10 +1255,11 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             )
         if (
             self._decode_max_logits is None
+            or tuple(self._decode_max_logits.shape) != max_logits_shape
             or self._decode_max_logits.device != output.device
         ):
             self._decode_max_logits = torch.empty(
-                (0,),
+                max_logits_shape,
                 dtype=torch.float32,
                 device=output.device,
             )
@@ -1003,7 +1277,11 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         seq_lens: torch.Tensor,
         max_seq_len: int,
     ) -> None:
-        assume_no_outlier, use_gqa_packed = self._resolve_decode_fast_path(
+        (
+            assume_no_outlier,
+            use_gqa_packed,
+            validated_all_safe,
+        ) = self._resolve_decode_fast_path(
             kv_cache,
             block_table,
             seq_lens,
@@ -1018,32 +1296,44 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         ):
             assume_no_outlier = False
             use_gqa_packed = False
+        num_decode_tokens = int(output.shape[0])
+        use_split_k = output.is_cuda and self._use_split_k_decode(
+            max_seq_len,
+            num_decode_tokens=num_decode_tokens,
+            use_gqa_packed=use_gqa_packed,
+        )
+        use_unnormalized_partition_output = (
+            use_split_k
+            and self._use_unnormalized_partition_output(
+                max_seq_len,
+                num_decode_tokens=num_decode_tokens,
+                use_gqa_packed=use_gqa_packed,
+            )
+        )
         tile_policy = self._decode_tile_policy_tuple(
             max_seq_len,
             assume_no_outlier=assume_no_outlier,
             use_gqa_packed=use_gqa_packed,
+            use_unnormalized_partition_output=use_unnormalized_partition_output,
         )
-        num_decode_tokens = int(output.shape[0])
         partition_size = self._decode_partition_size(
             max_seq_len,
             num_decode_tokens=num_decode_tokens,
             use_gqa_packed=use_gqa_packed,
         )
-        if output.is_cuda and self._use_split_k_decode(
-            max_seq_len,
-            num_decode_tokens=num_decode_tokens,
-            use_gqa_packed=use_gqa_packed,
-        ):
+        if use_split_k:
             exp_sums, max_logits, tmp_out = self._get_split_k_workspace(
                 output,
                 max_seq_len,
                 num_decode_tokens=num_decode_tokens,
                 use_gqa_packed=use_gqa_packed,
+                use_unnormalized_partition_output=(use_unnormalized_partition_output),
             )
             if (
                 assume_no_outlier
                 and self.decode_page_unsafe_flags
                 and page_unsafe_flags is not None
+                and not validated_all_safe
             ):
                 byte_v2_paged_decode_attention_split_k_guarded(
                     output,
@@ -1242,6 +1532,133 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         _debug_warmup("prefill native done")
         return output
 
+    @staticmethod
+    def _metadata_seq_lens_cpu(
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> torch.Tensor:
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = attn_metadata.seq_lens.detach().cpu()
+        return seq_lens_cpu
+
+    def _speculative_gqa_query_len(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> int | None:
+        query_len = attn_metadata.max_query_len
+        enabled = self.speculative_verify_gqa and query_len in (2, 4, 8)
+        enabled = enabled or (self.speculative_verify_q4 and query_len == 4)
+        enabled = enabled or (self.cached_prefix_q16 and query_len == 16)
+        if not enabled:
+            return None
+        if not (query.is_cuda and output.is_cuda and kv_cache.is_cuda):
+            return None
+        if query.shape != output.shape or output.ndim != 3:
+            return None
+        if attn_metadata.num_actual_tokens != output.shape[0]:
+            return None
+        if output.shape[0] == 0 or output.shape[0] % query_len != 0:
+            return None
+        if not attn_metadata.causal:
+            return None
+        if (
+            self.num_heads != 32
+            or self.num_kv_heads != 8
+            or self.head_size != 128
+            or self.tile_policy.alloc_block_tokens != 16
+            or self.tile_policy.compute_block_n != 64
+        ):
+            return None
+        if self.alibi_slopes is not None or self.sliding_window is not None:
+            return None
+        if self.logits_soft_cap is not None:
+            return None
+
+        query_start_locs = attn_metadata.query_start_loc_cpu.tolist()
+        num_requests = output.shape[0] // query_len
+        if len(query_start_locs) != num_requests + 1:
+            return None
+        if any(
+            int(end) - int(start) != query_len
+            for start, end in zip(query_start_locs[:-1], query_start_locs[1:])
+        ):
+            return None
+        if int(query_start_locs[-1]) != output.shape[0]:
+            return None
+        if (
+            attn_metadata.block_table.ndim != 2
+            or attn_metadata.block_table.shape[0] < num_requests
+            or attn_metadata.seq_lens.shape[0] < num_requests
+        ):
+            return None
+        seq_lens_cpu = self._metadata_seq_lens_cpu(attn_metadata)
+        if seq_lens_cpu.shape[0] < num_requests:
+            return None
+        if not bool(torch.all(seq_lens_cpu[:num_requests] > query_len).item()):
+            return None
+        return query_len
+
+    def _run_speculative_verify_gqa(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+        query_len: int,
+    ) -> bool:
+        page_unsafe_flags = self._usable_decode_page_unsafe_flags(kv_cache)
+        if page_unsafe_flags is None:
+            return False
+
+        num_requests = output.shape[0] // query_len
+        virtual_heads = query_len * self.num_heads
+        partition_size = self._speculative_gqa_partition_size(
+            attn_metadata.max_seq_len,
+            query_len,
+        )
+        exp_sums, max_logits, tmp_out = self._get_split_k_workspace(
+            output,
+            attn_metadata.max_seq_len,
+            num_decode_tokens=output.shape[0],
+            use_gqa_packed=True,
+            use_unnormalized_partition_output=False,
+            partition_size=partition_size,
+        )
+        num_partitions = exp_sums.shape[2]
+        virtual_exp_sums = exp_sums.view(
+            num_requests,
+            virtual_heads,
+            num_partitions,
+        )
+        virtual_tmp_out = tmp_out.view(
+            num_requests,
+            virtual_heads,
+            num_partitions,
+            self.head_size,
+        )
+        byte_v2_speculative_verify_gqa(
+            output,
+            virtual_exp_sums,
+            max_logits,
+            virtual_tmp_out,
+            query,
+            kv_cache,
+            page_unsafe_flags,
+            attn_metadata.block_table[:num_requests],
+            attn_metadata.seq_lens[:num_requests],
+            speculative_query_len=query_len,
+            scale=self.scale,
+            num_kv_heads=self.num_kv_heads,
+            block_size=self.tile_policy.alloc_block_tokens,
+            max_seq_len=attn_metadata.max_seq_len,
+            partition_size=partition_size,
+            tile_policy=self._base_tile_policy_tuple(),
+        )
+        return True
+
     def _forward_prefill(
         self,
         query: torch.Tensor,
@@ -1253,6 +1670,16 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
     ) -> torch.Tensor:
         if key is None or value is None:
             return output.fill_(0)
+        speculative_query_len = self._speculative_gqa_query_len(
+            query,
+            kv_cache,
+            output,
+            attn_metadata,
+        )
+        if speculative_query_len is not None and self._run_speculative_verify_gqa(
+            query, kv_cache, output, attn_metadata, speculative_query_len
+        ):
+            return output
         if self._prefill_has_cached_context(attn_metadata):
             return self._forward_prefill_from_cache(
                 query,
@@ -1311,6 +1738,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         if query_start_loc_cpu is None:
             query_start_loc_cpu = attn_metadata.query_start_loc.detach().cpu()
         query_start_locs = query_start_loc_cpu.tolist()
+        seq_lens_cpu = ByteV2AttentionImpl._metadata_seq_lens_cpu(attn_metadata)
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         for seq_idx, (start, end) in enumerate(
@@ -1319,9 +1747,9 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             start = min(int(start), num_actual_tokens)
             end = min(int(end), num_actual_tokens)
             query_len = end - start
-            if query_len <= 0 or seq_idx >= attn_metadata.seq_lens.shape[0]:
+            if query_len <= 0 or seq_idx >= seq_lens_cpu.shape[0]:
                 continue
-            if int(attn_metadata.seq_lens[seq_idx].item()) > query_len:
+            if int(seq_lens_cpu[seq_idx]) > query_len:
                 return True
         return False
 
@@ -1338,6 +1766,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         if query_start_loc_cpu is None:
             query_start_loc_cpu = attn_metadata.query_start_loc.detach().cpu()
         query_start_locs = query_start_loc_cpu.tolist()
+        seq_lens_cpu = self._metadata_seq_lens_cpu(attn_metadata)
         num_actual_tokens = min(attn_metadata.num_actual_tokens, query.shape[0])
 
         _debug_warmup(
@@ -1357,9 +1786,9 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 continue
 
             query_len = end - start
-            if seq_idx < attn_metadata.seq_lens.shape[0]:
+            if seq_idx < seq_lens_cpu.shape[0]:
                 context_len = max(
-                    int(attn_metadata.seq_lens[seq_idx].item()) - query_len,
+                    int(seq_lens_cpu[seq_idx]) - query_len,
                     0,
                 )
             else:
@@ -1454,13 +1883,29 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             tuple(kv_cache.shape),
             tuple(slot_mapping.shape),
         )
-        if self.raw_staging_manager.update(
+        page_unsafe_flags = None
+        if (
+            self.decode_page_unsafe_flags
+            and (
+                self.decode_assume_no_outlier
+                or self.speculative_verify_q4
+                or self.speculative_verify_gqa
+                or self.cached_prefix_q16
+            )
+            and kv_cache.is_cuda
+            and slot_mapping.is_cuda
+        ):
+            page_unsafe_flags = self._get_decode_page_unsafe_flags(kv_cache)
+        handled, flags_updated = self.raw_staging_manager.update(
             key=key,
             value=value,
             kv_cache=kv_cache,
             slot_mapping=slot_mapping,
-        ):
-            self._update_decode_page_unsafe_flags(kv_cache, slot_mapping)
+            page_unsafe_flags=page_unsafe_flags,
+        )
+        if handled:
+            if not flags_updated:
+                self._update_decode_page_unsafe_flags(kv_cache, slot_mapping)
             _debug_warmup("kv update done via cache update manager")
             return
         byte_v2_reshape_and_cache(

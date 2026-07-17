@@ -35,13 +35,24 @@ Current default policy:
 | outlier value bits | 8 |
 | outlier entries / tile | 256 |
 
-Current default page sizing:
+Current V5 default page sizing:
 
 | field | value |
 | --- | ---: |
 | codec payload / tile | 384 B |
 | code bytes / tile | 128 B |
-| page size | 115328 B |
+| page header | 128 B |
+| metadata / KV head | 96 B |
+| metadata / page | 896 B |
+| fixed 12-bit K/V payload | 49152 B |
+| shared outlier pool | 2048 B (1024 entries) |
+| V5 page size | 52096 B |
+| raw BF16 page size | 65536 B |
+| physical bytes saved | 20.5% |
+
+The legacy V4 layout reserved 256 outlier entries for every codec tile and
+therefore occupied 115328 B per page. V5 keeps the same fixed payload and
+logical repair format, but pools sparse outlier storage across the page.
 
 ## 3. Codec Tile Payload
 
@@ -113,14 +124,15 @@ elements are repaired by outlier sideband entries.
 
 ## 5. Outlier Sideband
 
-Outlier sideband is sparse logical metadata, but its storage area is fixed-size
-per tile in the page layout.
+V5 stores outliers in one fixed-size pool shared by all K/V tiles and KV heads
+in a cache page. It does not reserve a worst-case payload for every tile.
 
 Per tile metadata:
 
 ```text
 outlier mask bit: whether this tile has any outlier overlay
-outlier count:    number of valid outlier entries for this tile
+outlier count:    uint16 number of valid entries
+pool offset:      uint16 index of the tile's first pool entry
 outlier entries:  elem_idx + true high byte
 ```
 
@@ -130,7 +142,7 @@ Current outlier entry layout:
 elem index bits: 8   // enough for 0..255
 value bits:      8   // true bf16 high byte
 entry size:      2 B
-entries / tile:  256
+pool entries:    1024 / page
 ```
 
 Logical repair:
@@ -147,6 +159,15 @@ bf16 = (high << 8) | low
 
 The low byte is always read from the fixed main payload, including outliers.
 The outlier sideband only overrides the high byte.
+
+The writer allocates a power-of-two segment for each nonempty tile. The
+single-token updater compacts the page pool before appending new entries, then
+relocates a segment only when it must grow. Pool exhaustion sets the page
+overflow flag and traps the writer. It never silently drops an outlier.
+
+V5 is therefore exact for every page that fits in the 1024-entry pool and
+fail-closed otherwise. It is not a claim that arbitrary pathological pages
+with more than 1024 pooled entries can be represented by the compact format.
 
 ## 6. Decode Paths
 
@@ -194,23 +215,24 @@ The cache writer must preserve these invariants:
 2. The low byte of every element, including outliers, is stored exactly.
 3. For in-window elements, `code = high - base`.
 4. For out-of-window elements, an outlier entry stores the true high byte.
-5. Outlier metadata is tile-local and each stored entry carries its logical
-   `elem_idx`.
-6. The page layout remains fixed-size; outlier count changes valid entries, not
-   page offsets.
+5. Each tile descriptor stores its count and page-pool offset, and each entry
+   carries its logical `elem_idx`.
+6. Pool allocation failure must trap; it must not truncate the overlay.
+7. The page layout remains fixed-size; outlier count changes pool use, not page
+   size.
 
-With `OutlierEntriesPerTile = 256`, every element in a 16x16 tile can be
-represented by the outlier overlay if needed. The fallback mask remains part of
-the layout, but the target compressed format should avoid relying on raw
-fallback in the hot decode path.
+The per-tile logical maximum remains 256 entries, so one pathological tile is
+representable. The page-wide total is bounded by the 1024-entry V5 pool. The
+fallback mask remains part of the metadata, but V5 does not allocate a raw
+page-local fallback payload.
 
 Current implementation note:
 
 - Full-block cache writer stores only true out-of-window elements in the
-  outlier sideband.
+  shared outlier pool.
 - Raw-staging commit uses the same sparse overlay format as the direct writer.
-- Single-token fused cache update appends only out-of-window elements for the
-  updated row.
+- Single-token fused cache update compacts the pool, then appends only
+  out-of-window elements for the updated row.
 - The old dense-prefix overlay behavior is not used by writers. Generic decode
   can still scan entries by `elem_idx`, so the sparse sideband remains exact.
 
@@ -243,6 +265,8 @@ Known negative results:
 | --- | --- |
 | 8-bit code payload | slower by about 11.4%; DRAM read +34.5% |
 | 12-bit pair-interleaved payload | slower by about 14.7%; global load sectors +43.6% |
+| in-band zero escape | forced-outlier faster, but safe path slower by 5.8-17.3%; rejected |
+| zero-only bitmap overlay | synthetic forced-outlier -6.0%, but real-cache replay +4.5%; rejected |
 
 Therefore the default format should remain:
 
@@ -275,50 +299,53 @@ strong measured speedup to justify the added complexity.
 
 ## 11. Verification
 
-Sparse overlay implementation was validated with:
+The V5 implementation was validated on an NVIDIA A40 with:
 
 ```text
-CUDA_VISIBLE_DEVICES=5 .venv/bin/python -m pytest \
-  tests/v1/attention/test_byte_v2_layout.py \
-  -k "reshape_and_cache_cuda_writes_outlier_overlay or \
-      reshape_and_cache_cuda_full_tile_overlay_avoids_raw_fallback or \
-      raw_staging_commit_matches_direct_cache or \
-      raw_staging_incremental_partial_block_matches_direct_cache or \
-      single_token_cache_update_cuda_matches_direct_cache" -q
+CUDA_VISIBLE_DEVICES=6 .venv/bin/python -m pytest \
+  tests/v1/attention/test_byte_v2_layout.py -q \
+  --disable-warnings --maxfail=1
 ```
 
 Result:
 
 ```text
-8 passed, 104 deselected
+170 passed, 1 skipped
 ```
 
-Decode correctness:
+The suite covers V5 layout arithmetic, direct and raw-staging writers,
+single-token updates, generic/direct/speculative decode, and semantic cache
+equality after nondeterministic parallel pool allocation.
 
-```text
-CUDA_VISIBLE_DEVICES=5 .venv/bin/python -m pytest \
-  tests/v1/attention/test_byte_v2_layout.py \
-  -k gqa_packed_cuda_matches_raw_reference -q
-```
+Real layer-0 cache data at 4097 tokens contained 257 active pages:
 
-Result:
-
-```text
-2 passed, 110 deselected
-```
-
-No-outlier fast-path microbench artifact:
-
-```text
-profiles/byte_v2_vs_raw_gqa_sparse_overlay_format_16384_p64_gpu5_20260624.jsonl
-```
-
-Result:
-
-| kernel | median |
+| page outlier entries | value |
 | --- | ---: |
-| ByteV2 GQA4 p64 no-outlier | 0.2417 ms |
-| raw FA2 | 0.1362 ms |
+| mean | 4.78 |
+| p95 | 7 |
+| p99 | 9 |
+| maximum | 28 |
 
-This confirms the sparse overlay writer change does not regress the current
-safe-page decode fast path.
+The observed maximum uses 2.7% of the 1024-entry pool. Full-model E2E also
+completed without the fail-closed overflow trap.
+
+Capacity and E2E were measured with Llama-3.1-8B, context 4096, batch 1, static
+query-size compilation, and 100% speculative acceptance:
+
+| metric | ByteV2 V5 | raw FA2 | difference |
+| --- | ---: | ---: | ---: |
+| allocated KV tokens | 204324 | 163118 | +25.26% |
+| Q2 throughput | 59.643 tok/s | 57.618 tok/s | +3.51% |
+| Q4 throughput | 109.008 tok/s | 106.986 tok/s | +1.89% |
+| Q8 throughput | 189.755 tok/s | 187.194 tok/s | +1.37% |
+| Q16 throughput | 314.876 tok/s | 306.845 tok/s | +2.62% |
+
+ByteV2 and raw FA2 produced identical output token IDs at every Q width. V5
+Q16 throughput differs from the previous V4 measurement by -0.06%, while its
+physical page shrinks from 115328 B to 52096 B.
+
+Detailed artifacts are recorded in:
+
+```text
+profile/byte-v2-v5-compact-a40-20260717/REPORT.md
+```

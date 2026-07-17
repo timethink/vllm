@@ -158,6 +158,7 @@ class ByteV2CodecPayloadPolicy:
 
     low_bytes_per_elem: int = 1
     exponent_code_bits: int = 4
+    outlier_high_sideband: bool = False
 
     def __post_init__(self) -> None:
         _check_positive("low_bytes_per_elem", self.low_bytes_per_elem)
@@ -681,6 +682,195 @@ class ByteV2PageLayoutV4:
             self.raw_v_payload_base_bytes
             + kv_head * self.aligned_raw_v_payload_bytes_per_kv_head
             + (row * self.tile_policy.head_dim_v + dim) * self.raw_elem_bytes
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ByteV2PageLayoutV5(ByteV2PageLayoutV4):
+    """Compact V5 layout with one shared outlier pool per cache page."""
+
+    kv_head_meta_bytes: int = 96
+    outlier_pool_entries: int = 1024
+
+    def __post_init__(self) -> None:
+        ByteV2PageLayoutV4.__post_init__(self)
+        _check_positive("outlier_pool_entries", self.outlier_pool_entries)
+        if self.include_raw_payload:
+            raise ValueError("ByteV2 V5 does not store a page-local raw payload")
+        if self.outlier_pool_entries < self.tile_policy.codec_tile_elems:
+            raise ValueError("outlier_pool_entries must hold one full codec tile")
+        if self.outlier_pool_entries > 65535:
+            raise ValueError("outlier_pool_entries must fit in a uint16 offset")
+
+    @property
+    def kv_head_required_meta_bytes(self) -> int:
+        tiles = (
+            self.tile_policy.codec_tiles_per_k_page
+            + self.tile_policy.codec_tiles_per_v_page
+        )
+        return 32 + 4 * tiles
+
+    @property
+    def outlier_pool_bytes(self) -> int:
+        return self.outlier_pool_entries * self.outlier_entry_bytes
+
+    @property
+    def outlier_payload_bytes(self) -> int:
+        return self.outlier_pool_bytes
+
+    @property
+    def payload_bytes(self) -> int:
+        return self.compressed_payload_bytes + self.outlier_pool_bytes
+
+    @property
+    def outlier_pool_base_bytes(self) -> int:
+        return (
+            self.v_payload_base_bytes
+            + self.num_kv_heads * self.aligned_v_payload_bytes_per_kv_head
+        )
+
+    @property
+    def k_outlier_payload_base_bytes(self) -> int:
+        return self.outlier_pool_base_bytes
+
+    @property
+    def v_outlier_payload_base_bytes(self) -> int:
+        return self.outlier_pool_base_bytes
+
+    @property
+    def raw_k_payload_base_bytes(self) -> int:
+        return self.outlier_pool_base_bytes + self.outlier_pool_bytes
+
+    @property
+    def raw_v_payload_base_bytes(self) -> int:
+        return self.raw_k_payload_base_bytes
+
+    @property
+    def outlier_pool_used_offset(self) -> int:
+        return 0
+
+    @property
+    def outlier_pool_overflow_offset(self) -> int:
+        return 4
+
+    def _k_tile_index(self, dim_tile: int, token_tile: int) -> int:
+        return (
+            dim_tile * self.tile_policy.codec_token_tiles_per_alloc_block + token_tile
+        )
+
+    def _v_tile_index(self, dim_tile: int, token_tile: int) -> int:
+        return token_tile * self.tile_policy.v_dim_tiles + dim_tile
+
+    def k_outlier_count_offset(
+        self,
+        *,
+        kv_head: int,
+        dim_tile: int,
+        token_tile: int = 0,
+    ) -> int:
+        self._check_kv_head(kv_head)
+        self._check_dim_tile(dim_tile, self.tile_policy.k_dim_tiles)
+        self._check_token_tile(token_tile)
+        return (
+            self.kv_head_meta_offset(kv_head=kv_head)
+            + 32
+            + 2 * self._k_tile_index(dim_tile, token_tile)
+        )
+
+    def v_outlier_count_offset(
+        self,
+        *,
+        kv_head: int,
+        dim_tile: int,
+        token_tile: int = 0,
+    ) -> int:
+        self._check_kv_head(kv_head)
+        self._check_dim_tile(dim_tile, self.tile_policy.v_dim_tiles)
+        self._check_token_tile(token_tile)
+        return (
+            self.kv_head_meta_offset(kv_head=kv_head)
+            + 32
+            + 2
+            * (
+                self.tile_policy.codec_tiles_per_k_page
+                + self._v_tile_index(dim_tile, token_tile)
+            )
+        )
+
+    def k_outlier_pool_index_offset(
+        self,
+        *,
+        kv_head: int,
+        dim_tile: int,
+        token_tile: int = 0,
+    ) -> int:
+        tiles = (
+            self.tile_policy.codec_tiles_per_k_page
+            + self.tile_policy.codec_tiles_per_v_page
+        )
+        return (
+            self.kv_head_meta_offset(kv_head=kv_head)
+            + 32
+            + 2 * tiles
+            + 2 * self._k_tile_index(dim_tile, token_tile)
+        )
+
+    def v_outlier_pool_index_offset(
+        self,
+        *,
+        kv_head: int,
+        dim_tile: int,
+        token_tile: int = 0,
+    ) -> int:
+        tiles = (
+            self.tile_policy.codec_tiles_per_k_page
+            + self.tile_policy.codec_tiles_per_v_page
+        )
+        return (
+            self.kv_head_meta_offset(kv_head=kv_head)
+            + 32
+            + 2 * tiles
+            + 2
+            * (
+                self.tile_policy.codec_tiles_per_k_page
+                + self._v_tile_index(dim_tile, token_tile)
+            )
+        )
+
+    def k_outlier_payload_offset(
+        self,
+        *,
+        kv_head: int,
+        dim_tile: int,
+        token_tile: int = 0,
+        pool_entry_index: int = 0,
+        entry_idx: int = 0,
+    ) -> int:
+        del kv_head, dim_tile, token_tile
+        if not 0 <= pool_entry_index < self.outlier_pool_entries:
+            raise ValueError("pool_entry_index must be inside the outlier pool")
+        if not 0 <= pool_entry_index + entry_idx < self.outlier_pool_entries:
+            raise ValueError("entry_idx must be inside the outlier pool")
+        return (
+            self.outlier_pool_base_bytes
+            + (pool_entry_index + entry_idx) * self.outlier_entry_bytes
+        )
+
+    def v_outlier_payload_offset(
+        self,
+        *,
+        kv_head: int,
+        dim_tile: int,
+        token_tile: int = 0,
+        pool_entry_index: int = 0,
+        entry_idx: int = 0,
+    ) -> int:
+        return self.k_outlier_payload_offset(
+            kv_head=kv_head,
+            dim_tile=dim_tile,
+            token_tile=token_tile,
+            pool_entry_index=pool_entry_index,
+            entry_idx=entry_idx,
         )
 
 

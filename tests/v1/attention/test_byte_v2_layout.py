@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.byte_v2_layout import (
     ByteV2OutlierEntryPolicy,
     ByteV2PagedKVManager,
     ByteV2PageLayoutV4,
+    ByteV2PageLayoutV5,
     ByteV2RawStagingLayout,
     ByteV2TilePolicy,
     byte_v2_tile_policy_from_env,
@@ -35,7 +36,11 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_prefill_attention,
     byte_v2_prepare_raw_staging,
     byte_v2_release_raw_staging,
+    byte_v2_release_raw_staging_and_update_flags,
     byte_v2_reshape_and_cache,
+    byte_v2_reshape_and_cache_sideband_high,
+    byte_v2_speculative_verify_gqa,
+    byte_v2_update_cache_raw_staging,
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
     missing_byte_v2_custom_ops,
@@ -79,6 +84,30 @@ def _load_u32_bytes(cache: torch.Tensor, physical_block: int, offset: int) -> in
     )
 
 
+def _v5_outlier_payload_offset(
+    cache: torch.Tensor,
+    layout: ByteV2PageLayoutV5,
+    *,
+    physical_block: int,
+    kv_head: int,
+    dim_tile: int,
+    is_value: bool,
+    entry_idx: int = 0,
+) -> int:
+    pool_offset = (
+        layout.v_outlier_pool_index_offset(kv_head=kv_head, dim_tile=dim_tile)
+        if is_value
+        else layout.k_outlier_pool_index_offset(kv_head=kv_head, dim_tile=dim_tile)
+    )
+    pool_entry_index = _load_u16_bytes(cache, physical_block, pool_offset)
+    return layout.k_outlier_payload_offset(
+        kv_head=kv_head,
+        dim_tile=dim_tile,
+        pool_entry_index=pool_entry_index,
+        entry_idx=entry_idx,
+    )
+
+
 def _raw_payload_layout(*, outlier_entries_per_tile: int = 128) -> ByteV2PageLayoutV4:
     return ByteV2PageLayoutV4(
         include_raw_payload=True,
@@ -88,7 +117,7 @@ def _raw_payload_layout(*, outlier_entries_per_tile: int = 128) -> ByteV2PageLay
 
 def _decode_current_byte_v2_payload(
     cache: torch.Tensor,
-    layout: ByteV2PageLayoutV4,
+    layout: ByteV2PageLayoutV4 | ByteV2PageLayoutV5,
     *,
     physical_block: int,
     kv_head: int,
@@ -172,35 +201,61 @@ def _decode_current_byte_v2_payload(
         ),
     )
     if outlier_mask & (1 << tile_index):
-        outlier_count = int(
-            cache[
-                physical_block,
-                (
-                    layout.v_outlier_count_offset(
-                        kv_head=kv_head,
-                        dim_tile=dim_tile,
-                        token_tile=token_tile,
-                    )
-                    if is_value
-                    else layout.k_outlier_count_offset(
-                        kv_head=kv_head,
-                        dim_tile=dim_tile,
-                        token_tile=token_tile,
-                    )
-                ),
-            ]
+        count_offset = (
+            layout.v_outlier_count_offset(
+                kv_head=kv_head,
+                dim_tile=dim_tile,
+                token_tile=token_tile,
+            )
+            if is_value
+            else layout.k_outlier_count_offset(
+                kv_head=kv_head,
+                dim_tile=dim_tile,
+                token_tile=token_tile,
+            )
         )
+        outlier_count = (
+            _load_u16_bytes(cache, physical_block, count_offset)
+            if isinstance(layout, ByteV2PageLayoutV5)
+            else int(cache[physical_block, count_offset])
+        )
+        pool_entry_index = 0
+        if isinstance(layout, ByteV2PageLayoutV5):
+            pool_index_offset = (
+                layout.v_outlier_pool_index_offset(
+                    kv_head=kv_head,
+                    dim_tile=dim_tile,
+                    token_tile=token_tile,
+                )
+                if is_value
+                else layout.k_outlier_pool_index_offset(
+                    kv_head=kv_head,
+                    dim_tile=dim_tile,
+                    token_tile=token_tile,
+                )
+            )
+            pool_entry_index = _load_u16_bytes(cache, physical_block, pool_index_offset)
         outlier_payload_offset = (
             layout.v_outlier_payload_offset(
                 kv_head=kv_head,
                 dim_tile=dim_tile,
                 token_tile=token_tile,
+                **(
+                    {"pool_entry_index": pool_entry_index}
+                    if isinstance(layout, ByteV2PageLayoutV5)
+                    else {}
+                ),
             )
             if is_value
             else layout.k_outlier_payload_offset(
                 kv_head=kv_head,
                 dim_tile=dim_tile,
                 token_tile=token_tile,
+                **(
+                    {"pool_entry_index": pool_entry_index}
+                    if isinstance(layout, ByteV2PageLayoutV5)
+                    else {}
+                ),
             )
         )
         outlier_policy = layout.outlier_entry_policy
@@ -225,6 +280,123 @@ def _decode_current_byte_v2_payload(
                 high = outlier_policy.decode_value_bits(entry)
                 break
     return _float_from_bf16_bits((high << 8) | low)
+
+
+def _assert_byte_v2_caches_decode_equal(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    layout: ByteV2PageLayoutV5,
+    *,
+    num_tokens: int,
+) -> None:
+    actual = actual.cpu()
+    expected = expected.cpu()
+    block_size = layout.tile_policy.alloc_block_tokens
+    for token_idx in range(num_tokens):
+        physical_block, row = divmod(token_idx, block_size)
+        for kv_head in range(layout.num_kv_heads):
+            for dim in range(layout.tile_policy.head_dim):
+                for is_value in (False, True):
+                    actual_value = _decode_current_byte_v2_payload(
+                        actual,
+                        layout,
+                        physical_block=physical_block,
+                        kv_head=kv_head,
+                        row=row,
+                        dim=dim,
+                        is_value=is_value,
+                    )
+                    expected_value = _decode_current_byte_v2_payload(
+                        expected,
+                        layout,
+                        physical_block=physical_block,
+                        kv_head=kv_head,
+                        row=row,
+                        dim=dim,
+                        is_value=is_value,
+                    )
+                    assert actual_value == expected_value
+
+
+def _decode_sideband_high_byte_v2_payload(
+    cache: torch.Tensor,
+    layout: ByteV2PageLayoutV4 | ByteV2PageLayoutV5,
+    *,
+    physical_block: int,
+    kv_head: int,
+    row: int,
+    dim: int,
+    is_value: bool,
+) -> float:
+    policy = layout.tile_policy
+    dim_tile = dim // policy.codec_dim_block
+    dim_in_tile = dim % policy.codec_dim_block
+    token_tile = row // policy.codec_token_block
+    row_in_tile = row % policy.codec_token_block
+    tile_offset = (
+        layout.v_payload_offset(
+            kv_head=kv_head,
+            dim_tile=dim_tile,
+            token_tile=token_tile,
+        )
+        if is_value
+        else layout.k_payload_offset(
+            kv_head=kv_head,
+            dim_tile=dim_tile,
+            token_tile=token_tile,
+        )
+    )
+    tile_index = (
+        token_tile * policy.v_dim_tiles + dim_tile
+        if is_value
+        else dim_tile * policy.codec_token_tiles_per_alloc_block + token_tile
+    )
+    elem_idx = row_in_tile * policy.codec_dim_block + dim_in_tile
+    low = int(cache[physical_block, tile_offset + elem_idx])
+    outlier_mask = _load_u32_bytes(
+        cache,
+        physical_block,
+        (
+            layout.v_outlier_mask_offset(kv_head=kv_head)
+            if is_value
+            else layout.k_outlier_mask_offset(kv_head=kv_head)
+        ),
+    )
+    if outlier_mask & (1 << tile_index):
+        if isinstance(layout, ByteV2PageLayoutV5):
+            outlier_payload_offset = _v5_outlier_payload_offset(
+                cache,
+                layout,
+                physical_block=physical_block,
+                kv_head=kv_head,
+                dim_tile=dim_tile,
+                is_value=is_value,
+            )
+        else:
+            outlier_payload_offset = (
+                layout.v_outlier_payload_offset(
+                    kv_head=kv_head,
+                    dim_tile=dim_tile,
+                    token_tile=token_tile,
+                )
+                if is_value
+                else layout.k_outlier_payload_offset(
+                    kv_head=kv_head,
+                    dim_tile=dim_tile,
+                    token_tile=token_tile,
+                )
+            )
+        high = int(cache[physical_block, outlier_payload_offset + elem_idx])
+        return _float_from_bf16_bits((high << 8) | low)
+    return _decode_current_byte_v2_payload(
+        cache,
+        layout,
+        physical_block=physical_block,
+        kv_head=kv_head,
+        row=row,
+        dim=dim,
+        is_value=is_value,
+    )
 
 
 def _reference_current_byte_v2_decode(
@@ -578,6 +750,39 @@ def test_page_layout_v4_derives_payload_offsets():
         layout.raw_value_offset(kv_head=0, row=0, dim=0)
 
 
+def test_page_layout_v5_uses_compact_page_outlier_pool():
+    layout = ByteV2PageLayoutV5()
+
+    assert layout.metadata_bytes == 896
+    assert layout.aligned_metadata_bytes == 896
+    assert layout.compressed_payload_bytes == 49152
+    assert layout.outlier_pool_entries == 1024
+    assert layout.outlier_pool_bytes == 2048
+    assert layout.k_payload_base_bytes == 896
+    assert layout.v_payload_base_bytes == 25472
+    assert layout.outlier_pool_base_bytes == 50048
+    assert layout.page_size_bytes == 52096
+    assert layout.page_size_bytes < 2 * 16 * 8 * 128 * 2
+
+
+def test_page_layout_v5_derives_tile_descriptors():
+    layout = ByteV2PageLayoutV5()
+
+    assert layout.k_outlier_count_offset(kv_head=0, dim_tile=0) == 160
+    assert layout.v_outlier_count_offset(kv_head=0, dim_tile=0) == 176
+    assert layout.k_outlier_pool_index_offset(kv_head=0, dim_tile=0) == 192
+    assert layout.v_outlier_pool_index_offset(kv_head=0, dim_tile=0) == 208
+    assert (
+        layout.k_outlier_payload_offset(
+            kv_head=0,
+            dim_tile=0,
+            pool_entry_index=17,
+            entry_idx=3,
+        )
+        == 50088
+    )
+
+
 def test_page_layout_v4_derives_raw_enabled_offsets():
     layout = _raw_payload_layout()
 
@@ -751,7 +956,7 @@ def test_byte_v2_backend_is_registered_but_kernel_gated(monkeypatch):
         block_size=16,
         num_kv_heads=8,
         head_size=128,
-    ) == (3, ByteV2PageLayoutV4().page_size_bytes)
+    ) == (3, ByteV2PageLayoutV5().page_size_bytes)
 
     invalid_reasons = backend_cls.validate_configuration(
         head_size=128,
@@ -828,6 +1033,15 @@ def test_byte_v2_decode_gqa_packed_defaults_off(monkeypatch):
     assert byte_v2_attn_module._decode_gqa_packed_enabled() is True
 
 
+def test_byte_v2_decode_unnormalized_partition_output_defaults_off(monkeypatch):
+    env_name = "BYTE_V2_DECODE_UNNORMALIZED_PARTITION_OUTPUT"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._decode_unnormalized_partition_output_enabled() is False
+
+    monkeypatch.setenv(env_name, "1")
+    assert byte_v2_attn_module._decode_unnormalized_partition_output_enabled() is True
+
+
 def test_byte_v2_decode_validate_no_outlier_defaults_off(monkeypatch):
     monkeypatch.delenv("BYTE_V2_DECODE_VALIDATE_NO_OUTLIER", raising=False)
     assert byte_v2_attn_module._decode_validate_no_outlier_enabled() is False
@@ -842,6 +1056,66 @@ def test_byte_v2_decode_page_unsafe_flags_defaults_on(monkeypatch):
 
     monkeypatch.setenv("BYTE_V2_DECODE_PAGE_UNSAFE_FLAGS", "0")
     assert byte_v2_attn_module._decode_page_unsafe_flags_enabled() is False
+
+
+def test_byte_v2_fused_staging_release_flags_defaults_on(monkeypatch):
+    env_name = "BYTE_V2_FUSED_STAGING_RELEASE_FLAGS"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._fused_staging_release_flags_enabled() is True
+
+    monkeypatch.setenv(env_name, "0")
+    assert byte_v2_attn_module._fused_staging_release_flags_enabled() is False
+
+
+def test_byte_v2_native_raw_staging_update_defaults_on(monkeypatch):
+    env_name = "BYTE_V2_NATIVE_RAW_STAGING_UPDATE"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._native_raw_staging_update_enabled() is True
+
+    monkeypatch.setenv(env_name, "0")
+    assert byte_v2_attn_module._native_raw_staging_update_enabled() is False
+
+
+def test_byte_v2_fused_commit_metadata_clear_defaults_on(monkeypatch):
+    env_name = "BYTE_V2_FUSED_COMMIT_METADATA_CLEAR"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._fused_commit_metadata_clear_enabled() is True
+
+    monkeypatch.setenv(env_name, "0")
+    assert byte_v2_attn_module._fused_commit_metadata_clear_enabled() is False
+
+
+def test_byte_v2_warp_parallel_commit_histogram_defaults_on(monkeypatch):
+    env_name = "BYTE_V2_WARP_PARALLEL_COMMIT_HISTOGRAM"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._warp_parallel_commit_histogram_enabled() is True
+
+    monkeypatch.setenv(env_name, "0")
+    assert byte_v2_attn_module._warp_parallel_commit_histogram_enabled() is False
+
+
+def test_byte_v2_speculative_verify_q4_defaults_off(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_SPECULATIVE_VERIFY_Q4", raising=False)
+    assert byte_v2_attn_module._speculative_verify_q4_enabled() is False
+
+    monkeypatch.setenv("BYTE_V2_SPECULATIVE_VERIFY_Q4", "1")
+    assert byte_v2_attn_module._speculative_verify_q4_enabled() is True
+
+
+def test_byte_v2_speculative_verify_gqa_defaults_off(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_SPECULATIVE_VERIFY_GQA", raising=False)
+    assert byte_v2_attn_module._speculative_verify_gqa_enabled() is False
+
+    monkeypatch.setenv("BYTE_V2_SPECULATIVE_VERIFY_GQA", "1")
+    assert byte_v2_attn_module._speculative_verify_gqa_enabled() is True
+
+
+def test_byte_v2_cached_prefix_q16_defaults_off(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_CACHED_PREFIX_Q16", raising=False)
+    assert byte_v2_attn_module._cached_prefix_q16_enabled() is False
+
+    monkeypatch.setenv("BYTE_V2_CACHED_PREFIX_Q16", "1")
+    assert byte_v2_attn_module._cached_prefix_q16_enabled() is True
 
 
 def test_byte_v2_decode_partition_size_uses_long_context_default(monkeypatch):
@@ -866,6 +1140,53 @@ def test_byte_v2_decode_partition_size_uses_long_context_default(monkeypatch):
     assert impl._decode_partition_size(4096, num_decode_tokens=4) == 64
     assert impl._decode_partition_size(8192, num_decode_tokens=4) == 64
     assert impl._decode_partition_size(16384, num_decode_tokens=4) == 128
+
+
+def test_byte_v2_speculative_q4_uses_dedicated_partition_sizes(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_PARTITION_SIZE", raising=False)
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+
+    assert impl._speculative_q4_partition_size(1024) == 64
+    assert impl._speculative_q4_partition_size(2048) == 128
+    assert impl._speculative_q4_partition_size(4096) == 256
+    assert impl._speculative_q4_partition_size(8192) == 256
+    assert impl._speculative_q4_partition_size(16384) == 512
+
+
+def test_byte_v2_cached_prefix_q16_uses_dedicated_partition_sizes(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_PARTITION_SIZE", raising=False)
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+
+    assert impl._speculative_gqa_partition_size(512, 16) == 64
+    assert impl._speculative_gqa_partition_size(1024, 16) == 64
+    assert impl._speculative_gqa_partition_size(2048, 16) == 128
+    assert impl._speculative_gqa_partition_size(4096, 16) == 256
+    assert impl._speculative_gqa_partition_size(8192, 16) == 512
+    assert impl._speculative_gqa_partition_size(16384, 16) == 512
+
+
+def test_byte_v2_speculative_q8_uses_long_context_partition(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_PARTITION_SIZE", raising=False)
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+
+    assert impl._speculative_gqa_partition_size(4096, 8) == 256
+    assert impl._speculative_gqa_partition_size(8192, 8) == 512
+    assert impl._speculative_gqa_partition_size(8192, 4) == 256
 
 
 def test_byte_v2_decode_partition_size_keeps_explicit_base(monkeypatch):
@@ -958,9 +1279,84 @@ def test_byte_v2_gqa_fa2_direct_uses_auto_partition(monkeypatch):
     assert impl._decode_tile_policy_tuple(2048)[-5:] == (1, 1, 0, 0, 1)
     assert impl._decode_partition_size(2048) == 128
     assert impl._decode_partition_size(4096) == 256
-    assert impl._decode_partition_size(8192) == 256
-    assert impl._decode_partition_size(4096, num_decode_tokens=2) == 128
-    assert impl._decode_partition_size(4096, num_decode_tokens=4) == 128
+    assert impl._decode_partition_size(8192) == 512
+    assert impl._decode_partition_size(16384) == 1024
+    assert impl._decode_partition_size(32768) == 2048
+    assert impl._auto_gqa_fa2_direct_num_splits(2048, 1) == 16
+    assert impl._auto_gqa_fa2_direct_num_splits(8192, 1) == 16
+    assert impl._auto_gqa_fa2_direct_num_splits(32768, 1) == 16
+    assert impl._decode_partition_size(2048, num_decode_tokens=2) == 256
+    assert impl._decode_partition_size(4096, num_decode_tokens=2) == 512
+    assert impl._decode_partition_size(8192, num_decode_tokens=2) == 1024
+    assert impl._decode_partition_size(16384, num_decode_tokens=2) == 256
+    assert impl._decode_partition_size(32768, num_decode_tokens=2) == 512
+    assert impl._auto_gqa_fa2_direct_num_splits(2048, 2) == 8
+    assert impl._auto_gqa_fa2_direct_num_splits(4096, 2) == 8
+    assert impl._auto_gqa_fa2_direct_num_splits(8192, 2) == 8
+    assert impl._auto_gqa_fa2_direct_num_splits(32768, 2) == 64
+    assert impl._decode_partition_size(2048, num_decode_tokens=4) == 512
+    assert impl._decode_partition_size(4096, num_decode_tokens=4) == 1024
+    assert impl._decode_partition_size(8192, num_decode_tokens=4) == 256
+    assert impl._decode_partition_size(16384, num_decode_tokens=4) == 512
+    assert impl._decode_partition_size(32768, num_decode_tokens=4) == 512
+    assert impl._auto_gqa_fa2_direct_num_splits(2048, 4) == 4
+    assert impl._auto_gqa_fa2_direct_num_splits(4096, 4) == 4
+    assert impl._auto_gqa_fa2_direct_num_splits(8192, 4) == 32
+    assert impl._auto_gqa_fa2_direct_num_splits(32768, 4) == 64
+
+
+def test_byte_v2_unnormalized_partition_output_is_opt_in_gqa4(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_PACKED", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_ASSUME_NO_OUTLIER", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_LIKE", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_DIRECT", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_UNNORMALIZED_PARTITION_OUTPUT", "1")
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_MIN_SEQ_LEN", raising=False)
+
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+
+    assert impl._decode_tile_policy_tuple(2048)[-6:] == (1, 1, 0, 0, 1, 27)
+    output = torch.empty((1, 32, 128), dtype=torch.bfloat16)
+    _, max_logits, _ = impl._get_split_k_workspace(
+        output,
+        2048,
+        num_decode_tokens=1,
+        use_gqa_packed=True,
+    )
+    assert max_logits.shape == (1, 32, 16)
+
+
+def test_byte_v2_unnormalized_partition_output_fails_closed_for_non_gqa4(
+    monkeypatch,
+):
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_PACKED", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_ASSUME_NO_OUTLIER", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_LIKE", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_DIRECT", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_UNNORMALIZED_PARTITION_OUTPUT", "1")
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_MIN_SEQ_LEN", raising=False)
+
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=64,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+
+    assert impl._decode_tile_policy_tuple(2048)[-5:] == (1, 1, 0, 0, 1)
+    output = torch.empty((1, 64, 128), dtype=torch.bfloat16)
+    _, max_logits, _ = impl._get_split_k_workspace(
+        output,
+        2048,
+        num_decode_tokens=1,
+        use_gqa_packed=True,
+    )
+    assert max_logits.shape == (0,)
 
 
 @pytest.mark.parametrize("q_heads_per_kv", [1, 2, 4, 8, 16, 32])
@@ -1025,11 +1421,19 @@ def test_byte_v2_decode_validation_disables_unsafe_fast_path(monkeypatch):
         "_decode_cache_has_fallback_or_outlier",
         lambda *args: True,
     )
-    kv_cache = torch.empty((1, ByteV2PageLayoutV4().page_size_bytes))
-    block_table = torch.zeros((1, 256), dtype=torch.int32)
-    seq_lens = torch.tensor([4096], dtype=torch.int32)
 
-    assume_no_outlier, use_gqa_packed = impl._resolve_decode_fast_path(
+    class _CudaLike:
+        is_cuda = True
+
+    kv_cache = _CudaLike()
+    block_table = _CudaLike()
+    seq_lens = _CudaLike()
+
+    (
+        assume_no_outlier,
+        use_gqa_packed,
+        validated_all_safe,
+    ) = impl._resolve_decode_fast_path(
         kv_cache,
         block_table,
         seq_lens,
@@ -1038,12 +1442,58 @@ def test_byte_v2_decode_validation_disables_unsafe_fast_path(monkeypatch):
 
     assert assume_no_outlier is False
     assert use_gqa_packed is False
+    assert validated_all_safe is False
     assert impl._decode_tile_policy_tuple(
         4096,
         assume_no_outlier=assume_no_outlier,
         use_gqa_packed=use_gqa_packed,
     )[-2:] == (0, 0)
     assert impl._decode_partition_size(4096, use_gqa_packed=use_gqa_packed) == 32
+
+
+def test_byte_v2_decode_validation_marks_all_safe_fast_path(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_PACKED", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_ASSUME_NO_OUTLIER", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_VALIDATE_NO_OUTLIER", "1")
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_MIN_SEQ_LEN", raising=False)
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("BYTE_V2_DECODE_SPLIT_K_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("BYTE_V2_DECODE_SPLIT_K_LONG_PARTITION_SIZE", raising=False)
+    monkeypatch.delenv("BYTE_V2_DECODE_SPLIT_K_LONG_MIN_SEQ_LEN", raising=False)
+
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    monkeypatch.setattr(
+        impl,
+        "_decode_cache_has_fallback_or_outlier",
+        lambda *args: False,
+    )
+
+    class _CudaLike:
+        is_cuda = True
+
+    kv_cache = _CudaLike()
+    block_table = _CudaLike()
+    seq_lens = _CudaLike()
+
+    (
+        assume_no_outlier,
+        use_gqa_packed,
+        validated_all_safe,
+    ) = impl._resolve_decode_fast_path(
+        kv_cache,
+        block_table,
+        seq_lens,
+        4096,
+    )
+
+    assert assume_no_outlier is True
+    assert use_gqa_packed is True
+    assert validated_all_safe is True
 
 
 def test_byte_v2_kv_cache_spec_uses_byte_page_layout():
@@ -1061,8 +1511,8 @@ def test_byte_v2_kv_cache_spec_uses_byte_page_layout():
     assert spec.outlier_value_bits == 8
     assert spec.outlier_entries_per_tile == 256
     assert spec.include_raw_payload is False
-    assert spec.real_page_size_bytes == ByteV2PageLayoutV4().page_size_bytes
-    assert spec.page_size_bytes == ByteV2PageLayoutV4().page_size_bytes
+    assert spec.real_page_size_bytes == ByteV2PageLayoutV5().page_size_bytes
+    assert spec.page_size_bytes == ByteV2PageLayoutV5().page_size_bytes
     assert backend_cls.get_kv_cache_shape(
         num_blocks=3,
         block_size=spec.block_size,
@@ -1071,22 +1521,23 @@ def test_byte_v2_kv_cache_spec_uses_byte_page_layout():
     ) == (3, spec.page_size_bytes)
 
 
-def test_byte_v2_kv_cache_spec_parameterizes_outlier_overlay_capacity():
-    spec = ByteV2FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=8,
-        head_size=128,
-        head_size_v=128,
-        dtype=torch.uint8,
-        outlier_entries_per_tile=64,
-        include_raw_payload=True,
-    )
-    layout = _raw_payload_layout(outlier_entries_per_tile=64)
+def test_page_layout_v5_parameterizes_outlier_pool_capacity():
+    layout = ByteV2PageLayoutV5(outlier_pool_entries=2048)
 
-    assert spec.outlier_entries_per_tile == 64
-    assert spec.include_raw_payload is True
-    assert spec.real_page_size_bytes == layout.page_size_bytes
-    assert spec.real_page_size_bytes < _raw_payload_layout().page_size_bytes
+    assert layout.outlier_pool_entries == 2048
+    assert layout.page_size_bytes < _raw_payload_layout().page_size_bytes
+
+
+def test_byte_v2_kv_cache_spec_rejects_uncompiled_layout_capacity():
+    with pytest.raises(ValueError, match="compiled V5 CUDA layout"):
+        ByteV2FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            head_size_v=128,
+            dtype=torch.uint8,
+            outlier_pool_entries=2048,
+        )
 
 
 def test_byte_v2_kv_cache_spec_rejects_non_byte_storage():
@@ -1121,7 +1572,7 @@ def test_attention_layer_uses_byte_v2_kv_cache_spec():
     assert spec.dtype == torch.uint8
     assert spec.outlier_entries_per_tile == 256
     assert spec.include_raw_payload is False
-    assert spec.page_size_bytes == ByteV2PageLayoutV4().page_size_bytes
+    assert spec.page_size_bytes == ByteV2PageLayoutV5().page_size_bytes
 
 
 def test_byte_v2_backend_rejects_unsupported_shape_before_kernel_gate():
@@ -1162,6 +1613,9 @@ def test_byte_v2_ops_fail_cleanly_without_registered_kernels():
     release_staging_op_registered = _has_torch_op(
         "_C_cache_ops", "byte_v2_release_raw_staging"
     )
+    fused_release_staging_op_registered = _has_torch_op(
+        "_C_cache_ops", "byte_v2_release_raw_staging_and_update_flags"
+    )
     commit_staging_op_registered = _has_torch_op(
         "_C_cache_ops", "byte_v2_commit_raw_staging_to_cache"
     )
@@ -1181,6 +1635,7 @@ def test_byte_v2_ops_fail_cleanly_without_registered_kernels():
         and prepare_staging_op_registered
         and hydrate_staging_op_registered
         and release_staging_op_registered
+        and fused_release_staging_op_registered
         and commit_staging_op_registered
         and collect_stats_op_registered
         and update_flags_op_registered
@@ -1191,7 +1646,7 @@ def test_byte_v2_ops_fail_cleanly_without_registered_kernels():
 
     key = torch.empty((1, 1, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((1, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((1, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     slot_mapping = torch.zeros((1,), dtype=torch.int64)
     raw_staging = torch.empty(
         (1, ByteV2RawStagingLayout().slot_size_bytes), dtype=torch.uint8
@@ -1263,6 +1718,19 @@ def test_byte_v2_ops_fail_cleanly_without_registered_kernels():
                 valid_rows,
                 next_staging_slot,
                 overflow,
+            )
+
+    if not fused_release_staging_op_registered:
+        with pytest.raises(NotImplementedError, match="ByteV2 custom kernels"):
+            byte_v2_release_raw_staging_and_update_flags(
+                block_to_staging_slot,
+                staging_to_physical_block,
+                valid_rows,
+                next_staging_slot,
+                overflow,
+                page_unsafe_flags,
+                kv_cache,
+                tile_policy=(16, 16, 16, 64, 128, 128),
             )
 
     if not commit_staging_op_registered:
@@ -1344,6 +1812,7 @@ def test_byte_v2_ops_fail_cleanly_without_registered_kernels():
 
 def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
     calls = []
+    active_slot_capacities = []
 
     def prepare(
         slot_mapping,
@@ -1356,7 +1825,10 @@ def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
         alloc_block_tokens,
     ):
         calls.append("prepare")
+        active_slot_capacities.append(staging_to_physical_block.shape[0])
         assert alloc_block_tokens == 16
+        assert staging_to_physical_block.shape == slot_mapping.shape
+        assert valid_rows.shape == slot_mapping.shape
         assert block_to_staging_slot.tolist() == [-1, -1, -1, -1]
         block_to_staging_slot[0] = 0
         staging_to_physical_block[0] = 0
@@ -1378,7 +1850,11 @@ def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
         del value, slot_mapping, block_to_staging_slot
         calls.append("append")
         assert key.shape[1:] == (8, 128)
-        assert raw_staging.shape == (2, ByteV2RawStagingLayout().slot_size_bytes)
+        active_slot_capacities.append(raw_staging.shape[0])
+        assert raw_staging.shape == (
+            key.shape[0],
+            ByteV2RawStagingLayout().slot_size_bytes,
+        )
         assert (codec_token_block, codec_dim_block, alloc_block_tokens) == (
             16,
             16,
@@ -1395,8 +1871,11 @@ def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
         codec_dim_block,
         alloc_block_tokens,
     ):
-        del raw_staging, kv_cache, staging_to_physical_block, valid_rows
+        del kv_cache
         calls.append("hydrate")
+        active_slot_capacities.append(staging_to_physical_block.shape[0])
+        assert raw_staging.shape[0] == staging_to_physical_block.shape[0]
+        assert valid_rows.shape == staging_to_physical_block.shape
         assert (codec_token_block, codec_dim_block, alloc_block_tokens) == (
             16,
             16,
@@ -1413,8 +1892,11 @@ def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
         codec_dim_block,
         alloc_block_tokens,
     ):
-        del raw_staging, kv_cache, staging_to_physical_block, valid_rows
+        del kv_cache
         calls.append("commit")
+        active_slot_capacities.append(staging_to_physical_block.shape[0])
+        assert raw_staging.shape[0] == staging_to_physical_block.shape[0]
+        assert valid_rows.shape == staging_to_physical_block.shape
         assert (codec_token_block, codec_dim_block, alloc_block_tokens) == (
             16,
             16,
@@ -1429,6 +1911,8 @@ def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
         overflow,
     ):
         calls.append("release")
+        active_slot_capacities.append(staging_to_physical_block.shape[0])
+        assert valid_rows.shape == staging_to_physical_block.shape
         block_to_staging_slot.fill_(-1)
         staging_to_physical_block.fill_(-1)
         valid_rows.zero_()
@@ -1460,22 +1944,88 @@ def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
     )
     key = torch.empty((2, 8, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((4, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((4, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
 
     impl.do_kv_cache_update(None, key, value, kv_cache, slot_mapping)
     first_staging_buffer = impl.raw_staging_manager.raw_staging
 
     assert calls == ["prepare", "hydrate", "append", "commit", "release"]
+    assert active_slot_capacities == [2, 2, 2, 2, 2]
     assert first_staging_buffer is not None
     assert impl.raw_staging_manager.block_to_staging_slot.tolist() == [-1, -1, -1, -1]
     assert impl.raw_staging_manager.next_staging_slot.item() == 0
 
     calls.clear()
+    active_slot_capacities.clear()
     impl.do_kv_cache_update(None, key[:1], value[:1], kv_cache, slot_mapping[:1])
 
     assert calls == ["prepare", "hydrate", "append", "commit", "release"]
+    assert active_slot_capacities == [1, 1, 1, 1, 1]
     assert impl.raw_staging_manager.raw_staging is first_staging_buffer
+
+
+def test_byte_v2_raw_staging_manager_uses_native_update_with_flags(monkeypatch):
+    calls = []
+
+    def native_update(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        slot_mapping,
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+        page_unsafe_flags,
+        *,
+        tile_policy,
+        fuse_metadata_clear,
+        warp_parallel_histogram,
+    ):
+        del key, value, kv_cache, slot_mapping, page_unsafe_flags
+        calls.append(
+            (
+                raw_staging.shape[0],
+                tuple(tile_policy),
+                fuse_metadata_clear,
+                warp_parallel_histogram,
+            )
+        )
+        block_to_staging_slot.fill_(-1)
+        staging_to_physical_block.fill_(-1)
+        valid_rows.zero_()
+        next_staging_slot.zero_()
+        overflow.zero_()
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_update_cache_raw_staging",
+        native_update,
+    )
+    manager = byte_v2_attn_module.ByteV2RawStagingManager(
+        tile_policy=DEFAULT_BYTE_V2_TILE_POLICY,
+        num_kv_heads=8,
+    )
+    key = torch.empty((2, 8, 128), dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    kv_cache = torch.empty((4, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
+    slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
+    page_unsafe_flags = torch.zeros((4,), dtype=torch.int32)
+
+    handled, flags_updated = manager.update(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        page_unsafe_flags=page_unsafe_flags,
+    )
+
+    assert handled is True
+    assert flags_updated is True
+    assert calls == [(2, (16, 16, 16, 64, 128, 128), True, True)]
 
 
 def test_byte_v2_kv_cache_update_falls_back_when_raw_staging_is_missing(monkeypatch):
@@ -1515,7 +2065,7 @@ def test_byte_v2_kv_cache_update_falls_back_when_raw_staging_is_missing(monkeypa
     )
     key = torch.empty((2, 8, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((4, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((4, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
 
     impl.do_kv_cache_update(None, key, value, kv_cache, slot_mapping)
@@ -1560,7 +2110,7 @@ def test_byte_v2_kv_cache_update_skips_raw_staging_above_threshold(monkeypatch):
     impl.raw_staging_manager.max_tokens_per_update = 1
     key = torch.empty((2, 8, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((4, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((4, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     slot_mapping = torch.tensor([0, 1], dtype=torch.int64)
 
     impl.do_kv_cache_update(None, key, value, kv_cache, slot_mapping)
@@ -1587,7 +2137,7 @@ def test_byte_v2_attention_forward_zeros_output_for_profile_run(monkeypatch):
     query = torch.empty((1, 32, 128), dtype=torch.bfloat16)
     key = torch.empty((1, 8, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((1, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((1, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     output = torch.empty_like(query)
 
     result = impl.forward(
@@ -1634,7 +2184,7 @@ def test_byte_v2_attention_forward_uses_native_prefill_when_not_decode_compatibl
     query = torch.zeros((2, 32, 128), dtype=torch.bfloat16)
     key = torch.zeros((2, 8, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((1, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((1, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     output = torch.empty_like(query)
     attn_metadata = SimpleNamespace(
         num_actual_tokens=2,
@@ -1699,7 +2249,7 @@ def test_byte_v2_attention_forward_uses_sdpa_prefill_by_default(monkeypatch):
     query = torch.zeros((2, 32, 128), dtype=torch.bfloat16)
     key = torch.zeros((2, 8, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((1, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((1, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     output = torch.empty_like(query)
     attn_metadata = SimpleNamespace(
         num_actual_tokens=2,
@@ -1786,7 +2336,7 @@ def test_byte_v2_attention_forward_uses_paged_decode_for_prefix_prefill(
     query = torch.zeros((2, 32, 128), dtype=torch.bfloat16)
     key = torch.zeros((2, 8, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((4, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((4, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     output = torch.empty_like(query)
     attn_metadata = SimpleNamespace(
         num_actual_tokens=2,
@@ -1849,7 +2399,7 @@ def test_byte_v2_attention_forward_uses_prefill_fallback_when_not_decode_compati
     value = torch.empty_like(key)
     value[0].fill_(1)
     value[1].fill_(3)
-    kv_cache = torch.empty((1, ByteV2PageLayoutV4().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty((1, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
     output = torch.empty_like(query)
     attn_metadata = SimpleNamespace(
         num_actual_tokens=2,
@@ -1889,7 +2439,7 @@ def test_byte_v2_collect_cache_stats_cuda_detects_masks():
     if not _has_torch_op("_C_cache_ops", "byte_v2_collect_cache_stats"):
         pytest.skip("ByteV2 cache stats custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     kv_cache = torch.zeros(
         (2, layout.page_size_bytes),
         dtype=torch.uint8,
@@ -1936,7 +2486,7 @@ def test_byte_v2_update_cache_unsafe_flags_cuda_detects_touched_masks():
     if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_unsafe_flags"):
         pytest.skip("ByteV2 unsafe flags custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     kv_cache = torch.zeros(
         (3, layout.page_size_bytes),
         dtype=torch.uint8,
@@ -1960,15 +2510,55 @@ def test_byte_v2_update_cache_unsafe_flags_cuda_detects_touched_masks():
         tile_policy=(16, 16, 16, 64, 128, 128),
     )
 
-    assert page_unsafe_flags.cpu().tolist() == [1, 0, -7]
+    assert page_unsafe_flags.cpu().tolist() == [3, 0, -7]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_byte_v2_reshape_and_cache_cuda_writes_v4_payload():
+def test_byte_v2_fused_staging_release_updates_unique_page_flags():
+    op_name = "byte_v2_release_raw_staging_and_update_flags"
+    if not _has_torch_op("_C_cache_ops", op_name):
+        pytest.skip("ByteV2 fused staging release custom op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    kv_cache = torch.zeros(
+        (3, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    kv_cache[0, layout.k_fallback_mask_offset(kv_head=0)] = 1
+    kv_cache[2, layout.v_outlier_mask_offset(kv_head=1)] = 1
+    block_to_staging_slot = torch.tensor([0, -1, 1], dtype=torch.int32, device="cuda")
+    staging_to_physical_block = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    valid_rows = torch.tensor([4, 4], dtype=torch.int32, device="cuda")
+    next_staging_slot = torch.tensor([2], dtype=torch.int32, device="cuda")
+    overflow = torch.tensor([1], dtype=torch.int32, device="cuda")
+    page_unsafe_flags = torch.full((3,), -7, dtype=torch.int32, device="cuda")
+
+    byte_v2_release_raw_staging_and_update_flags(
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+        page_unsafe_flags,
+        kv_cache,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+
+    assert page_unsafe_flags.cpu().tolist() == [3, -7, 5]
+    assert block_to_staging_slot.cpu().tolist() == [-1, -1, -1]
+    assert staging_to_physical_block.cpu().tolist() == [-1, -1]
+    assert valid_rows.cpu().tolist() == [0, 0]
+    assert next_staging_slot.cpu().tolist() == [0]
+    assert overflow.cpu().tolist() == [0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_reshape_and_cache_cuda_writes_v5_payload():
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 custom ops are not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     key = (
         torch.arange(2 * 8 * 128, dtype=torch.float32, device="cuda")
         .reshape(2, 8, 128)
@@ -1994,7 +2584,10 @@ def test_byte_v2_reshape_and_cache_cuda_writes_v4_payload():
     )
     cache = kv_cache.cpu()
 
-    assert torch.all(cache[0, : layout.page_header_bytes] == 0)
+    pool_entries_used = _load_u32_bytes(cache, 0, layout.outlier_pool_used_offset)
+    assert 0 <= pool_entries_used <= layout.outlier_pool_entries
+    assert _load_u32_bytes(cache, 0, layout.outlier_pool_overflow_offset) == 0
+    assert torch.all(cache[0, 8 : layout.page_header_bytes] == 0)
 
     k_bits0 = _bf16_bits(key[0, 0, 0])
     k_bits1 = _bf16_bits(key[0, 0, 1])
@@ -2033,7 +2626,7 @@ def test_byte_v2_reshape_and_cache_cuda_writes_outlier_overlay():
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 custom ops are not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     key_bits = torch.zeros((16, 8, 128), dtype=torch.int16, device="cuda")
     value_bits = torch.zeros_like(key_bits)
     key_bits[0, 0, 0] = (32 << 8) | 0x55
@@ -2074,7 +2667,14 @@ def test_byte_v2_reshape_and_cache_cuda_writes_outlier_overlay():
     k_entry = _load_u16_bytes(
         cache,
         0,
-        layout.k_outlier_payload_offset(kv_head=0, dim_tile=0),
+        _v5_outlier_payload_offset(
+            cache,
+            layout,
+            physical_block=0,
+            kv_head=0,
+            dim_tile=0,
+            is_value=False,
+        ),
     )
     assert layout.outlier_entry_policy.decode(k_entry) == (0, 32)
     assert _decode_current_byte_v2_payload(
@@ -2103,10 +2703,105 @@ def test_byte_v2_reshape_and_cache_cuda_writes_outlier_overlay():
     v_entry = _load_u16_bytes(
         cache,
         0,
-        layout.v_outlier_payload_offset(kv_head=0, dim_tile=0),
+        _v5_outlier_payload_offset(
+            cache,
+            layout,
+            physical_block=0,
+            kv_head=0,
+            dim_tile=0,
+            is_value=True,
+        ),
     )
     assert layout.outlier_entry_policy.decode(v_entry) == (16, 48)
     assert _decode_current_byte_v2_payload(
+        cache,
+        layout,
+        physical_block=0,
+        kv_head=0,
+        row=1,
+        dim=0,
+        is_value=True,
+    ) == pytest.approx(float(value[1, 0, 0].float().cpu()))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_reshape_and_cache_sideband_high_cuda_writes_outlier_sideband():
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache_sideband_high"):
+        pytest.skip("ByteV2 sideband-high custom op is not registered")
+
+    layout = ByteV2PageLayoutV5(
+        codec_payload_policy=ByteV2CodecPayloadPolicy(
+            outlier_high_sideband=True,
+        ),
+    )
+    key_bits = torch.zeros((16, 8, 128), dtype=torch.int16, device="cuda")
+    value_bits = torch.zeros_like(key_bits)
+    key_bits[0, 0, 0] = (32 << 8) | 0x55
+    value_bits[1, 0, 0] = (48 << 8) | 0x66
+    key = key_bits.view(torch.bfloat16)
+    value = value_bits.view(torch.bfloat16)
+    kv_cache = torch.zeros(
+        (1, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    slot_mapping = torch.arange(16, dtype=torch.int64, device="cuda")
+
+    byte_v2_reshape_and_cache_sideband_high(
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    cache = kv_cache.cpu()
+
+    k_outlier_mask = _load_u32_bytes(
+        cache,
+        0,
+        layout.k_outlier_mask_offset(kv_head=0),
+    )
+    assert k_outlier_mask & 1
+    assert int(cache[0, layout.k_outlier_count_offset(kv_head=0, dim_tile=0)]) == 1
+    k_sideband_offset = _v5_outlier_payload_offset(
+        cache,
+        layout,
+        physical_block=0,
+        kv_head=0,
+        dim_tile=0,
+        is_value=False,
+    )
+    assert int(cache[0, k_sideband_offset]) == 32
+    assert int(cache[0, k_sideband_offset + 1]) == 0
+    assert _decode_sideband_high_byte_v2_payload(
+        cache,
+        layout,
+        physical_block=0,
+        kv_head=0,
+        row=0,
+        dim=0,
+        is_value=False,
+    ) == pytest.approx(float(key[0, 0, 0].float().cpu()))
+
+    v_outlier_mask = _load_u32_bytes(
+        cache,
+        0,
+        layout.v_outlier_mask_offset(kv_head=0),
+    )
+    assert v_outlier_mask & 1
+    assert int(cache[0, layout.v_outlier_count_offset(kv_head=0, dim_tile=0)]) == 1
+    v_sideband_offset = _v5_outlier_payload_offset(
+        cache,
+        layout,
+        physical_block=0,
+        kv_head=0,
+        dim_tile=0,
+        is_value=True,
+    )
+    assert int(cache[0, v_sideband_offset + 16]) == 48
+    assert _decode_sideband_high_byte_v2_payload(
         cache,
         layout,
         physical_block=0,
@@ -2122,7 +2817,7 @@ def test_byte_v2_reshape_and_cache_cuda_full_tile_overlay_avoids_raw_fallback():
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 custom ops are not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     key_bits = torch.zeros((16, 8, 128), dtype=torch.int16, device="cuda")
     value_bits = torch.zeros_like(key_bits)
     tile_pattern = torch.empty((16, 16), dtype=torch.int16, device="cuda")
@@ -2167,7 +2862,15 @@ def test_byte_v2_reshape_and_cache_cuda_full_tile_overlay_avoids_raw_fallback():
     k_entry = _load_u16_bytes(
         cache,
         0,
-        layout.k_outlier_payload_offset(kv_head=0, dim_tile=0, entry_idx=169),
+        _v5_outlier_payload_offset(
+            cache,
+            layout,
+            physical_block=0,
+            kv_head=0,
+            dim_tile=0,
+            is_value=False,
+            entry_idx=169,
+        ),
     )
     assert layout.outlier_entry_policy.decode(k_entry) == (255, 64)
     assert _decode_current_byte_v2_payload(
@@ -2182,11 +2885,11 @@ def test_byte_v2_reshape_and_cache_cuda_full_tile_overlay_avoids_raw_fallback():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_byte_v2_reshape_and_cache_cuda_block_direct_writes_v4_payload():
+def test_byte_v2_reshape_and_cache_cuda_block_direct_writes_v5_payload():
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 custom ops are not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     key = (
         torch.arange(17 * 8 * 128, dtype=torch.float32, device="cuda")
         .reshape(17, 8, 128)
@@ -2212,7 +2915,16 @@ def test_byte_v2_reshape_and_cache_cuda_block_direct_writes_v4_payload():
     )
     cache = kv_cache.cpu()
 
-    assert torch.all(cache[:, : layout.page_header_bytes] == 0)
+    assert torch.all(cache[:, 8 : layout.page_header_bytes] == 0)
+    for physical_block in range(cache.shape[0]):
+        assert (
+            _load_u32_bytes(cache, physical_block, layout.outlier_pool_overflow_offset)
+            == 0
+        )
+        assert (
+            _load_u32_bytes(cache, physical_block, layout.outlier_pool_used_offset)
+            <= layout.outlier_pool_entries
+        )
 
     k_bits0 = _bf16_bits(key[16, 7, 126])
     k_bits1 = _bf16_bits(key[16, 7, 127])
@@ -2252,7 +2964,7 @@ def test_byte_v2_fallback_stats_counts_cache_writer_tiles():
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 custom ops are not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     key = (
         torch.arange(17 * 8 * 128, dtype=torch.float32, device="cuda")
         .reshape(17, 8, 128)
@@ -2366,7 +3078,7 @@ def test_byte_v2_raw_staging_commit_matches_direct_cache(num_tokens):
     if not _has_torch_op("_C_cache_ops", "byte_v2_commit_raw_staging_to_cache"):
         pytest.skip("ByteV2 raw staging commit custom op is not registered")
 
-    compressed_layout = ByteV2PageLayoutV4()
+    compressed_layout = ByteV2PageLayoutV5()
     staging_layout = ByteV2RawStagingLayout()
     num_blocks = (
         num_tokens + compressed_layout.tile_policy.alloc_block_tokens - 1
@@ -2445,7 +3157,12 @@ def test_byte_v2_raw_staging_commit_matches_direct_cache(num_tokens):
 
     assert int(overflow.cpu().item()) == 0
     assert int(next_staging_slot.cpu().item()) == num_blocks
-    torch.testing.assert_close(staged_cache.cpu(), direct_cache.cpu(), atol=0, rtol=0)
+    _assert_byte_v2_caches_decode_equal(
+        staged_cache,
+        direct_cache,
+        compressed_layout,
+        num_tokens=num_tokens,
+    )
 
     byte_v2_release_raw_staging(
         block_to_staging_slot,
@@ -2463,6 +3180,321 @@ def test_byte_v2_raw_staging_commit_matches_direct_cache(num_tokens):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_staging_cross_page_update_matches_direct_cache():
+    required_ops = (
+        "byte_v2_reshape_and_cache",
+        "byte_v2_append_raw_staging",
+        "byte_v2_prepare_raw_staging",
+        "byte_v2_hydrate_raw_staging_from_cache",
+        "byte_v2_release_raw_staging",
+        "byte_v2_commit_raw_staging_to_cache",
+    )
+    if not all(_has_torch_op("_C_cache_ops", op) for op in required_ops):
+        pytest.skip("ByteV2 raw staging custom ops are not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    total_tokens = 20
+    initial_tokens = 12
+    update_tokens = total_tokens - initial_tokens
+    num_blocks = 2
+    torch.manual_seed(7)
+    key = torch.randn(total_tokens, 8, 128, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    slot_mapping = torch.arange(total_tokens, dtype=torch.int64, device="cuda")
+    update_slots = slot_mapping[initial_tokens:]
+
+    staged_cache = torch.zeros(
+        (num_blocks, layout.page_size_bytes), dtype=torch.uint8, device="cuda"
+    )
+    direct_cache = torch.zeros_like(staged_cache)
+    byte_v2_reshape_and_cache(
+        key[:initial_tokens],
+        value[:initial_tokens],
+        staged_cache,
+        slot_mapping[:initial_tokens],
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    byte_v2_reshape_and_cache(
+        key,
+        value,
+        direct_cache,
+        slot_mapping,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+
+    block_to_staging_slot = torch.full(
+        (num_blocks,), -1, dtype=torch.int32, device="cuda"
+    )
+    staging_to_physical_block = torch.full(
+        (update_tokens,), -1, dtype=torch.int32, device="cuda"
+    )
+    valid_rows = torch.zeros((update_tokens,), dtype=torch.int32, device="cuda")
+    next_staging_slot = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    overflow = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    raw_staging = torch.empty(
+        (update_tokens, staging_layout.slot_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    byte_v2_prepare_raw_staging(
+        update_slots,
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+        alloc_block_tokens=16,
+    )
+    byte_v2_hydrate_raw_staging_from_cache(
+        raw_staging,
+        staged_cache,
+        staging_to_physical_block,
+        valid_rows,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    byte_v2_append_raw_staging(
+        key[initial_tokens:],
+        value[initial_tokens:],
+        raw_staging,
+        update_slots,
+        block_to_staging_slot,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    byte_v2_commit_raw_staging_to_cache(
+        raw_staging,
+        staged_cache,
+        staging_to_physical_block,
+        valid_rows,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+
+    assert int(overflow.cpu().item()) == 0
+    assert int(next_staging_slot.cpu().item()) == num_blocks
+    staged_cache_cpu = staged_cache.cpu()
+    direct_cache_cpu = direct_cache.cpu()
+    for token_idx in range(total_tokens):
+        physical_block, row = divmod(token_idx, 16)
+        for kv_head in range(8):
+            for dim in range(128):
+                for is_value in (False, True):
+                    staged = _decode_current_byte_v2_payload(
+                        staged_cache_cpu,
+                        layout,
+                        physical_block=physical_block,
+                        kv_head=kv_head,
+                        row=row,
+                        dim=dim,
+                        is_value=is_value,
+                    )
+                    direct = _decode_current_byte_v2_payload(
+                        direct_cache_cpu,
+                        layout,
+                        physical_block=physical_block,
+                        kv_head=kv_head,
+                        row=row,
+                        dim=dim,
+                        is_value=is_value,
+                    )
+                    assert staged == direct
+
+    byte_v2_release_raw_staging(
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+    )
+
+    assert torch.all(block_to_staging_slot.cpu() == -1)
+    assert torch.all(staging_to_physical_block.cpu() == -1)
+    assert torch.all(valid_rows.cpu() == 0)
+    assert int(next_staging_slot.cpu().item()) == 0
+    assert int(overflow.cpu().item()) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("start_row", [0, 12])
+@pytest.mark.parametrize(
+    ("fuse_metadata_clear", "warp_parallel_histogram"),
+    [(False, False), (True, False), (True, True)],
+)
+@pytest.mark.parametrize("update_pattern", ["random", "safe"])
+def test_byte_v2_native_raw_staging_update_matches_chained_ops(
+    start_row, fuse_metadata_clear, warp_parallel_histogram, update_pattern
+):
+    required_ops = (
+        "byte_v2_reshape_and_cache",
+        "byte_v2_append_raw_staging",
+        "byte_v2_prepare_raw_staging",
+        "byte_v2_hydrate_raw_staging_from_cache",
+        "byte_v2_commit_raw_staging_to_cache",
+        "byte_v2_release_raw_staging_and_update_flags",
+        "byte_v2_update_cache_raw_staging",
+    )
+    if not all(_has_torch_op("_C_cache_ops", op) for op in required_ops):
+        pytest.skip("ByteV2 native raw staging update op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    num_tokens = 8
+    num_blocks = (start_row + num_tokens + 15) // 16
+    initial_tokens = num_blocks * 16
+    torch.manual_seed(20260714)
+    initial_key = torch.randn(
+        initial_tokens, 8, 128, dtype=torch.bfloat16, device="cuda"
+    )
+    initial_value = torch.randn_like(initial_key)
+    initial_slots = torch.arange(initial_tokens, dtype=torch.int64, device="cuda")
+    if update_pattern == "random":
+        key = torch.randn(num_tokens, 8, 128, dtype=torch.bfloat16, device="cuda")
+        value = torch.randn_like(key)
+    else:
+        key = torch.ones(num_tokens, 8, 128, dtype=torch.bfloat16, device="cuda")
+        value = torch.full_like(key, 0.5)
+    slot_mapping = torch.arange(
+        start_row,
+        start_row + num_tokens,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    chained_cache = torch.zeros(
+        (num_blocks, layout.page_size_bytes), dtype=torch.uint8, device="cuda"
+    )
+    byte_v2_reshape_and_cache(
+        initial_key,
+        initial_value,
+        chained_cache,
+        initial_slots,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    native_cache = chained_cache.clone()
+
+    def make_state():
+        return (
+            torch.empty(
+                (num_tokens, staging_layout.slot_size_bytes),
+                dtype=torch.uint8,
+                device="cuda",
+            ),
+            torch.full((num_blocks,), -1, dtype=torch.int32, device="cuda"),
+            torch.full((num_tokens,), -1, dtype=torch.int32, device="cuda"),
+            torch.zeros((num_tokens,), dtype=torch.int32, device="cuda"),
+            torch.zeros((1,), dtype=torch.int32, device="cuda"),
+            torch.zeros((1,), dtype=torch.int32, device="cuda"),
+            torch.zeros((num_blocks,), dtype=torch.int32, device="cuda"),
+        )
+
+    chained_state = make_state()
+    native_state = make_state()
+    (
+        chained_staging,
+        chained_block_to_slot,
+        chained_slot_to_block,
+        chained_valid_rows,
+        chained_next_slot,
+        chained_overflow,
+        chained_flags,
+    ) = chained_state
+    byte_v2_prepare_raw_staging(
+        slot_mapping,
+        chained_block_to_slot,
+        chained_slot_to_block,
+        chained_valid_rows,
+        chained_next_slot,
+        chained_overflow,
+        alloc_block_tokens=16,
+    )
+    byte_v2_hydrate_raw_staging_from_cache(
+        chained_staging,
+        chained_cache,
+        chained_slot_to_block,
+        chained_valid_rows,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    byte_v2_append_raw_staging(
+        key,
+        value,
+        chained_staging,
+        slot_mapping,
+        chained_block_to_slot,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    byte_v2_commit_raw_staging_to_cache(
+        chained_staging,
+        chained_cache,
+        chained_slot_to_block,
+        chained_valid_rows,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    byte_v2_release_raw_staging_and_update_flags(
+        chained_block_to_slot,
+        chained_slot_to_block,
+        chained_valid_rows,
+        chained_next_slot,
+        chained_overflow,
+        chained_flags,
+        chained_cache,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+
+    (
+        native_staging,
+        native_block_to_slot,
+        native_slot_to_block,
+        native_valid_rows,
+        native_next_slot,
+        native_overflow,
+        native_flags,
+    ) = native_state
+    byte_v2_update_cache_raw_staging(
+        key,
+        value,
+        native_staging,
+        native_cache,
+        slot_mapping,
+        native_block_to_slot,
+        native_slot_to_block,
+        native_valid_rows,
+        native_next_slot,
+        native_overflow,
+        native_flags,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+        fuse_metadata_clear=fuse_metadata_clear,
+        warp_parallel_histogram=warp_parallel_histogram,
+    )
+    torch.accelerator.synchronize()
+
+    _assert_byte_v2_caches_decode_equal(
+        native_cache,
+        chained_cache,
+        layout,
+        num_tokens=initial_tokens,
+    )
+    for native_tensor, chained_tensor in zip(native_state[1:], chained_state[1:]):
+        torch.testing.assert_close(native_tensor, chained_tensor, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_byte_v2_raw_staging_incremental_partial_block_matches_direct_cache():
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 cache custom op is not registered")
@@ -2477,7 +3509,7 @@ def test_byte_v2_raw_staging_incremental_partial_block_matches_direct_cache():
     if not _has_torch_op("_C_cache_ops", "byte_v2_release_raw_staging"):
         pytest.skip("ByteV2 raw staging release custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     total_tokens = 56
     initial_tokens = 52
     num_blocks = (
@@ -2542,10 +3574,10 @@ def test_byte_v2_raw_staging_incremental_partial_block_matches_direct_cache():
 def test_byte_v2_single_token_cache_update_cuda_matches_direct_cache(row):
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 cache custom op is not registered")
-    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_single_token"):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_single_token_fused"):
         pytest.skip("ByteV2 single-token cache update custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     seq_len = row + 1
     token_base = torch.arange(
         seq_len * 8 * 128,
@@ -2572,11 +3604,13 @@ def test_byte_v2_single_token_cache_update_cuda_matches_direct_cache(row):
             codec_dim_block=16,
             alloc_block_tokens=16,
         )
+    page_unsafe_flags = torch.zeros((1,), dtype=torch.int32, device="cuda")
     byte_v2_update_cache_single_token(
         key[row : row + 1],
         value[row : row + 1],
         fused_cache,
         slot_mapping[row : row + 1],
+        page_unsafe_flags=page_unsafe_flags,
         codec_token_block=16,
         codec_dim_block=16,
         alloc_block_tokens=16,
@@ -2589,6 +3623,14 @@ def test_byte_v2_single_token_cache_update_cuda_matches_direct_cache(row):
         slot_mapping,
         layout=layout,
     )
+    expected_flags = torch.zeros_like(page_unsafe_flags)
+    byte_v2_update_cache_unsafe_flags(
+        expected_flags,
+        fused_cache,
+        slot_mapping[row : row + 1],
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+    torch.testing.assert_close(page_unsafe_flags, expected_flags)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -2647,7 +3689,7 @@ def test_byte_v2_paged_decode_attention_cuda_matches_current_codec_reference(
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention"):
         pytest.skip("ByteV2 decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     seq_lens_cpu = torch.tensor([5, 19], dtype=torch.int32)
     block_tables_cpu = torch.tensor([[0, -1], [1, 2]], dtype=torch.int32)
     total_tokens = int(seq_lens_cpu.sum())
@@ -2727,7 +3769,7 @@ def test_byte_v2_paged_decode_attention_cuda_matches_raw_reference(
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention"):
         pytest.skip("ByteV2 decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     num_blocks = (
         seq_len + layout.tile_policy.alloc_block_tokens - 1
     ) // layout.tile_policy.alloc_block_tokens
@@ -2813,7 +3855,7 @@ def test_byte_v2_paged_decode_attention_split_k_cuda_matches_raw_reference(
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention_split_k"):
         pytest.skip("ByteV2 split-k decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     num_blocks = (
         seq_len + layout.tile_policy.alloc_block_tokens - 1
     ) // layout.tile_policy.alloc_block_tokens
@@ -2913,7 +3955,7 @@ def test_byte_v2_paged_decode_attention_split_k_guarded_cuda_matches_raw_referen
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention_split_k_guarded"):
         pytest.skip("ByteV2 guarded split-k decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     seq_len = 64
     partition_size = 32
     num_blocks = (
@@ -2949,7 +3991,7 @@ def test_byte_v2_paged_decode_attention_split_k_guarded_cuda_matches_raw_referen
         slot_mapping,
         tile_policy=(16, 16, 16, 64, 128, 128),
     )
-    assert page_unsafe_flags.cpu().tolist() == [1] * num_blocks
+    assert page_unsafe_flags.cpu().tolist() == [7] * num_blocks
 
     query_base = torch.arange(32 * 128, dtype=torch.float32, device="cuda")
     query = ((query_base % 127) / 31).reshape(1, 32, 128).to(torch.bfloat16)
@@ -3003,6 +4045,217 @@ def test_byte_v2_paged_decode_attention_split_k_guarded_cuda_matches_raw_referen
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_guarded_fa2_direct_unsafe_pages_cuda_matches_raw_reference():
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_unsafe_flags"):
+        pytest.skip("ByteV2 unsafe flags custom op is not registered")
+    if not _has_torch_op("_C", "byte_v2_paged_decode_attention_split_k_guarded"):
+        pytest.skip("ByteV2 guarded split-k decode custom op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    seq_len = 64
+    partition_size = 64
+    num_blocks = (
+        seq_len + layout.tile_policy.alloc_block_tokens - 1
+    ) // layout.tile_policy.alloc_block_tokens
+    key_bits = torch.zeros((seq_len, 8, 128), dtype=torch.int16, device="cuda")
+    value_bits = torch.zeros_like(key_bits)
+    token_high_bits = (32 + torch.arange(seq_len, device="cuda") % 8).to(torch.int16)
+    key_bits[:, :, 0] = (token_high_bits.view(seq_len, 1) << 8) | 0x55
+    value_bits[:, :, 1] = ((token_high_bits + 16).view(seq_len, 1) << 8) | 0x66
+    key = key_bits.view(torch.bfloat16)
+    value = value_bits.view(torch.bfloat16)
+
+    slot_mapping = torch.arange(seq_len, dtype=torch.int64, device="cuda")
+    kv_cache = torch.zeros(
+        (num_blocks, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    byte_v2_reshape_and_cache(
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    page_unsafe_flags = torch.empty((num_blocks,), dtype=torch.int32, device="cuda")
+    byte_v2_update_cache_unsafe_flags(
+        page_unsafe_flags,
+        kv_cache,
+        slot_mapping,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+    assert page_unsafe_flags.cpu().tolist() == [7] * num_blocks
+
+    query_base = torch.arange(32 * 128, dtype=torch.float32, device="cuda")
+    query = ((query_base % 127) / 31).reshape(1, 32, 128).to(torch.bfloat16)
+    output = torch.empty_like(query)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device="cuda").reshape(
+        1,
+        num_blocks,
+    )
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    max_num_partitions = (seq_len + partition_size - 1) // partition_size
+    exp_sums = torch.empty(
+        (1, 32, max_num_partitions),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    max_logits = torch.empty((0,), dtype=torch.float32, device="cuda")
+    tmp_out = torch.empty(
+        (1, 32, max_num_partitions, 128),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    scale = 0.125
+
+    byte_v2_paged_decode_attention_split_k_guarded(
+        output,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        query,
+        kv_cache,
+        page_unsafe_flags,
+        block_tables,
+        seq_lens,
+        scale=scale,
+        num_kv_heads=8,
+        block_size=16,
+        max_seq_len=seq_len,
+        partition_size=partition_size,
+        tile_policy=(16, 16, 16, 64, 128, 128, 0, 1, 1, 1, 1, 0, 0, 1),
+    )
+
+    expected = _reference_raw_paged_decode(
+        query,
+        key,
+        value,
+        seq_lens,
+        scale=scale,
+        num_kv_heads=8,
+    )
+    torch.testing.assert_close(output.cpu().float(), expected, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_len", [2, 4, 8, 16])
+def test_byte_v2_speculative_verify_gqa_cuda_matches_causal_raw_reference(
+    query_len,
+):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_unsafe_flags"):
+        pytest.skip("ByteV2 unsafe flags custom op is not registered")
+    if not _has_torch_op("_C", "byte_v2_speculative_verify_gqa"):
+        pytest.skip("ByteV2 GQA speculative verify custom op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    seq_len = 64
+    partition_size = 32
+    num_blocks = seq_len // layout.tile_policy.alloc_block_tokens
+    key_bits = torch.zeros((seq_len, 8, 128), dtype=torch.int16, device="cuda")
+    value_bits = torch.zeros_like(key_bits)
+    token_high_bits = (32 + torch.arange(seq_len, device="cuda") % 8).to(torch.int16)
+    key_bits[:, :, 0] = (token_high_bits.view(seq_len, 1) << 8) | 0x55
+    value_bits[:, :, 1] = ((token_high_bits + 16).view(seq_len, 1) << 8) | 0x66
+    key = key_bits.view(torch.bfloat16)
+    value = value_bits.view(torch.bfloat16)
+
+    slot_mapping = torch.arange(seq_len, dtype=torch.int64, device="cuda")
+    kv_cache = torch.zeros(
+        (num_blocks, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    byte_v2_reshape_and_cache(
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    page_unsafe_flags = torch.empty((num_blocks,), dtype=torch.int32, device="cuda")
+    byte_v2_update_cache_unsafe_flags(
+        page_unsafe_flags,
+        kv_cache,
+        slot_mapping,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+    assert page_unsafe_flags.cpu().tolist() == [7] * num_blocks
+
+    query_base = torch.arange(query_len * 32 * 128, dtype=torch.float32, device="cuda")
+    query = ((query_base % 127) / 31).reshape(query_len, 32, 128).to(torch.bfloat16)
+    output = torch.empty_like(query)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device="cuda").reshape(
+        1, num_blocks
+    )
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    num_partitions = (seq_len + partition_size - 1) // partition_size
+    exp_sums = torch.empty(
+        (1, query_len * 32, num_partitions),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    max_logits = torch.empty((0,), dtype=torch.float32, device="cuda")
+    tmp_out = torch.empty(
+        (1, query_len * 32, num_partitions, 128),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    scale = 0.125
+
+    byte_v2_speculative_verify_gqa(
+        output,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        query,
+        kv_cache,
+        page_unsafe_flags,
+        block_tables,
+        seq_lens,
+        speculative_query_len=query_len,
+        scale=scale,
+        num_kv_heads=8,
+        block_size=16,
+        max_seq_len=seq_len,
+        partition_size=partition_size,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+
+    query_float = query.float()
+    key_float = key.float()
+    value_float = value.float()
+    expected = torch.empty_like(query_float)
+    for token_idx in range(query_len):
+        token_seq_len = seq_len - (query_len - 1) + token_idx
+        for head_idx in range(32):
+            kv_head_idx = head_idx // 4
+            scores = torch.matmul(
+                key_float[:token_seq_len, kv_head_idx],
+                query_float[token_idx, head_idx],
+            )
+            probs = torch.softmax(scores * scale, dim=0)
+            expected[token_idx, head_idx] = torch.matmul(
+                probs,
+                value_float[:token_seq_len, kv_head_idx],
+            )
+    torch.testing.assert_close(
+        output.cpu().float(),
+        expected.cpu().to(torch.bfloat16).float(),
+        atol=5e-3,
+        rtol=5e-3,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("compute_block_n", [64, 128])
 def test_byte_v2_paged_decode_attention_split_k_gqa_packed_cuda_matches_raw_reference(
     compute_block_n,
@@ -3012,7 +4265,7 @@ def test_byte_v2_paged_decode_attention_split_k_gqa_packed_cuda_matches_raw_refe
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention_split_k"):
         pytest.skip("ByteV2 split-k decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     seq_len = 96
     partition_size = 32
     num_blocks = (
@@ -3101,15 +4354,17 @@ def test_byte_v2_paged_decode_attention_split_k_gqa_packed_cuda_matches_raw_refe
         "use_fa2_direct",
         "seq_len",
         "partition_size",
+        "direct_diagnostic_mode",
     ),
     [
-        (False, False, False, False, 96, 64),
-        (True, False, False, False, 96, 64),
-        (True, True, False, False, 96, 64),
-        (True, False, True, False, 96, 64),
-        (True, False, False, True, 96, 64),
-        (True, False, False, True, 192, 128),
-        (True, False, False, True, 320, 256),
+        (False, False, False, False, 96, 64, 0),
+        (True, False, False, False, 96, 64, 0),
+        (True, True, False, False, 96, 64, 0),
+        (True, False, True, False, 96, 64, 0),
+        (True, False, False, True, 96, 64, 0),
+        (True, False, False, True, 192, 128, 0),
+        (True, False, False, True, 320, 256, 0),
+        (True, False, False, True, 320, 256, 27),
     ],
 )
 def test_byte_v2_paged_decode_attention_split_k_gqa_fa2_like_cuda_matches_raw_reference(
@@ -3119,13 +4374,14 @@ def test_byte_v2_paged_decode_attention_split_k_gqa_fa2_like_cuda_matches_raw_re
     use_fa2_direct,
     seq_len,
     partition_size,
+    direct_diagnostic_mode,
 ):
     if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
         pytest.skip("ByteV2 cache custom op is not registered")
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention_split_k"):
         pytest.skip("ByteV2 split-k decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     num_blocks = (
         seq_len + layout.tile_policy.alloc_block_tokens - 1
     ) // layout.tile_policy.alloc_block_tokens
@@ -3167,7 +4423,11 @@ def test_byte_v2_paged_decode_attention_split_k_gqa_fa2_like_cuda_matches_raw_re
         dtype=torch.float32,
         device="cuda",
     )
-    max_logits = torch.empty((0,), dtype=torch.float32, device="cuda")
+    max_logits = (
+        torch.empty_like(exp_sums)
+        if direct_diagnostic_mode == 27
+        else torch.empty((0,), dtype=torch.float32, device="cuda")
+    )
     tmp_out = torch.empty(
         (1, 32, max_num_partitions, 128),
         dtype=torch.float32,
@@ -3193,6 +4453,8 @@ def test_byte_v2_paged_decode_attention_split_k_gqa_fa2_like_cuda_matches_raw_re
         tile_policy += (1,)
     elif use_fa2_direct:
         tile_policy += (0, 0, 1)
+        if direct_diagnostic_mode:
+            tile_policy += (direct_diagnostic_mode,)
 
     byte_v2_paged_decode_attention_split_k(
         output,
@@ -3232,7 +4494,7 @@ def test_byte_v2_split_k_fa2_direct_grouped_q_cuda_matches_raw_reference(
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention_split_k"):
         pytest.skip("ByteV2 split-k decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     seq_len = 48
     partition_size = 64
     num_kv_heads = 8
@@ -3336,7 +4598,7 @@ def test_byte_v2_paged_decode_attention_cuda_rejects_raw_fallback_without_payloa
     if not _has_torch_op("_C", "byte_v2_paged_decode_attention"):
         pytest.skip("ByteV2 decode custom op is not registered")
 
-    layout = ByteV2PageLayoutV4()
+    layout = ByteV2PageLayoutV5()
     seq_len = 1
     num_blocks = (
         seq_len + layout.tile_policy.alloc_block_tokens - 1

@@ -12,6 +12,63 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+DIRECT_DIAGNOSTIC_MODE_IDS = {
+    "current": 0,
+    "decode-stage-only": 1,
+    "fake-decode-zero": 2,
+    "raw-same-skeleton": 3,
+    "k-decode-stage-only": 4,
+    "v-decode-stage-only": 5,
+    "k-decode-qk-only": 6,
+    "v-decode-pv-only": 7,
+    "k-decode-producer3-stage-only": 8,
+    "v-decode-producer3-stage-only": 9,
+    "k-decode-producer2-stage-only": 10,
+    "v-decode-producer2-stage-only": 11,
+    "k-decode-no-store-stage-only": 12,
+    "v-decode-no-store-stage-only": 13,
+    "k-decode-low-only-stage-only": 14,
+    "v-decode-low-only-stage-only": 15,
+    "k-decode-high-only-stage-only": 16,
+    "v-decode-high-only-stage-only": 17,
+    "phase-profile": 18,
+    "stage-window16": 19,
+    "stage-window32": 20,
+    "stage-window16-specialized": 21,
+    "qk-window16-profile": 22,
+    "effective-m16-profile": 23,
+    "v-decode-pv-no-gemm-only": 24,
+    "v-decode-pv-no-accum-only": 25,
+    "k-decode-qk-no-output": 26,
+    "unnormalized-partition-output": 27,
+}
+
+PHASE_PROFILE_KEYS = (
+    "total_cycles",
+    "stage_cycles",
+    "qk_cycles",
+    "softmax_cycles",
+    "pv_cycles",
+    "stage_wait_warp0_cycles",
+    "stage_wait_warp1_cycles",
+    "stage_wait_warp2_cycles",
+    "stage_wait_warp3_cycles",
+    "compute_wait_warp0_cycles",
+    "compute_wait_warp1_cycles",
+    "compute_wait_warp2_cycles",
+    "compute_wait_warp3_cycles",
+    "tile_count",
+    "compute_block_n_profiled",
+    "partition_size_profiled",
+    "compute_region_warp0_cycles",
+    "compute_region_warp1_cycles",
+    "compute_region_warp2_cycles",
+    "compute_region_warp3_cycles",
+    "qk_window_count",
+    "qk_window_dim",
+    "qk_windows_per_tile",
+)
+
 
 def _prepend_venv_bin_to_path() -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -119,13 +176,50 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--high-byte-payload",
+        action="store_true",
+        help=(
+            "Use the experimental low+raw-high-byte ByteV2 payload format. "
+            "This is an upper-bound format/kernel co-design experiment and "
+            "currently requires --gqa-fa2-direct."
+        ),
+    )
+    parser.add_argument(
+        "--sideband-high-payload",
+        action="store_true",
+        help=(
+            "Use the experimental tile-local outlier high-byte sideband format. "
+            "Safe tiles keep the default fixed payload; outlier tiles read high "
+            "bytes from the outlier payload sideband. Requires guarded "
+            "FA2-direct decode."
+        ),
+    )
+    parser.add_argument(
         "--guarded-split",
         action="store_true",
         help=("Use the split-k no-outlier fast path guarded by per-page unsafe flags."),
     )
     parser.add_argument(
+        "--direct-diagnostic-modes",
+        nargs="+",
+        choices=tuple(DIRECT_DIAGNOSTIC_MODE_IDS),
+        default=["current"],
+        help=(
+            "FA2-direct diagnostic variants to benchmark. Non-current modes "
+            "are benchmark-only and currently require q_per_kv=4."
+        ),
+    )
+    parser.add_argument(
         "--output-jsonl",
         default="profiles/byte_v2_decode_microbench.jsonl",
+    )
+    parser.add_argument(
+        "--cuda-profiler-range",
+        action="store_true",
+        help=(
+            "Wrap timed iterations in cudaProfilerStart/Stop for Nsight "
+            "Compute --profile-from-start off."
+        ),
     )
     return parser.parse_args()
 
@@ -150,6 +244,7 @@ def _time_cuda_kernel(
     *,
     warmup: int,
     iters: int,
+    cuda_profiler_range: bool = False,
 ) -> tuple[dict[str, float], Any]:
     import torch
 
@@ -159,6 +254,8 @@ def _time_cuda_kernel(
     torch.accelerator.synchronize()
 
     events = []
+    if cuda_profiler_range:
+        torch.cuda.cudart().cudaProfilerStart()
     for _ in range(iters):
         start_event = torch.Event(enable_timing=True)
         end_event = torch.Event(enable_timing=True)
@@ -167,6 +264,8 @@ def _time_cuda_kernel(
         end_event.record()
         events.append((start_event, end_event))
     torch.accelerator.synchronize()
+    if cuda_profiler_range:
+        torch.cuda.cudart().cudaProfilerStop()
 
     return _stats_ms([start.elapsed_time(end) for start, end in events]), result
 
@@ -183,9 +282,15 @@ def _workspace_mib(*tensors: Any) -> float:
 def _make_inputs(args: argparse.Namespace, seq_len: int) -> dict[str, Any]:
     import torch
 
-    from vllm.v1.attention.backends.byte_v2_layout import ByteV2PageLayoutV4
+    from vllm.v1.attention.backends.byte_v2_layout import (
+        ByteV2CodecPayloadPolicy,
+        ByteV2PageLayoutV4,
+        ByteV2RawStagingLayout,
+    )
     from vllm.v1.attention.backends.byte_v2_ops import (
         byte_v2_reshape_and_cache,
+        byte_v2_reshape_and_cache_high_byte,
+        byte_v2_reshape_and_cache_sideband_high,
         byte_v2_update_cache_unsafe_flags,
     )
 
@@ -259,21 +364,55 @@ def _make_inputs(args: argparse.Namespace, seq_len: int) -> dict[str, Any]:
         device=device,
     )
 
-    layout = ByteV2PageLayoutV4(num_kv_heads=args.num_kv_heads)
+    if args.high_byte_payload:
+        layout = ByteV2PageLayoutV4(
+            codec_payload_policy=ByteV2CodecPayloadPolicy(exponent_code_bits=8),
+            num_kv_heads=args.num_kv_heads,
+        )
+    elif args.sideband_high_payload:
+        layout = ByteV2PageLayoutV4(
+            codec_payload_policy=ByteV2CodecPayloadPolicy(
+                outlier_high_sideband=True,
+            ),
+            num_kv_heads=args.num_kv_heads,
+        )
+    else:
+        layout = ByteV2PageLayoutV4(num_kv_heads=args.num_kv_heads)
     kv_cache = torch.zeros(
         (num_blocks, layout.page_size_bytes),
         dtype=torch.uint8,
         device=device,
     )
-    byte_v2_reshape_and_cache(
-        key,
-        value,
-        kv_cache,
-        slot_mapping,
-        codec_token_block=16,
-        codec_dim_block=16,
-        alloc_block_tokens=16,
-    )
+    if args.high_byte_payload:
+        byte_v2_reshape_and_cache_high_byte(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            codec_token_block=16,
+            codec_dim_block=16,
+            alloc_block_tokens=16,
+        )
+    elif args.sideband_high_payload:
+        byte_v2_reshape_and_cache_sideband_high(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            codec_token_block=16,
+            codec_dim_block=16,
+            alloc_block_tokens=16,
+        )
+    else:
+        byte_v2_reshape_and_cache(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            codec_token_block=16,
+            codec_dim_block=16,
+            alloc_block_tokens=16,
+        )
     page_unsafe_flags = None
     if args.guarded_split:
         page_unsafe_flags = torch.empty(
@@ -299,10 +438,36 @@ def _make_inputs(args: argparse.Namespace, seq_len: int) -> dict[str, Any]:
     raw_value_cache = torch.zeros_like(raw_key_cache)
     raw_key_cache.view(-1, args.num_kv_heads, args.head_size)[slot_mapping] = key
     raw_value_cache.view(-1, args.num_kv_heads, args.head_size)[slot_mapping] = value
+    raw_layout = ByteV2RawStagingLayout(num_kv_heads=args.num_kv_heads)
+    raw_skeleton_stride = max(layout.page_size_bytes, raw_layout.slot_size_bytes)
+    raw_skeleton_cache = torch.empty(
+        (num_blocks, raw_skeleton_stride),
+        dtype=torch.uint8,
+        device=device,
+    )
+    raw_key_bytes = (
+        raw_key_cache.permute(0, 2, 1, 3)
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(num_blocks, -1)
+    )
+    raw_value_bytes = (
+        raw_value_cache.permute(0, 2, 1, 3)
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(num_blocks, -1)
+    )
+    raw_skeleton_cache[:, : raw_layout.key_bytes].copy_(raw_key_bytes)
+    raw_skeleton_cache[
+        :,
+        raw_layout.value_base_bytes : raw_layout.value_base_bytes
+        + raw_layout.value_bytes,
+    ].copy_(raw_value_bytes)
 
     return {
         "query": query,
         "kv_cache": kv_cache,
+        "raw_skeleton_cache": raw_skeleton_cache,
         "raw_key_cache": raw_key_cache,
         "raw_value_cache": raw_value_cache,
         "block_tables": block_tables,
@@ -321,6 +486,7 @@ def _byte_v2_split_fn(
     seq_len: int,
     partition_size: int,
     compute_block_n: int,
+    direct_diagnostic_mode: str = "current",
 ):
     import torch
 
@@ -338,11 +504,22 @@ def _byte_v2_split_fn(
         dtype=torch.float32,
         device=tensors["query"].device,
     )
-    max_logits = torch.empty(
-        (0,),
-        dtype=torch.float32,
-        device=tensors["query"].device,
-    )
+    if direct_diagnostic_mode in {
+        "phase-profile",
+        "stage-window16",
+        "stage-window32",
+        "stage-window16-specialized",
+        "qk-window16-profile",
+        "effective-m16-profile",
+        "unnormalized-partition-output",
+    }:
+        max_logits = torch.empty_like(exp_sums)
+    else:
+        max_logits = torch.empty(
+            (0,),
+            dtype=torch.float32,
+            device=tensors["query"].device,
+        )
     tmp_out = torch.empty(
         args.num_seqs,
         args.num_heads,
@@ -373,6 +550,11 @@ def _byte_v2_split_fn(
                     tile_policy += (1,)
                 elif args.gqa_fa2_direct:
                     tile_policy += (0, 0, 1)
+                    diagnostic_mode_id = DIRECT_DIAGNOSTIC_MODE_IDS[
+                        direct_diagnostic_mode
+                    ]
+                    if diagnostic_mode_id:
+                        tile_policy += (diagnostic_mode_id,)
     elif args.assume_no_outlier:
         tile_policy = (
             16,
@@ -386,6 +568,15 @@ def _byte_v2_split_fn(
         )
     else:
         tile_policy = (16, 16, 16, compute_block_n, args.head_size, args.head_size)
+    if args.high_byte_payload or args.sideband_high_payload:
+        if len(tile_policy) == 14:
+            tile_policy += (0,)
+        tile_policy += (1 if args.high_byte_payload else 2,)
+
+    if direct_diagnostic_mode == "raw-same-skeleton":
+        kv_cache = tensors["raw_skeleton_cache"]
+    else:
+        kv_cache = tensors["kv_cache"]
 
     def run():
         if args.guarded_split:
@@ -395,7 +586,7 @@ def _byte_v2_split_fn(
                 max_logits,
                 tmp_out,
                 tensors["query"],
-                tensors["kv_cache"],
+                kv_cache,
                 tensors["page_unsafe_flags"],
                 tensors["block_tables"],
                 tensors["seq_lens"],
@@ -413,7 +604,7 @@ def _byte_v2_split_fn(
                 max_logits,
                 tmp_out,
                 tensors["query"],
-                tensors["kv_cache"],
+                kv_cache,
                 tensors["block_tables"],
                 tensors["seq_lens"],
                 scale=tensors["scale"],
@@ -424,6 +615,16 @@ def _byte_v2_split_fn(
                 tile_policy=tile_policy,
             )
         return output
+
+    if direct_diagnostic_mode in {
+        "phase-profile",
+        "stage-window16",
+        "stage-window32",
+        "stage-window16-specialized",
+        "qk-window16-profile",
+        "effective-m16-profile",
+    }:
+        run.phase_profile_tensor = max_logits  # type: ignore[attr-defined]
 
     return run, output, _workspace_mib(exp_sums, max_logits, tmp_out)
 
@@ -555,6 +756,10 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                             suffix += "_direct"
             elif args.assume_no_outlier:
                 suffix = "_nooutlier"
+            if args.high_byte_payload:
+                suffix += "_highbyte"
+            elif args.sideband_high_payload:
+                suffix += "_sideband_high"
             if args.guarded_split:
                 suffix += "_guarded"
             variants.append(
@@ -562,6 +767,7 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                     f"byte_v2_single_bn{compute_block_n}{suffix}",
                     None,
                     compute_block_n,
+                    "current",
                     *_byte_v2_single_fn(
                         args,
                         tensors,
@@ -591,20 +797,34 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                             suffix += "_direct"
             elif args.assume_no_outlier:
                 suffix = "_nooutlier"
-            variants.append(
-                (
-                    f"byte_v2_split_p{partition_size}_bn{compute_block_n}{suffix}",
-                    partition_size,
-                    compute_block_n,
-                    *_byte_v2_split_fn(
-                        args,
-                        tensors,
-                        seq_len=seq_len,
-                        partition_size=partition_size,
-                        compute_block_n=compute_block_n,
-                    ),
-                )
+            if args.high_byte_payload:
+                suffix += "_highbyte"
+            elif args.sideband_high_payload:
+                suffix += "_sideband_high"
+            diagnostic_modes = (
+                args.direct_diagnostic_modes if args.gqa_fa2_direct else ["current"]
             )
+            for diagnostic_mode in diagnostic_modes:
+                diagnostic_suffix = (
+                    "" if diagnostic_mode == "current" else f"_diag_{diagnostic_mode}"
+                )
+                variants.append(
+                    (
+                        f"byte_v2_split_p{partition_size}_bn{compute_block_n}"
+                        f"{suffix}{diagnostic_suffix}",
+                        partition_size,
+                        compute_block_n,
+                        diagnostic_mode,
+                        *_byte_v2_split_fn(
+                            args,
+                            tensors,
+                            seq_len=seq_len,
+                            partition_size=partition_size,
+                            compute_block_n=compute_block_n,
+                            direct_diagnostic_mode=diagnostic_mode,
+                        ),
+                    )
+                )
     if args.include_flash:
         if fa_version is None:
             raise RuntimeError("could not determine FlashAttention version")
@@ -613,16 +833,26 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                 f"vllm_flash_paged_fa{fa_version}",
                 None,
                 None,
+                "current",
                 *_flash_paged_fn(args, tensors, seq_len=seq_len, fa_version=fa_version),
             )
         )
 
-    for name, partition_size, compute_block_n, run, output, workspace_mib in variants:
+    for (
+        name,
+        partition_size,
+        compute_block_n,
+        diagnostic_mode,
+        run,
+        output,
+        workspace_mib,
+    ) in variants:
         try:
             stats, result = _time_cuda_kernel(
                 run,
                 warmup=args.warmup,
                 iters=args.iters,
+                cuda_profiler_range=args.cuda_profiler_range,
             )
             result = result[0] if isinstance(result, tuple) else result
             if result is not output:
@@ -656,6 +886,9 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                 "gqa_fa2_mainloop": args.gqa_fa2_mainloop,
                 "gqa_fa2_multiwarp": args.gqa_fa2_multiwarp,
                 "gqa_fa2_direct": args.gqa_fa2_direct,
+                "high_byte_payload": args.high_byte_payload,
+                "sideband_high_payload": args.sideband_high_payload,
+                "direct_diagnostic_mode": diagnostic_mode,
                 "guarded_split": args.guarded_split,
                 "workspace_mib": workspace_mib,
                 "warmup": args.warmup,
@@ -663,6 +896,17 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                 "max_abs_diff_vs_first": max_abs_diff,
                 **stats,
             }
+            phase_profile_tensor = getattr(run, "phase_profile_tensor", None)
+            if phase_profile_tensor is not None:
+                phase_values = (
+                    phase_profile_tensor.detach()
+                    .flatten()[: len(PHASE_PROFILE_KEYS)]
+                    .cpu()
+                    .tolist()
+                )
+                row["phase_profile_cycles"] = dict(
+                    zip(PHASE_PROFILE_KEYS, phase_values, strict=False)
+                )
         except Exception as exc:
             row = {
                 "name": name,
@@ -684,6 +928,9 @@ def _benchmark_one(args: argparse.Namespace, seq_len: int) -> list[dict[str, Any
                 "gqa_fa2_mainloop": args.gqa_fa2_mainloop,
                 "gqa_fa2_multiwarp": args.gqa_fa2_multiwarp,
                 "gqa_fa2_direct": args.gqa_fa2_direct,
+                "high_byte_payload": args.high_byte_payload,
+                "sideband_high_payload": args.sideband_high_payload,
+                "direct_diagnostic_mode": diagnostic_mode,
                 "guarded_split": args.guarded_split,
                 "warmup": args.warmup,
                 "iters": args.iters,
@@ -707,6 +954,7 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
         "num_partitions,compute_block_n,no_outlier_inputs,"
         "force_outlier_inputs,assume_no_outlier,gqa_packed,gqa_fa2_like,"
         "gqa_fa2_qk_mma,gqa_fa2_mainloop,gqa_fa2_multiwarp,gqa_fa2_direct,"
+        "high_byte_payload,sideband_high_payload,direct_diagnostic_mode,"
         "guarded_split,workspace_mib,"
         "max_abs_diff_vs_first,error"
     )
@@ -726,6 +974,9 @@ def _print_summary(rows: list[dict[str, Any]]) -> None:
             f"{row.get('gqa_fa2_mainloop', '')},"
             f"{row.get('gqa_fa2_multiwarp', '')},"
             f"{row.get('gqa_fa2_direct', '')},"
+            f"{row.get('high_byte_payload', '')},"
+            f"{row.get('sideband_high_payload', '')},"
+            f"{row.get('direct_diagnostic_mode', '')},"
             f"{row.get('guarded_split', '')},"
             f"{row.get('workspace_mib', '')},"
             f"{row.get('max_abs_diff_vs_first', '')},{row.get('error', '')}"
@@ -752,6 +1003,57 @@ def main() -> None:
         raise ValueError("--gqa-fa2-multiwarp requires --gqa-fa2-qk-mma")
     if args.gqa_fa2_direct and not args.gqa_fa2_qk_mma:
         raise ValueError("--gqa-fa2-direct requires --gqa-fa2-qk-mma")
+    payload_mode_count = sum(
+        (
+            args.high_byte_payload,
+            args.sideband_high_payload,
+        )
+    )
+    if payload_mode_count > 1:
+        raise ValueError(
+            "only one of --high-byte-payload and --sideband-high-payload may be set"
+        )
+    if args.high_byte_payload and not (args.assume_no_outlier and args.gqa_fa2_direct):
+        raise ValueError(
+            "--high-byte-payload requires --assume-no-outlier and --gqa-fa2-direct"
+        )
+    if args.high_byte_payload and args.include_single:
+        raise ValueError("--high-byte-payload currently supports split-k only")
+    if args.high_byte_payload and args.direct_diagnostic_modes != ["current"]:
+        raise ValueError(
+            "--high-byte-payload currently supports only the current direct "
+            "diagnostic mode"
+        )
+    if args.sideband_high_payload and not (
+        args.assume_no_outlier and args.gqa_fa2_direct and args.guarded_split
+    ):
+        raise ValueError(
+            "--sideband-high-payload requires --assume-no-outlier, "
+            "--gqa-fa2-direct, and --guarded-split"
+        )
+    if args.sideband_high_payload and args.include_single:
+        raise ValueError("--sideband-high-payload currently supports split-k only")
+    if args.sideband_high_payload and args.direct_diagnostic_modes != ["current"]:
+        raise ValueError(
+            "--sideband-high-payload currently supports only the current "
+            "direct diagnostic mode"
+        )
+    if args.direct_diagnostic_modes != ["current"] and not args.gqa_fa2_direct:
+        raise ValueError("--direct-diagnostic-modes requires --gqa-fa2-direct")
+    q_per_kv = args.num_heads // args.num_kv_heads
+    effective_m16_enabled = any(
+        mode == "effective-m16-profile" for mode in args.direct_diagnostic_modes
+    )
+    other_diagnostic_enabled = any(
+        mode not in {"current", "effective-m16-profile"}
+        for mode in args.direct_diagnostic_modes
+    )
+    if effective_m16_enabled and q_per_kv != 16:
+        raise ValueError("effective-m16-profile requires q_per_kv=16")
+    if other_diagnostic_enabled and q_per_kv != 4:
+        raise ValueError(
+            "non-current --direct-diagnostic-modes currently require q_per_kv=4"
+        )
     enabled_fa2_subpaths = sum(
         int(flag)
         for flag in (

@@ -364,7 +364,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
 
     ByteV2 stores compressed K/V payloads plus per-page metadata in a custom
     byte layout. The raw KV allocation therefore uses ``torch.uint8`` and the
-    page size comes from ``ByteV2PageLayoutV4`` instead of the normal
+    page size comes from ``ByteV2PageLayoutV5`` instead of the normal
     ``head_size * dtype`` formula.
     """
 
@@ -372,10 +372,11 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
     codec_low_bytes_per_elem: int = 1
     codec_exponent_code_bits: int = 4
     page_header_bytes: int = 128
-    kv_head_meta_bytes: int = 64
+    kv_head_meta_bytes: int = 96
     alignment_bytes: int = 128
     outlier_value_bits: int = 8
     outlier_entries_per_tile: int = 256
+    outlier_pool_entries: int = 1024
     include_raw_payload: bool = False
 
     def __post_init__(self):
@@ -395,14 +396,35 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
                 head_dim_v=self.head_size_v,
             ),
         )
+        compiled_layout = {
+            "codec_low_bytes_per_elem": 1,
+            "codec_exponent_code_bits": 4,
+            "page_header_bytes": 128,
+            "kv_head_meta_bytes": 96,
+            "alignment_bytes": 128,
+            "outlier_value_bits": 8,
+            "outlier_entries_per_tile": 256,
+            "outlier_pool_entries": 1024,
+            "include_raw_payload": False,
+        }
+        mismatches = [
+            name
+            for name, compiled_value in compiled_layout.items()
+            if getattr(self, name) != compiled_value
+        ]
+        if mismatches:
+            raise ValueError(
+                "ByteV2FullAttentionSpec does not match the compiled V5 CUDA "
+                f"layout; unsupported fields: {', '.join(mismatches)}"
+            )
 
     def _page_layout(self):
         from vllm.v1.attention.backends.byte_v2_layout import (
             ByteV2CodecPayloadPolicy,
-            ByteV2PageLayoutV4,
+            ByteV2PageLayoutV5,
         )
 
-        return ByteV2PageLayoutV4(
+        return ByteV2PageLayoutV5(
             tile_policy=self.tile_policy,
             codec_payload_policy=ByteV2CodecPayloadPolicy(
                 low_bytes_per_elem=self.codec_low_bytes_per_elem,
@@ -414,6 +436,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
             alignment_bytes=self.alignment_bytes,
             outlier_value_bits=self.outlier_value_bits,
             outlier_entries_per_tile=self.outlier_entries_per_tile,
+            outlier_pool_entries=self.outlier_pool_entries,
             include_raw_payload=self.include_raw_payload,
         )
 
@@ -449,6 +472,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
                 and spec.alignment_bytes == first.alignment_bytes
                 and spec.outlier_value_bits == first.outlier_value_bits
                 and spec.outlier_entries_per_tile == first.outlier_entries_per_tile
+                and spec.outlier_pool_entries == first.outlier_pool_entries
                 and spec.include_raw_payload == first.include_raw_payload
             ), (
                 "All ByteV2 layers in the same KV cache group must use the "
@@ -464,6 +488,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
             alignment_bytes=first.alignment_bytes,
             outlier_value_bits=first.outlier_value_bits,
             outlier_entries_per_tile=first.outlier_entries_per_tile,
+            outlier_pool_entries=first.outlier_pool_entries,
             include_raw_payload=first.include_raw_payload,
         )
 
