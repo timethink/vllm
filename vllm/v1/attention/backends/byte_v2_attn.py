@@ -40,6 +40,8 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_collect_cache_stats,
     byte_v2_commit_raw_staging_to_cache,
     byte_v2_custom_ops_are_available,
+    byte_v2_fa2_decode_is_available,
+    byte_v2_fa2_paged_decode_attention,
     byte_v2_hydrate_raw_staging_from_cache,
     byte_v2_paged_decode_attention,
     byte_v2_paged_decode_attention_split_k,
@@ -50,6 +52,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_release_raw_staging_and_update_flags,
     byte_v2_reshape_and_cache,
     byte_v2_speculative_verify_gqa,
+    byte_v2_speculative_verify_ragged_q4,
     byte_v2_update_cache_raw_staging,
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
@@ -58,6 +61,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
 _BYTE_V2_KERNELS_NOT_READY = "ByteV2 native CUDA kernels are not registered yet"
 _BYTE_V2_MAX_RAW_STAGING_TOKENS = 1024
 _BYTE_V2_UNNORMALIZED_PARTITION_OUTPUT_MODE = 27
+_BYTE_V2_FA2_PAGE_SIZE_BYTES = ByteV2PageLayoutV5().page_size_bytes
 logger = init_logger(__name__)
 
 
@@ -78,6 +82,17 @@ def _decode_raw_fallback_enabled() -> bool:
     if value is None:
         return False
     return value.lower() not in ("0", "false", "no", "off")
+
+
+def _decode_kernel_mode() -> str:
+    value = os.environ.get("BYTE_V2_DECODE_KERNEL")
+    if value is None:
+        return "legacy"
+    mode = value.lower()
+    if mode not in ("legacy", "fa2", "auto"):
+        logger.warning("[ByteV2] ignoring invalid BYTE_V2_DECODE_KERNEL=%r", value)
+        return "legacy"
+    return mode
 
 
 def _decode_assume_no_outlier_enabled() -> bool:
@@ -178,6 +193,13 @@ def _speculative_verify_gqa_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _speculative_verify_ragged_q4_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_SPECULATIVE_VERIFY_RAGGED_Q4")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 def _cached_prefix_q16_enabled() -> bool:
     value = os.environ.get("BYTE_V2_CACHED_PREFIX_Q16")
     if value is None:
@@ -231,6 +253,7 @@ class ByteV2AttentionMetadata(AttentionMetadata):
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     causal: bool
+    seq_len_sum: int | None = None
     common_prefix_len: int = 0
     tile_policy: ByteV2TilePolicy = DEFAULT_BYTE_V2_TILE_POLICY
 
@@ -268,17 +291,31 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
         fast_build: bool = False,
     ) -> ByteV2AttentionMetadata:
         del fast_build
+        seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        num_reqs = int(
+            getattr(
+                common_attn_metadata,
+                "num_reqs",
+                0 if seq_lens_cpu is None else seq_lens_cpu.shape[0],
+            )
+        )
+        seq_len_sum = (
+            int(seq_lens_cpu[:num_reqs].sum().item())
+            if seq_lens_cpu is not None and num_reqs > 0
+            else None
+        )
         return ByteV2AttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
-            seq_lens_cpu=getattr(common_attn_metadata, "_seq_lens_cpu", None),
+            seq_lens_cpu=seq_lens_cpu,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             causal=common_attn_metadata.causal,
+            seq_len_sum=seq_len_sum,
             common_prefix_len=int(common_prefix_len),
             tile_policy=self.tile_policy,
         )
@@ -718,6 +755,20 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             num_kv_heads=self.num_kv_heads,
         )
         self.prefill_backend = _prefill_backend()
+        self.decode_kernel_mode = _decode_kernel_mode()
+        self.decode_fa2_available = False
+        if self.decode_kernel_mode != "legacy":
+            self.decode_fa2_available = byte_v2_fa2_decode_is_available()
+            if self.decode_kernel_mode == "fa2" and not self.decode_fa2_available:
+                raise RuntimeError(
+                    "BYTE_V2_DECODE_KERNEL=fa2 was requested, but the ByteV2 "
+                    "FA2 extension op is unavailable"
+                )
+            if self.decode_kernel_mode == "auto" and not self.decode_fa2_available:
+                logger.warning_once(
+                    "[ByteV2] ByteV2 FA2 decode is unavailable; using the "
+                    "legacy decode kernel"
+                )
         self.decode_raw_fallback = _decode_raw_fallback_enabled()
         self.decode_assume_no_outlier = _decode_assume_no_outlier_enabled()
         self.decode_gqa_packed = _decode_gqa_packed_enabled()
@@ -730,6 +781,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         self.decode_page_unsafe_flags = _decode_page_unsafe_flags_enabled()
         self.speculative_verify_q4 = _speculative_verify_q4_enabled()
         self.speculative_verify_gqa = _speculative_verify_gqa_enabled()
+        self.speculative_verify_ragged_q4 = _speculative_verify_ragged_q4_enabled()
         self.cached_prefix_q16 = _cached_prefix_q16_enabled()
         if self.decode_gqa_packed and not self.decode_assume_no_outlier:
             logger.warning(
@@ -797,7 +849,10 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         )
         self._decode_exp_sums: torch.Tensor | None = None
         self._decode_max_logits: torch.Tensor | None = None
+        self._decode_empty_max_logits: torch.Tensor | None = None
         self._decode_tmp_out: torch.Tensor | None = None
+        self._speculative_ragged_exp_sums: torch.Tensor | None = None
+        self._speculative_ragged_tmp_out: torch.Tensor | None = None
         self._decode_cache_stats: torch.Tensor | None = None
         self._decode_page_unsafe_flags: torch.Tensor | None = None
         self._decode_page_unsafe_flags_cache_ptr: int | None = None
@@ -889,6 +944,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         *,
         num_decode_tokens: int = 1,
         use_gqa_packed: bool | None = None,
+        seq_len_sum: int | None = None,
     ) -> int:
         if use_gqa_packed is None:
             use_gqa_packed = self._use_gqa_packed_decode(max_seq_len)
@@ -899,6 +955,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                         return self._auto_gqa_fa2_direct_partition_size(
                             max_seq_len,
                             num_decode_tokens,
+                            seq_len_sum=seq_len_sum,
                         )
                     return self.decode_gqa_packed_partition_size
                 return self.tile_policy.compute_block_n
@@ -979,7 +1036,20 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         self,
         max_seq_len: int,
         num_decode_tokens: int,
+        *,
+        seq_len_sum: int | None = None,
     ) -> int:
+        # A fixed four-way split underutilizes the GPU when a B4 decode batch is
+        # strongly ragged. The 0.8 threshold keeps the uniform/safe regime on
+        # the existing heuristic while using the measured N64 sweet spot for
+        # ragged 2K decode.
+        if (
+            num_decode_tokens == 4
+            and 2048 <= max_seq_len < 4096
+            and seq_len_sum is not None
+            and seq_len_sum * 5 <= max_seq_len * num_decode_tokens * 4
+        ):
+            return self.tile_policy.compute_block_n
         num_splits = self._auto_gqa_fa2_direct_num_splits(
             max_seq_len,
             num_decode_tokens,
@@ -1014,6 +1084,15 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
 
     def _speculative_q4_partition_size(self, max_seq_len: int) -> int:
         return self._speculative_gqa_partition_size(max_seq_len, 4)
+
+    def _speculative_ragged_q4_partition_size(self, max_seq_len: int) -> int:
+        if self.decode_gqa_packed_partition_size_explicit:
+            return self.decode_gqa_packed_partition_size
+        if max_seq_len >= 16384:
+            return 256
+        if max_seq_len >= 8192:
+            return 128
+        return 64
 
     def _auto_gqa_fa2_direct_num_splits(
         self,
@@ -1139,6 +1218,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 self.decode_assume_no_outlier
                 or self.speculative_verify_q4
                 or self.speculative_verify_gqa
+                or self.speculative_verify_ragged_q4
                 or self.cached_prefix_q16
             )
         ):
@@ -1227,46 +1307,144 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 use_gqa_packed=use_gqa_packed,
             )
         num_partitions = max(1, (max_seq_len + partition_size - 1) // partition_size)
-        stats_shape = (output.shape[0], self.num_heads, num_partitions)
-        tmp_shape = (*stats_shape, self.head_size)
+        # CUDA graphs are captured in descending batch-size order. Reserve enough
+        # partitions for every decode heuristic bucket on the first capture so a
+        # later, smaller batch cannot replace storage referenced by an older graph.
+        capacity_partitions = num_partitions
+        for candidate_tokens in (1, 2, 4):
+            candidate_partition_size = self._decode_partition_size(
+                max_seq_len,
+                num_decode_tokens=candidate_tokens,
+                use_gqa_packed=use_gqa_packed,
+                seq_len_sum=0 if candidate_tokens == 4 else None,
+            )
+            capacity_partitions = max(
+                capacity_partitions,
+                (max_seq_len + candidate_partition_size - 1)
+                // candidate_partition_size,
+            )
+        num_output_tokens = output.shape[0]
         if use_unnormalized_partition_output is None:
             use_unnormalized_partition_output = self._use_unnormalized_partition_output(
                 max_seq_len,
                 num_decode_tokens=num_decode_tokens,
                 use_gqa_packed=use_gqa_packed,
             )
-        max_logits_shape = stats_shape if use_unnormalized_partition_output else (0,)
-
+        stats_shape = (num_output_tokens, self.num_heads, num_partitions)
+        stats_numel = num_output_tokens * self.num_heads * num_partitions
+        capacity_numel = (
+            max(num_output_tokens, 4) * self.num_heads * capacity_partitions
+        )
         needs_alloc = (
             self._decode_exp_sums is None
-            or tuple(self._decode_exp_sums.shape) != stats_shape
             or self._decode_exp_sums.device != output.device
+            or self._decode_exp_sums.numel() < capacity_numel
         )
         if needs_alloc:
+            allocation_numel = capacity_numel
+            if (
+                self._decode_exp_sums is not None
+                and self._decode_exp_sums.device == output.device
+            ):
+                allocation_numel = max(
+                    allocation_numel,
+                    self._decode_exp_sums.numel(),
+                )
             self._decode_exp_sums = torch.empty(
-                stats_shape,
+                (allocation_numel,),
                 dtype=torch.float32,
                 device=output.device,
             )
             self._decode_tmp_out = torch.empty(
-                tmp_shape,
-                dtype=torch.float32,
-                device=output.device,
-            )
-        if (
-            self._decode_max_logits is None
-            or tuple(self._decode_max_logits.shape) != max_logits_shape
-            or self._decode_max_logits.device != output.device
-        ):
-            self._decode_max_logits = torch.empty(
-                max_logits_shape,
+                (allocation_numel * self.head_size,),
                 dtype=torch.float32,
                 device=output.device,
             )
         assert self._decode_exp_sums is not None
-        assert self._decode_max_logits is not None
         assert self._decode_tmp_out is not None
-        return self._decode_exp_sums, self._decode_max_logits, self._decode_tmp_out
+        exp_sums = self._decode_exp_sums[:stats_numel].view(stats_shape)
+        tmp_out = self._decode_tmp_out[: stats_numel * self.head_size].view(
+            *stats_shape, self.head_size
+        )
+
+        if use_unnormalized_partition_output:
+            if (
+                self._decode_max_logits is None
+                or self._decode_max_logits.device != output.device
+                or self._decode_max_logits.numel() < capacity_numel
+            ):
+                self._decode_max_logits = torch.empty(
+                    (capacity_numel,),
+                    dtype=torch.float32,
+                    device=output.device,
+                )
+            max_logits = self._decode_max_logits[:stats_numel].view(stats_shape)
+        else:
+            if (
+                self._decode_empty_max_logits is None
+                or self._decode_empty_max_logits.device != output.device
+            ):
+                self._decode_empty_max_logits = torch.empty(
+                    (0,),
+                    dtype=torch.float32,
+                    device=output.device,
+                )
+            max_logits = self._decode_empty_max_logits
+
+        return exp_sums, max_logits, tmp_out
+
+    def _get_speculative_ragged_q4_workspace(
+        self,
+        output: torch.Tensor,
+        max_seq_len: int,
+        *,
+        num_requests: int,
+        partition_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_partitions = max(1, (max_seq_len + partition_size - 1) // partition_size)
+        stats_shape = (num_requests, self.num_heads * 4, num_partitions)
+        stats_numel = num_requests * self.num_heads * 4 * num_partitions
+        needs_alloc = (
+            self._speculative_ragged_exp_sums is None
+            or self._speculative_ragged_exp_sums.device != output.device
+            or self._speculative_ragged_exp_sums.numel() < stats_numel
+        )
+        if needs_alloc:
+            allocation_numel = stats_numel
+            if (
+                self._speculative_ragged_exp_sums is not None
+                and self._speculative_ragged_exp_sums.device == output.device
+            ):
+                allocation_numel = max(
+                    allocation_numel,
+                    self._speculative_ragged_exp_sums.numel() * 2,
+                )
+            self._speculative_ragged_exp_sums = torch.empty(
+                (allocation_numel,),
+                dtype=torch.float32,
+                device=output.device,
+            )
+            self._speculative_ragged_tmp_out = torch.empty(
+                (allocation_numel * self.head_size,),
+                dtype=torch.float32,
+                device=output.device,
+            )
+        assert self._speculative_ragged_exp_sums is not None
+        assert self._speculative_ragged_tmp_out is not None
+        exp_sums = self._speculative_ragged_exp_sums[:stats_numel].view(stats_shape)
+        tmp_out = self._speculative_ragged_tmp_out[: stats_numel * self.head_size].view(
+            *stats_shape, self.head_size
+        )
+        if (
+            self._decode_empty_max_logits is None
+            or self._decode_empty_max_logits.device != output.device
+        ):
+            self._decode_empty_max_logits = torch.empty(
+                (0,),
+                dtype=torch.float32,
+                device=output.device,
+            )
+        return exp_sums, self._decode_empty_max_logits, tmp_out
 
     def _run_paged_decode(
         self,
@@ -1276,6 +1454,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
+        seq_len_sum: int | None = None,
     ) -> None:
         (
             assume_no_outlier,
@@ -1320,6 +1499,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             max_seq_len,
             num_decode_tokens=num_decode_tokens,
             use_gqa_packed=use_gqa_packed,
+            seq_len_sum=seq_len_sum,
         )
         if use_split_k:
             exp_sums, max_logits, tmp_out = self._get_split_k_workspace(
@@ -1328,6 +1508,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 num_decode_tokens=num_decode_tokens,
                 use_gqa_packed=use_gqa_packed,
                 use_unnormalized_partition_output=(use_unnormalized_partition_output),
+                partition_size=partition_size,
             )
             if (
                 assume_no_outlier
@@ -1659,6 +1840,124 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         )
         return True
 
+    def _speculative_ragged_q4_num_requests(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> int | None:
+        if not self.speculative_verify_ragged_q4:
+            return None
+        if not 1 < attn_metadata.max_query_len <= 4:
+            return None
+        if not (query.is_cuda and output.is_cuda and kv_cache.is_cuda):
+            return None
+        if query.shape != output.shape or output.ndim != 3:
+            return None
+        if not 0 < attn_metadata.num_actual_tokens <= output.shape[0]:
+            return None
+        if not attn_metadata.causal:
+            return None
+        if (
+            self.num_heads != 32
+            or self.num_kv_heads != 8
+            or self.head_size != 128
+            or self.tile_policy.alloc_block_tokens != 16
+            or self.tile_policy.compute_block_n != 64
+        ):
+            return None
+        if self.alibi_slopes is not None or self.sliding_window is not None:
+            return None
+        if self.logits_soft_cap is not None:
+            return None
+
+        query_start_locs = attn_metadata.query_start_loc_cpu.tolist()
+        if len(query_start_locs) < 2 or int(query_start_locs[0]) != 0:
+            return None
+        if any(
+            int(end) < int(start)
+            for start, end in zip(query_start_locs[:-1], query_start_locs[1:])
+        ):
+            return None
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        clipped_starts = [
+            max(0, min(int(start), num_actual_tokens)) for start in query_start_locs
+        ]
+        if clipped_starts[-1] != num_actual_tokens:
+            return None
+        query_lens = [
+            end - start for start, end in zip(clipped_starts[:-1], clipped_starts[1:])
+        ]
+        if any(query_len < 0 or query_len > 4 for query_len in query_lens):
+            return None
+        if not any(query_len > 1 for query_len in query_lens):
+            return None
+
+        num_requests = len(query_lens)
+        if (
+            attn_metadata.query_start_loc.ndim != 1
+            or attn_metadata.query_start_loc.shape[0] < num_requests + 1
+            or attn_metadata.query_start_loc.dtype != torch.int32
+            or attn_metadata.block_table.ndim != 2
+            or attn_metadata.block_table.shape[0] < num_requests
+            or attn_metadata.seq_lens.shape[0] < num_requests
+        ):
+            return None
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            return None
+        if seq_lens_cpu.shape[0] < num_requests:
+            return None
+        if any(
+            query_len > 0 and int(seq_lens_cpu[idx]) <= query_len
+            for idx, query_len in enumerate(query_lens)
+        ):
+            return None
+        return num_requests
+
+    def _run_speculative_verify_ragged_q4(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+        num_requests: int,
+    ) -> bool:
+        page_unsafe_flags = self._usable_decode_page_unsafe_flags(kv_cache)
+        if page_unsafe_flags is None:
+            return False
+
+        partition_size = self._speculative_ragged_q4_partition_size(
+            attn_metadata.max_seq_len
+        )
+        exp_sums, max_logits, tmp_out = self._get_speculative_ragged_q4_workspace(
+            output,
+            attn_metadata.max_seq_len,
+            num_requests=num_requests,
+            partition_size=partition_size,
+        )
+        byte_v2_speculative_verify_ragged_q4(
+            output,
+            exp_sums,
+            max_logits,
+            tmp_out,
+            query,
+            kv_cache,
+            page_unsafe_flags,
+            attn_metadata.block_table[:num_requests],
+            attn_metadata.seq_lens[:num_requests],
+            attn_metadata.query_start_loc[: num_requests + 1],
+            num_actual_tokens=attn_metadata.num_actual_tokens,
+            scale=self.scale,
+            num_kv_heads=self.num_kv_heads,
+            block_size=self.tile_policy.alloc_block_tokens,
+            max_seq_len=attn_metadata.max_seq_len,
+            partition_size=partition_size,
+            tile_policy=self._base_tile_policy_tuple(),
+        )
+        return True
+
     def _forward_prefill(
         self,
         query: torch.Tensor,
@@ -1678,6 +1977,20 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         )
         if speculative_query_len is not None and self._run_speculative_verify_gqa(
             query, kv_cache, output, attn_metadata, speculative_query_len
+        ):
+            return output
+        ragged_num_requests = self._speculative_ragged_q4_num_requests(
+            query,
+            kv_cache,
+            output,
+            attn_metadata,
+        )
+        if ragged_num_requests is not None and self._run_speculative_verify_ragged_q4(
+            query,
+            kv_cache,
+            output,
+            attn_metadata,
+            ragged_num_requests,
         ):
             return output
         if self._prefill_has_cached_context(attn_metadata):
@@ -1823,6 +2136,129 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             and attn_metadata.seq_lens.shape[0] >= output.shape[0]
         )
 
+    def _fa2_decode_incompatibility(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> str | None:
+        if not self.decode_fa2_available:
+            return "the ByteV2 FA2 extension op is unavailable"
+        if attn_metadata.max_query_len != 1:
+            return "only Q1 decode is supported"
+        if not attn_metadata.causal or self.attn_type != AttentionType.DECODER:
+            return "only causal decoder Q1 attention is supported"
+        if self.alibi_slopes is not None:
+            return "ALiBi is unsupported"
+        if self.sliding_window is not None:
+            return "sliding-window/local attention is unsupported"
+        if self.logits_soft_cap is not None and self.logits_soft_cap > 0:
+            return "logit softcap is unsupported"
+        if self.tile_policy != DEFAULT_BYTE_V2_TILE_POLICY:
+            return "the default ByteV2 V5 tile policy is required"
+        if attn_metadata.tile_policy != DEFAULT_BYTE_V2_TILE_POLICY:
+            return "metadata does not use the default ByteV2 V5 tile policy"
+        if self.num_heads != 32 or self.num_kv_heads != 8 or self.head_size != 128:
+            return "local Hq=32, Hkv=8, and D=128 are required"
+        if query.ndim != 3 or query.shape != output.shape:
+            return "query and output must have the same rank-3 shape"
+        if output.shape[0] <= 0 or tuple(output.shape[1:]) != (32, 128):
+            return "query and output must have shape (total_q, 32, 128)"
+        if query.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+            return "query and output must use BF16"
+        if not (query.is_cuda and output.is_cuda and kv_cache.is_cuda):
+            return "query, output, and KV cache must be CUDA tensors"
+        if not (query.device == output.device == kv_cache.device):
+            return "query, output, and KV cache must share a CUDA device"
+        if query.stride(-1) != 1 or output.stride(-1) != 1:
+            return "query and output must have a contiguous head dimension"
+        if (
+            kv_cache.dtype != torch.uint8
+            or kv_cache.ndim != 2
+            or kv_cache.shape[0] <= 0
+            or kv_cache.shape[1] != _BYTE_V2_FA2_PAGE_SIZE_BYTES
+            or not kv_cache.is_contiguous()
+        ):
+            return "KV cache must be contiguous V5 uint8 pages of 52096 bytes"
+
+        batch_size = output.shape[0]
+        query_start_locs = attn_metadata.query_start_loc
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
+        if (
+            query_start_locs.ndim != 1
+            or query_start_locs.numel() != batch_size + 1
+            or query_start_locs.dtype != torch.int32
+            or not query_start_locs.is_cuda
+            or not query_start_locs.is_contiguous()
+            or query_start_locs.device != query.device
+        ):
+            return "query_start_loc must be CUDA int32 with total_q + 1 entries"
+        if (
+            seq_lens.ndim != 1
+            or seq_lens.shape[0] < batch_size
+            or seq_lens.dtype != torch.int32
+            or not seq_lens.is_cuda
+            or not seq_lens.is_contiguous()
+            or seq_lens.device != query.device
+        ):
+            return "seq_lens must provide one contiguous CUDA int32 value per query"
+        if (
+            block_table.ndim != 2
+            or block_table.shape[0] < batch_size
+            or block_table.dtype != torch.int32
+            or not block_table.is_cuda
+            or block_table.stride(-1) != 1
+            or block_table.device != query.device
+        ):
+            return "block_table must provide one CUDA int32 row per query"
+        if attn_metadata.max_seq_len <= 0:
+            return "max_seq_len must be positive"
+        if (
+            attn_metadata.max_seq_len
+            > block_table.shape[1] * self.tile_policy.alloc_block_tokens
+        ):
+            return "max_seq_len exceeds block-table capacity"
+        return None
+
+    def _run_fa2_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> bool:
+        if self.decode_kernel_mode == "legacy":
+            return False
+        incompatibility = self._fa2_decode_incompatibility(
+            query,
+            kv_cache,
+            output,
+            attn_metadata,
+        )
+        if incompatibility is not None:
+            if self.decode_kernel_mode == "fa2":
+                raise RuntimeError(
+                    "BYTE_V2_DECODE_KERNEL=fa2 cannot run this decode: "
+                    f"{incompatibility}"
+                )
+            return False
+
+        batch_size = output.shape[0]
+        byte_v2_fa2_paged_decode_attention(
+            output,
+            query,
+            kv_cache,
+            attn_metadata.query_start_loc,
+            attn_metadata.block_table[:batch_size],
+            attn_metadata.seq_lens[:batch_size],
+            scale=self.scale,
+            max_seq_len=attn_metadata.max_seq_len,
+            causal=attn_metadata.causal,
+        )
+        return True
+
     def forward(
         self,
         layer,
@@ -1857,6 +2293,9 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             tuple(attn_metadata.seq_lens.shape),
             attn_metadata.max_seq_len,
         )
+        if self._run_fa2_decode(query, kv_cache, output, attn_metadata):
+            _debug_warmup("decode forward done via FA2 template")
+            return output
         self._run_paged_decode(
             output,
             query,
@@ -1864,6 +2303,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             attn_metadata.block_table,
             attn_metadata.seq_lens,
             max_seq_len=attn_metadata.max_seq_len,
+            seq_len_sum=getattr(attn_metadata, "seq_len_sum", None),
         )
         _debug_warmup("decode forward done")
         return output
@@ -1890,6 +2330,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 self.decode_assume_no_outlier
                 or self.speculative_verify_q4
                 or self.speculative_verify_gqa
+                or self.speculative_verify_ragged_q4
                 or self.cached_prefix_q16
             )
             and kv_cache.is_cuda

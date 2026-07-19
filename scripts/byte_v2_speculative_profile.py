@@ -13,6 +13,7 @@ import argparse
 import gc
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 RESULT_PREFIX = "BYTE_V2_SPECULATIVE_PROFILE_RESULT "
+POOL_DIAGNOSTIC_PREFIX = "BYTE_V2_OUTLIER_POOL_DIAGNOSTIC "
 
 
 def _prepend_venv_bin_to_path() -> None:
@@ -62,6 +64,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
+    parser.add_argument(
+        "--sharegpt-rows-dir",
+        help=(
+            "Directory containing JSON responses from the Hugging Face "
+            "datasets-server rows API. Use first-turn user prompts instead "
+            "of the synthetic repeated prompt."
+        ),
+    )
+    parser.add_argument("--sharegpt-seed", type=int, default=20260717)
+    parser.add_argument(
+        "--sharegpt-target-lens",
+        nargs="+",
+        type=int,
+        help=(
+            "Select the closest distinct ShareGPT prompt for each requested "
+            "token length. The number of targets must equal --batch-size."
+        ),
+    )
+    parser.add_argument(
+        "--disable-prefix-caching",
+        action="store_true",
+        help="Disable prefix caching so warmup cannot cache measured prompts.",
+    )
+    parser.add_argument(
+        "--diagnose-outlier-pool",
+        action="store_true",
+        help=(
+            "Inspect raw staging immediately before each ByteV2 cache commit "
+            "and report the V5 outlier-pool demand. This disables the fused "
+            "native raw-staging update and is not a performance mode."
+        ),
+    )
     parser.add_argument(
         "--prompt-lookup-min",
         type=int,
@@ -106,10 +140,14 @@ class ProfileCollector:
     def __init__(self) -> None:
         self.enabled = False
         self.stats: dict[str, OpStats] = defaultdict(OpStats)
+        self.byte_v2_prefill_patterns: dict[str, int] = defaultdict(int)
+        self.byte_v2_prefill_shapes: dict[str, int] = defaultdict(int)
         self.restore_callbacks: list[Callable[[], None]] = []
 
     def reset(self) -> None:
         self.stats.clear()
+        self.byte_v2_prefill_patterns.clear()
+        self.byte_v2_prefill_shapes.clear()
 
     def install(self, backend: str) -> None:
         if backend == "byte_v2":
@@ -210,6 +248,47 @@ class ProfileCollector:
             count = slot_mapping.shape[0] if slot_mapping is not None else "unknown"
             return f"byte_v2.cache_update.n{count}"
 
+        def cached_prefill_q(args: tuple, kwargs: dict) -> str:
+            return metadata_q(args, kwargs).replace("forward", "prefill_from_cache")
+
+        def ragged_candidate_q(args: tuple, kwargs: dict) -> str:
+            label = metadata_q(args, kwargs).replace("forward", "ragged_candidate")
+            if not self.enabled:
+                return label
+            metadata = next(
+                (
+                    arg
+                    for arg in args
+                    if hasattr(arg, "query_start_loc_cpu")
+                    and hasattr(arg, "num_actual_tokens")
+                ),
+                None,
+            )
+            if metadata is None or not 1 < metadata.max_query_len <= 4:
+                return label
+            starts = metadata.query_start_loc_cpu.tolist()
+            num_actual_tokens = int(metadata.num_actual_tokens)
+            query_lens = [
+                max(
+                    0,
+                    min(int(end), num_actual_tokens)
+                    - min(int(start), num_actual_tokens),
+                )
+                for start, end in zip(starts[:-1], starts[1:])
+            ]
+            active_query_lens = [length for length in query_lens if length > 0]
+            pattern = ",".join(str(length) for length in active_query_lens)
+            self.byte_v2_prefill_patterns[pattern or "empty"] += 1
+            query = args[0] if args else kwargs.get("query")
+            output = args[2] if len(args) > 2 else kwargs.get("output")
+            shape_key = (
+                f"q{metadata.max_query_len}.actual{num_actual_tokens}."
+                f"query{query.shape[0]}.output{output.shape[0]}."
+                f"requests{len(query_lens)}"
+            )
+            self.byte_v2_prefill_shapes[shape_key] += 1
+            return label
+
         self._patch_method(
             byte_v2_attn.ByteV2AttentionImpl,
             "forward",
@@ -218,9 +297,7 @@ class ProfileCollector:
         self._patch_method(
             byte_v2_attn.ByteV2AttentionImpl,
             "_forward_prefill_from_cache",
-            lambda args, kwargs: metadata_q(args, kwargs).replace(
-                "forward", "prefill_from_cache"
-            ),
+            cached_prefill_q,
         )
         self._patch_method(
             byte_v2_attn.ByteV2AttentionImpl,
@@ -229,11 +306,21 @@ class ProfileCollector:
         )
         self._patch_method(
             byte_v2_attn.ByteV2AttentionImpl,
+            "_speculative_ragged_q4_num_requests",
+            ragged_candidate_q,
+        )
+        self._patch_method(
+            byte_v2_attn.ByteV2AttentionImpl,
             "_run_speculative_verify_gqa",
             lambda args, kwargs: (
                 "byte_v2.speculative_verify_gqa.q"
                 f"{args[4] if len(args) > 4 else kwargs.get('query_len', 'unknown')}"
             ),
+        )
+        self._patch_method(
+            byte_v2_attn.ByteV2AttentionImpl,
+            "_run_speculative_verify_ragged_q4",
+            lambda _args, _kwargs: "byte_v2.speculative_verify_ragged_q4",
         )
         self._patch_method(
             byte_v2_attn.ByteV2AttentionImpl,
@@ -256,6 +343,7 @@ class ProfileCollector:
             "byte_v2_paged_decode_attention_split_k",
             "byte_v2_paged_decode_attention_split_k_guarded",
             "byte_v2_speculative_verify_q4",
+            "byte_v2_speculative_verify_ragged_q4",
         ):
             self._patch_module_function(
                 byte_v2_attn,
@@ -332,6 +420,194 @@ class ProfileCollector:
             )
         return sorted(rows, key=lambda row: row["cuda_total_ms"], reverse=True)
 
+    def byte_v2_pattern_result(self) -> dict[str, int] | None:
+        if not self.byte_v2_prefill_patterns:
+            return None
+        return dict(sorted(self.byte_v2_prefill_patterns.items()))
+
+    def byte_v2_shape_result(self) -> dict[str, int] | None:
+        if not self.byte_v2_prefill_shapes:
+            return None
+        return dict(sorted(self.byte_v2_prefill_shapes.items()))
+
+
+@dataclass
+class OutlierPoolDiagnostic:
+    call_count: int = 0
+    active_pages: int = 0
+    overflow_pages: int = 0
+    max_pool_capacity: int = 0
+    max_outliers: int = 0
+    max_record: dict[str, Any] | None = None
+
+    @staticmethod
+    def _segment_capacity(count: int) -> int:
+        return 1 << (count - 1).bit_length() if count else 0
+
+    def inspect(self, raw_staging, staging_to_physical_block, valid_rows) -> None:
+        import torch
+
+        physical_blocks = staging_to_physical_block.detach().cpu().tolist()
+        row_counts = valid_rows.detach().cpu().tolist()
+        active_slots = [
+            slot
+            for slot, physical_block in enumerate(physical_blocks)
+            if physical_block >= 0 and row_counts[slot] > 0
+        ]
+        self.call_count += 1
+        if not active_slots:
+            return
+
+        active_indices = torch.tensor(
+            active_slots,
+            dtype=torch.long,
+            device=raw_staging.device,
+        )
+        active_raw = (
+            raw_staging.index_select(0, active_indices)
+            .detach()
+            .cpu()
+            .reshape(len(active_slots), -1)
+        )
+        for active_idx, staging_slot in enumerate(active_slots):
+            rows = min(int(row_counts[staging_slot]), 16)
+            raw_slot = active_raw[active_idx]
+            pool_capacity = 0
+            total_outliers = 0
+            outlier_tiles = 0
+            max_tile_outliers = 0
+            row_outliers = [0] * rows
+            row_zero_values = [0] * rows
+            row_high7_chunks = []
+            for kv_side in range(2):
+                side_offset = kv_side * 32768
+                side_pairs = raw_slot[side_offset : side_offset + 32768].reshape(
+                    8, 16, 128, 2
+                )
+                side_high7 = side_pairs[..., 1].bitwise_and(0x7F)
+                row_high7_chunks.append(
+                    side_high7[:, :rows].permute(1, 0, 2).reshape(rows, -1)
+                )
+                side_zeros = side_pairs[..., 0].eq(0) & side_pairs[..., 1].eq(0)
+                side_row_zeros = side_zeros[:, :rows].sum(dim=(0, 2)).tolist()
+                row_zero_values = [
+                    total + int(side_count)
+                    for total, side_count in zip(row_zero_values, side_row_zeros)
+                ]
+                for kv_head in range(8):
+                    for dim_tile in range(8):
+                        tile_values = side_high7[
+                            kv_head,
+                            :rows,
+                            dim_tile * 16 : (dim_tile + 1) * 16,
+                        ]
+                        values = tile_values.reshape(-1)
+                        high_counts = torch.bincount(values, minlength=128)
+                        window_counts = high_counts.unfold(0, 8, 1).sum(dim=1)
+                        best_base = int(window_counts.argmax().item())
+                        outlier_count = int(
+                            values.numel() - window_counts[best_base].item()
+                        )
+                        if outlier_count:
+                            tile_row_outliers = (
+                                (tile_values < best_base)
+                                | (tile_values >= best_base + 8)
+                            ).sum(dim=1)
+                            row_outliers = [
+                                total + int(tile_count)
+                                for total, tile_count in zip(
+                                    row_outliers,
+                                    tile_row_outliers.tolist(),
+                                )
+                            ]
+                            outlier_tiles += 1
+                            total_outliers += outlier_count
+                            pool_capacity += self._segment_capacity(outlier_count)
+                            max_tile_outliers = max(
+                                max_tile_outliers,
+                                outlier_count,
+                            )
+
+            row_high7 = torch.cat(row_high7_chunks, dim=1)
+            row_high7_stats = []
+            for row_values in row_high7:
+                counts = torch.bincount(row_values, minlength=128)
+                row_high7_stats.append(
+                    {
+                        "min": int(row_values.min().item()),
+                        "max": int(row_values.max().item()),
+                        "mode": int(counts.argmax().item()),
+                        "mode_count": int(counts.max().item()),
+                    }
+                )
+
+            self.active_pages += 1
+            if pool_capacity > 1024:
+                self.overflow_pages += 1
+            record = {
+                "call": self.call_count,
+                "staging_slot": staging_slot,
+                "physical_block": int(physical_blocks[staging_slot]),
+                "valid_rows": rows,
+                "pool_capacity": pool_capacity,
+                "outliers": total_outliers,
+                "outlier_tiles": outlier_tiles,
+                "max_tile_outliers": max_tile_outliers,
+                "row_outliers": row_outliers,
+                "row_zero_values": row_zero_values,
+                "row_high7_stats": row_high7_stats,
+            }
+            if pool_capacity > self.max_pool_capacity:
+                self.max_pool_capacity = pool_capacity
+                self.max_outliers = total_outliers
+                self.max_record = record
+                print(
+                    POOL_DIAGNOSTIC_PREFIX + json.dumps(record, sort_keys=True),
+                    flush=True,
+                )
+
+    def result(self) -> dict[str, Any]:
+        return {
+            "call_count": self.call_count,
+            "active_pages": self.active_pages,
+            "overflow_pages": self.overflow_pages,
+            "max_pool_capacity": self.max_pool_capacity,
+            "max_outliers": self.max_outliers,
+            "max_record": self.max_record,
+        }
+
+
+def _install_outlier_pool_diagnostic(
+    collector: ProfileCollector,
+) -> OutlierPoolDiagnostic:
+    from vllm.v1.attention.backends import byte_v2_attn
+
+    diagnostic = OutlierPoolDiagnostic()
+    original = byte_v2_attn.byte_v2_commit_raw_staging_to_cache
+
+    def wrapper(*args, **kwargs):
+        raw_staging = args[0] if args else kwargs["raw_staging"]
+        staging_to_physical_block = (
+            args[2] if len(args) > 2 else kwargs["staging_to_physical_block"]
+        )
+        valid_rows = args[3] if len(args) > 3 else kwargs["valid_rows"]
+        diagnostic.inspect(
+            raw_staging,
+            staging_to_physical_block,
+            valid_rows,
+        )
+        return original(*args, **kwargs)
+
+    byte_v2_attn.byte_v2_commit_raw_staging_to_cache = wrapper
+    collector.restore_callbacks.append(
+        lambda: setattr(
+            byte_v2_attn,
+            "byte_v2_commit_raw_staging_to_cache",
+            original,
+        )
+    )
+    return diagnostic
+
 
 def _iter_tensors(value: Any):
     import torch
@@ -377,6 +653,64 @@ def _make_prompt_token_ids(model: str, prompt_len: int, offset: int) -> list[int
     return prompt_ids
 
 
+def _make_sharegpt_prompt_token_ids(
+    model: str,
+    rows_dir: str,
+    *,
+    num_requests: int,
+    max_prompt_len: int,
+    seed: int,
+    target_lens: list[int] | None = None,
+) -> list[list[int]]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    candidates: list[tuple[int, list[int]]] = []
+    for path in sorted(Path(rows_dir).glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for item in payload.get("rows", []):
+            row = item.get("row", item)
+            conversations = row.get("conversations", [])
+            if not conversations:
+                continue
+            prompt_text = conversations[0].get("value", "")
+            if not prompt_text:
+                continue
+            prompt_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_text}],
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
+            )
+            if 16 <= len(prompt_ids) <= max_prompt_len:
+                candidates.append((int(item.get("row_idx", 0)), prompt_ids))
+    if len(candidates) < num_requests:
+        raise ValueError(
+            f"only {len(candidates)} valid ShareGPT prompts for "
+            f"batch_size={num_requests} and max_prompt_len={max_prompt_len}"
+        )
+    if target_lens is not None:
+        if len(target_lens) != num_requests:
+            raise ValueError(
+                "the number of --sharegpt-target-lens values must equal --batch-size"
+            )
+        selected: list[list[int]] = []
+        remaining = candidates.copy()
+        for target_len in target_lens:
+            best_idx = min(
+                range(len(remaining)),
+                key=lambda idx: (
+                    abs(len(remaining[idx][1]) - target_len),
+                    remaining[idx][0],
+                ),
+            )
+            _, prompt_ids = remaining.pop(best_idx)
+            selected.append(prompt_ids)
+        return selected
+    random.Random(seed).shuffle(candidates)
+    return [prompt_ids for _, prompt_ids in candidates[:num_requests]]
+
+
 def _build_llm(args: argparse.Namespace, backend: str, spec_tokens: int):
     from vllm import LLM
 
@@ -402,7 +736,7 @@ def _build_llm(args: argparse.Namespace, backend: str, spec_tokens: int):
         max_num_batched_tokens=max_model_len,
         max_num_seqs=args.batch_size,
         block_size=16,
-        enable_prefix_caching=True,
+        enable_prefix_caching=not args.disable_prefix_caching,
         disable_log_stats=False,
         speculative_config=speculative_config,
         attention_config={"backend": attention_backend},
@@ -479,12 +813,15 @@ def _run_generate_step_profile(
     if backend == "byte_v2":
         verify_labels = {
             f"byte_v2.op.byte_v2_speculative_verify_gqa.q{verify_query_len}",
+            "byte_v2.op.byte_v2_speculative_verify_ragged_q4",
+            "byte_v2.speculative_verify_ragged_q4",
             f"byte_v2.paged_decode.q{verify_query_len}",
         }
         query_prefixes = (
             "byte_v2.forward.q",
             "byte_v2.paged_decode.q",
             "byte_v2.prefill_from_cache.q",
+            "byte_v2.ragged_candidate.q",
             "byte_v2.op.byte_v2_speculative_verify_gqa.q",
         )
     else:
@@ -542,6 +879,9 @@ def _run_generate_step_profile(
 
 
 def _run_worker(args: argparse.Namespace) -> None:
+    if args.diagnose_outlier_pool:
+        os.environ["BYTE_V2_NATIVE_RAW_STAGING_UPDATE"] = "0"
+
     import torch
 
     from vllm import SamplingParams, TokensPrompt
@@ -550,7 +890,10 @@ def _run_worker(args: argparse.Namespace) -> None:
     assert args.worker_spec_tokens is not None
     spec_tokens = args.worker_spec_tokens
     collector = ProfileCollector()
-    collector.install(args.backend)
+    pool_diagnostic = None
+    if args.backend == "byte_v2" and args.diagnose_outlier_pool:
+        collector.install(args.backend)
+        pool_diagnostic = _install_outlier_pool_diagnostic(collector)
 
     init_start = time.perf_counter()
     llm = _build_llm(args, args.backend, spec_tokens)
@@ -561,41 +904,68 @@ def _run_worker(args: argparse.Namespace) -> None:
 
     try:
         for context_index, context_len in enumerate(args.context_lens):
-            prompts = [
-                TokensPrompt(
-                    prompt_token_ids=_make_prompt_token_ids(
+            if args.sharegpt_rows_dir:
+                prompt_token_ids = _make_sharegpt_prompt_token_ids(
+                    args.model,
+                    args.sharegpt_rows_dir,
+                    num_requests=args.batch_size,
+                    max_prompt_len=context_len,
+                    seed=args.sharegpt_seed + context_index,
+                    target_lens=args.sharegpt_target_lens,
+                )
+            else:
+                prompt_token_ids = [
+                    _make_prompt_token_ids(
                         args.model,
                         context_len,
                         offset=context_index * 11 + request_idx * 7,
                     )
-                )
-                for request_idx in range(args.batch_size)
+                    for request_idx in range(args.batch_size)
+                ]
+            prompts = [
+                TokensPrompt(prompt_token_ids=token_ids)
+                for token_ids in prompt_token_ids
             ]
 
-            warmup_seconds = 0.0
-            for prompt in prompts:
-                prompt_seconds, _ = _run_generate(
+            if args.disable_prefix_caching:
+                warmup_seconds, _ = _run_generate(
                     llm,
-                    [prompt],
+                    prompts,
                     cache_fill_params,
                 )
-                warmup_seconds += prompt_seconds
+            else:
+                warmup_seconds = 0.0
+                for prompt in prompts:
+                    prompt_seconds, _ = _run_generate(
+                        llm,
+                        [prompt],
+                        cache_fill_params,
+                    )
+                    warmup_seconds += prompt_seconds
 
             before = _metric_snapshot(llm)
             measured_seconds, token_ids = _run_generate(llm, prompts, sampling_params)
             measured_metrics = _metric_diff(before, _metric_snapshot(llm))
 
-            profile_metrics_before = _metric_snapshot(llm)
-            profile_seconds, profile_token_ids, step_profile = (
-                _run_generate_step_profile(
-                    llm,
-                    prompts,
-                    sampling_params,
-                    collector,
-                    backend=args.backend,
-                    verify_query_len=spec_tokens + 1,
+            profile_instrumentation_installed = False
+            if not args.diagnose_outlier_pool:
+                collector.install(args.backend)
+                profile_instrumentation_installed = True
+            try:
+                profile_metrics_before = _metric_snapshot(llm)
+                profile_seconds, profile_token_ids, step_profile = (
+                    _run_generate_step_profile(
+                        llm,
+                        prompts,
+                        sampling_params,
+                        collector,
+                        backend=args.backend,
+                        verify_query_len=spec_tokens + 1,
+                    )
                 )
-            )
+            finally:
+                if profile_instrumentation_installed:
+                    collector.restore()
             profile_metrics = _metric_diff(
                 profile_metrics_before,
                 _metric_snapshot(llm),
@@ -615,6 +985,10 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "spec_tokens": spec_tokens,
                 "verify_query_len": spec_tokens + 1,
                 "context_len": context_len,
+                "prompt_source": (
+                    "sharegpt" if args.sharegpt_rows_dir else "synthetic_repeat"
+                ),
+                "prompt_lens": [len(ids) for ids in prompt_token_ids],
                 "batch_size": args.batch_size,
                 "max_tokens": args.max_tokens,
                 "enforce_eager": args.enforce_eager,
@@ -631,7 +1005,12 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "profile_token_ids_match": token_ids == profile_token_ids,
                 "spec_metrics": measured_metrics,
                 "profile_ops": collector.result(),
+                "byte_v2_prefill_patterns": collector.byte_v2_pattern_result(),
+                "byte_v2_prefill_shapes": collector.byte_v2_shape_result(),
                 "step_profile": step_profile,
+                "outlier_pool_diagnostic": (
+                    pool_diagnostic.result() if pool_diagnostic is not None else None
+                ),
             }
             print(RESULT_PREFIX + json.dumps(result, sort_keys=True), flush=True)
     finally:
@@ -685,6 +1064,20 @@ def _run_child(
         "--prompt-lookup-max",
         str(args.prompt_lookup_max),
     ]
+    if args.sharegpt_rows_dir:
+        cmd.extend(["--sharegpt-rows-dir", args.sharegpt_rows_dir])
+        cmd.extend(["--sharegpt-seed", str(args.sharegpt_seed)])
+        if args.sharegpt_target_lens:
+            cmd.extend(
+                [
+                    "--sharegpt-target-lens",
+                    *[str(value) for value in args.sharegpt_target_lens],
+                ]
+            )
+    if args.disable_prefix_caching:
+        cmd.append("--disable-prefix-caching")
+    if args.diagnose_outlier_pool:
+        cmd.append("--diagnose-outlier-pool")
     if not args.enforce_eager:
         cmd.append("--no-enforce-eager")
     if args.compile_size_specialization:

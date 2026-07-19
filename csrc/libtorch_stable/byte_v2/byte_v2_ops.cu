@@ -2223,7 +2223,7 @@ template <typename Layout, bool UsePageUnsafeFlags, bool UseQkMma,
           bool UseFa2Mainloop, bool UseFa2Multiwarp, bool UseFa2Direct,
           int QHeadsPerKv, int QGroupTile, int NumThreads,
           int DirectDiagnosticMode = kByteV2DirectDiagnosticCurrent,
-          int SpeculativeQueryLen = 0>
+          int SpeculativeQueryLen = 0, bool UseRaggedSpeculativeQ4 = false>
 __global__ void
 byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kernel(
     float* __restrict__ tmp_out, float* __restrict__ exp_sums,
@@ -2231,8 +2231,10 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
     const uint8_t* __restrict__ kv_cache,
     const int32_t* __restrict__ page_unsafe_flags,
     const int32_t* __restrict__ block_tables,
-    const int32_t* __restrict__ seq_lens, float scale, int64_t q_stride_token,
-    int64_t q_stride_head, int64_t q_stride_dim, int64_t kv_cache_stride_block,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ query_start_locs, int num_actual_tokens,
+    float scale, int64_t q_stride_token, int64_t q_stride_head,
+    int64_t q_stride_dim, int64_t kv_cache_stride_block,
     int64_t block_table_stride_seq, int max_num_blocks_per_seq,
     int max_num_partitions, int partition_size) {
   using Policy = typename Layout::TilePolicy;
@@ -2249,7 +2251,19 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
   const int kv_head_idx = kv_group_idx / kGroupsPerKv;
   const int q_group_block = kv_group_idx - kv_head_idx * kGroupsPerKv;
   const int q_group_base = q_group_block * QGroupTile;
-  const int valid_q_rows = min(QGroupTile, QHeadsPerKv - q_group_base);
+  int query_start = seq_idx * SpeculativeQueryLen;
+  int request_query_len = SpeculativeQueryLen;
+  if constexpr (UseRaggedSpeculativeQ4) {
+    query_start = max(min(query_start_locs[seq_idx], num_actual_tokens), 0);
+    const int query_end =
+        max(min(query_start_locs[seq_idx + 1], num_actual_tokens), query_start);
+    request_query_len = min(query_end - query_start, SpeculativeQueryLen);
+  }
+  int valid_q_rows = min(QGroupTile, QHeadsPerKv - q_group_base);
+  if constexpr (UseRaggedSpeculativeQ4) {
+    valid_q_rows =
+        max(min(request_query_len * 4 - q_group_base, QGroupTile), 0);
+  }
   const int partition_idx = blockIdx.z;
   const int dim = threadIdx.x;
   const int lane = threadIdx.x & 31;
@@ -2276,6 +2290,8 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
   static_assert(SpeculativeQueryLen == 0 ||
                 QHeadsPerKv == SpeculativeQueryLen * 4);
   static_assert(SpeculativeQueryLen == 0 || QGroupTile <= 64);
+  static_assert(!UseRaggedSpeculativeQ4 || SpeculativeQueryLen == 4);
+  static_assert(!UseRaggedSpeculativeQ4 || QHeadsPerKv == 16);
   static_assert(DirectDiagnosticMode >= kByteV2DirectDiagnosticCurrent &&
                 DirectDiagnosticMode <= kByteV2DirectDiagnosticCodeReady);
   static_assert(UseFa2Direct ||
@@ -2442,6 +2458,12 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
                              partition_idx;
   const int64_t tmp_base = stats_base * static_cast<int64_t>(Policy::HeadDimV);
 
+  if constexpr (UseRaggedSpeculativeQ4) {
+    if (valid_q_rows == 0) {
+      return;
+    }
+  }
+
   if (partition_start >= seq_len || partition_start >= partition_end) {
     if (threadIdx.x == 0) {
 #pragma unroll
@@ -2557,7 +2579,7 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
           int head_idx = kv_head_idx * kQHeadsPerKv + q_group_base + row;
           if constexpr (SpeculativeQueryLen > 0) {
             const int virtual_row = q_group_base + row;
-            q_token_idx = seq_idx * SpeculativeQueryLen + virtual_row / 4;
+            q_token_idx = query_start + virtual_row / 4;
             head_idx = kv_head_idx * 4 + virtual_row % 4;
           }
           const int64_t q_offset =
@@ -2585,7 +2607,7 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
           int head_idx = kv_head_idx * kQHeadsPerKv + q_group_base + row;
           if constexpr (SpeculativeQueryLen > 0) {
             const int virtual_row = q_group_base + row;
-            q_token_idx = seq_idx * SpeculativeQueryLen + virtual_row / 4;
+            q_token_idx = query_start + virtual_row / 4;
             head_idx = kv_head_idx * 4 + virtual_row % 4;
           }
           const int64_t q_offset =
@@ -3202,8 +3224,7 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
             if constexpr (SpeculativeQueryLen > 0) {
               const int virtual_row =
                   q_group_base + direct_row_base + logical_row;
-              row_seq_len =
-                  seq_len - (SpeculativeQueryLen - 1) + virtual_row / 4;
+              row_seq_len = seq_len - (request_query_len - 1) + virtual_row / 4;
             }
 #pragma unroll
             for (int col = 0; col < cute::size<1>(scores); ++col) {
@@ -3260,8 +3281,7 @@ byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kern
             if constexpr (SpeculativeQueryLen > 0) {
               const int virtual_row =
                   q_group_base + direct_row_base + logical_row;
-              row_seq_len =
-                  seq_len - (SpeculativeQueryLen - 1) + virtual_row / 4;
+              row_seq_len = seq_len - (request_query_len - 1) + virtual_row / 4;
             }
             row_m[row] = -FLT_MAX;
 #pragma unroll
@@ -5052,11 +5072,13 @@ __global__ void byte_v2_paged_decode_attention_split_k_reduce_warp_kernel(
   }
 }
 
-template <typename Layout, int SpeculativeQueryLen>
+template <typename Layout, int SpeculativeQueryLen,
+          bool UseRaggedSpeculativeQ4 = false>
 __global__ void
 byte_v2_paged_decode_attention_split_k_reduce_speculative_row_kernel(
     uint16_t* __restrict__ output, const float* __restrict__ tmp_out,
     const float* __restrict__ exp_sums, const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ query_start_locs, int num_actual_tokens,
     int64_t out_stride_token, int64_t out_stride_head, int64_t out_stride_dim,
     int max_num_partitions, int partition_size) {
   using Policy = typename Layout::TilePolicy;
@@ -5067,6 +5089,7 @@ byte_v2_paged_decode_attention_split_k_reduce_speculative_row_kernel(
   constexpr int kVirtualRowsPerKv = SpeculativeQueryLen * kQueryHeadsPerKv;
   constexpr int kNumVirtualHeads = Layout::NumKvHeadsValue * kVirtualRowsPerKv;
   static_assert(Policy::HeadDimV == 128);
+  static_assert(!UseRaggedSpeculativeQ4 || SpeculativeQueryLen == 4);
 
   extern __shared__ float shared_partition_weights[];
   float* const shared_sum = shared_partition_weights + max_num_partitions;
@@ -5076,15 +5099,30 @@ byte_v2_paged_decode_attention_split_k_reduce_speculative_row_kernel(
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int dim = threadIdx.x;
   const int32_t seq_len = seq_lens[seq_idx];
-  const int num_partitions = (seq_len + partition_size - 1) / partition_size;
+  const int num_partitions =
+      max(min(static_cast<int>(
+                  (static_cast<int64_t>(seq_len) + partition_size - 1) /
+                  partition_size),
+              max_num_partitions),
+          0);
   const int64_t stats_base =
       (static_cast<int64_t>(seq_idx) * kNumVirtualHeads + head_idx) *
       max_num_partitions;
   const int64_t tmp_base = stats_base * static_cast<int64_t>(Policy::HeadDimV);
   const int kv_head_idx = head_idx / kVirtualRowsPerKv;
   const int virtual_row = head_idx - kv_head_idx * kVirtualRowsPerKv;
-  const int out_token_idx =
-      seq_idx * SpeculativeQueryLen + virtual_row / kQueryHeadsPerKv;
+  int query_start = seq_idx * SpeculativeQueryLen;
+  int request_query_len = SpeculativeQueryLen;
+  if constexpr (UseRaggedSpeculativeQ4) {
+    query_start = max(min(query_start_locs[seq_idx], num_actual_tokens), 0);
+    const int query_end =
+        max(min(query_start_locs[seq_idx + 1], num_actual_tokens), query_start);
+    request_query_len = min(query_end - query_start, SpeculativeQueryLen);
+    if (virtual_row / kQueryHeadsPerKv >= request_query_len) {
+      return;
+    }
+  }
+  const int out_token_idx = query_start + virtual_row / kQueryHeadsPerKv;
   const int out_head_idx =
       kv_head_idx * kQueryHeadsPerKv + virtual_row % kQueryHeadsPerKv;
   const int64_t out_offset =
@@ -5535,13 +5573,11 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
       ByteV2DefaultLayout::CodecPayloadBytesPerTile;
   constexpr int kCodeBase = kCodecTileElems;
 
-  const int64_t token_block_idx = blockIdx.x;
-  const int64_t token_start = token_block_idx * kCodecTokenBlock;
-  const int64_t remaining_tokens = num_tokens - token_start;
-  const int rows =
-      static_cast<int>(remaining_tokens < kCodecTokenBlock ? remaining_tokens
-                                                           : kCodecTokenBlock);
-  if (rows <= 0) {
+  const int64_t source_chunk_start =
+      static_cast<int64_t>(blockIdx.x) * kCodecTokenBlock;
+  const int64_t source_chunk_end =
+      min(source_chunk_start + kCodecTokenBlock, num_tokens);
+  if (source_chunk_start >= source_chunk_end) {
     return;
   }
 
@@ -5555,37 +5591,55 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
   __shared__ int shared_base;
   __shared__ int shared_fallback;
 
-  if (threadIdx.x == 0) {
-    int high_counts[128];
-    for (int i = 0; i < 128; ++i) {
-      high_counts[i] = 0;
+  for (int64_t page_token_start = source_chunk_start;
+       page_token_start < source_chunk_end; ++page_token_start) {
+    const int64_t first_slot_idx = slot_mapping[page_token_start];
+    if (first_slot_idx < 0) {
+      continue;
     }
-    int elem_count = 0;
-    int64_t first_valid_physical_block = -1;
-    for (int row = 0; row < rows; ++row) {
-      const int64_t slot_idx = slot_mapping[token_start + row];
-      if (slot_idx < 0) {
+    const int64_t physical_block = first_slot_idx / kBlockSize;
+    if (page_token_start > 0) {
+      const int64_t previous_slot_idx = slot_mapping[page_token_start - 1];
+      if (previous_slot_idx >= 0 &&
+          previous_slot_idx / kBlockSize == physical_block) {
         continue;
       }
-      const int64_t physical_block = slot_idx / kBlockSize;
-      if (first_valid_physical_block < 0) {
-        first_valid_physical_block = physical_block;
+    }
+
+    int page_token_count = 1;
+    while (page_token_count < kBlockSize &&
+           page_token_start + page_token_count < num_tokens) {
+      const int64_t next_slot_idx =
+          slot_mapping[page_token_start + page_token_count];
+      if (next_slot_idx < 0 || next_slot_idx / kBlockSize != physical_block) {
+        break;
       }
-      const int64_t row_src_base =
-          (token_start + row) *
-              (kv_side == 0 ? key_stride_token : value_stride_token) +
-          head_idx * (kv_side == 0 ? key_stride_head : value_stride_head);
+      ++page_token_count;
+    }
+
+    uint8_t* __restrict__ page =
+        kv_cache + physical_block * kv_cache_stride_block;
+    if (threadIdx.x == 0) {
+      int high_counts[128];
+      for (int i = 0; i < 128; ++i) {
+        high_counts[i] = 0;
+      }
       const uint16_t* __restrict__ src = kv_side == 0 ? key : value;
       const int64_t stride_dim =
           kv_side == 0 ? key_stride_dim : value_stride_dim;
-      for (int dim_offset = 0; dim_offset < kCodecDimBlock; ++dim_offset) {
-        const int dim = dim_tile * kCodecDimBlock + dim_offset;
-        const uint16_t bits = src[row_src_base + dim * stride_dim];
-        ++high_counts[byte_v2_high7(bits)];
-        ++elem_count;
+      for (int source_offset = 0; source_offset < page_token_count;
+           ++source_offset) {
+        const int64_t token_idx = page_token_start + source_offset;
+        const int64_t row_src_base =
+            token_idx * (kv_side == 0 ? key_stride_token : value_stride_token) +
+            head_idx * (kv_side == 0 ? key_stride_head : value_stride_head);
+        for (int dim_offset = 0; dim_offset < kCodecDimBlock; ++dim_offset) {
+          const int dim = dim_tile * kCodecDimBlock + dim_offset;
+          const uint16_t bits = src[row_src_base + dim * stride_dim];
+          ++high_counts[byte_v2_high7(bits)];
+        }
       }
-    }
-    if (first_valid_physical_block >= 0) {
+
       int best_base = 0;
       int best_count = -1;
       for (int base = 0; base <= 120; ++base) {
@@ -5598,12 +5652,11 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
           best_base = base;
         }
       }
+      const int elem_count = page_token_count * kCodecDimBlock;
       const int outlier_count = elem_count - best_count;
       const int fallback =
           outlier_count > ByteV2DefaultLayout::OutlierEntriesPerTileValue;
       const int has_overlay = outlier_count > 0 && !fallback;
-      uint8_t* __restrict__ page =
-          kv_cache + first_valid_physical_block * kv_cache_stride_block;
       const int token_tile = 0;
       int outlier_pool_index = 0;
       if (has_overlay) {
@@ -5655,19 +5708,15 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
       }
       if (has_overlay) {
         int overlay_entry_idx = 0;
-        for (int row = 0; row < rows; ++row) {
-          const int64_t slot_idx = slot_mapping[token_start + row];
-          if (slot_idx < 0) {
-            continue;
-          }
+        for (int source_offset = 0; source_offset < page_token_count;
+             ++source_offset) {
+          const int64_t token_idx = page_token_start + source_offset;
+          const int64_t slot_idx = slot_mapping[token_idx];
           const int row_in_tile = static_cast<int>(slot_idx % kBlockSize);
           const int64_t row_src_base =
-              (token_start + row) *
+              token_idx *
                   (kv_side == 0 ? key_stride_token : value_stride_token) +
               head_idx * (kv_side == 0 ? key_stride_head : value_stride_head);
-          const uint16_t* __restrict__ src = kv_side == 0 ? key : value;
-          const int64_t stride_dim =
-              kv_side == 0 ? key_stride_dim : value_stride_dim;
           for (int dim_offset = 0; dim_offset < kCodecDimBlock; ++dim_offset) {
             const int dim = dim_tile * kCodecDimBlock + dim_offset;
             const uint16_t bits = src[row_src_base + dim * stride_dim];
@@ -5702,88 +5751,76 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
       }
       shared_base = best_base;
       shared_fallback = fallback;
-    } else {
-      shared_base = 0;
-      shared_fallback = 1;
     }
-  }
-  __syncthreads();
+    __syncthreads();
 
-  const int pair_idx = threadIdx.x;
-  if (pair_idx >= kPairsPerCodecTile) {
-    return;
-  }
-  const int row_in_source_block = pair_idx / kPairsPerRow;
-  if (row_in_source_block >= rows) {
-    return;
-  }
+    const int pair_idx = threadIdx.x;
+    const int source_offset = pair_idx / kPairsPerRow;
+    if (pair_idx < kPairsPerCodecTile && source_offset < page_token_count) {
+      const int64_t token_idx = page_token_start + source_offset;
+      const int64_t slot_idx = slot_mapping[token_idx];
+      const int pair_in_dim_tile = pair_idx % kPairsPerRow;
+      const int token_offset = static_cast<int>(slot_idx % kBlockSize);
+      const int token_tile = token_offset / kCodecTokenBlock;
+      const int row_in_tile = token_offset % kCodecTokenBlock;
 
-  const int64_t token_idx = token_start + row_in_source_block;
-  const int64_t slot_idx = slot_mapping[token_idx];
-  if (slot_idx < 0) {
-    return;
-  }
+      const int dim0 = dim_tile * kCodecDimBlock + pair_in_dim_tile * 2;
+      const int dim1 = dim0 + 1;
+      const uint16_t* __restrict__ src = kv_side == 0 ? key : value;
+      const int64_t stride_token =
+          kv_side == 0 ? key_stride_token : value_stride_token;
+      const int64_t stride_head =
+          kv_side == 0 ? key_stride_head : value_stride_head;
+      const int64_t stride_dim =
+          kv_side == 0 ? key_stride_dim : value_stride_dim;
+      const int64_t src_base =
+          token_idx * stride_token + head_idx * stride_head;
+      const uint16_t bits0 = src[src_base + dim0 * stride_dim];
+      const uint16_t bits1 = src[src_base + dim1 * stride_dim];
 
-  const int pair_in_dim_tile = pair_idx % kPairsPerRow;
-  const int64_t physical_block = slot_idx / kBlockSize;
-  const int token_offset = static_cast<int>(slot_idx % kBlockSize);
-  const int token_tile = token_offset / kCodecTokenBlock;
-  const int row_in_tile = token_offset % kCodecTokenBlock;
-  uint8_t* __restrict__ page =
-      kv_cache + physical_block * kv_cache_stride_block;
+      int64_t tile_offset;
+      if (kv_side == 0) {
+        tile_offset =
+            ByteV2DefaultLayout::KPayloadBaseBytes +
+            head_idx * ByteV2DefaultLayout::AlignedKPayloadBytesPerKvHead +
+            (dim_tile * ByteV2DefaultPolicy::CodecTokenTilesPerAllocBlock +
+             token_tile) *
+                kPayloadBytesPerTile;
+      } else {
+        tile_offset =
+            ByteV2DefaultLayout::VPayloadBaseBytes +
+            head_idx * ByteV2DefaultLayout::AlignedVPayloadBytesPerKvHead +
+            (token_tile * kVDimTiles + dim_tile) * kPayloadBytesPerTile;
+      }
 
-  const int dim0 = dim_tile * kCodecDimBlock + pair_in_dim_tile * 2;
-  const int dim1 = dim0 + 1;
-  const uint16_t* __restrict__ src = kv_side == 0 ? key : value;
-  const int64_t stride_token =
-      kv_side == 0 ? key_stride_token : value_stride_token;
-  const int64_t stride_head =
-      kv_side == 0 ? key_stride_head : value_stride_head;
-  const int64_t stride_dim = kv_side == 0 ? key_stride_dim : value_stride_dim;
-  const int64_t src_base = token_idx * stride_token + head_idx * stride_head;
-  const uint16_t bits0 = src[src_base + dim0 * stride_dim];
-  const uint16_t bits1 = src[src_base + dim1 * stride_dim];
+      const int elem_base = row_in_tile * kCodecDimBlock + pair_in_dim_tile * 2;
+      page[tile_offset + elem_base] = static_cast<uint8_t>(bits0 & 0xff);
+      page[tile_offset + elem_base + 1] = static_cast<uint8_t>(bits1 & 0xff);
+      const uint8_t code0 = shared_fallback
+                                ? byte_v2_code_nibble(bits0)
+                                : byte_v2_delta_code_nibble(bits0, shared_base);
+      const uint8_t code1 = shared_fallback
+                                ? byte_v2_code_nibble(bits1)
+                                : byte_v2_delta_code_nibble(bits1, shared_base);
+      page[tile_offset + kCodeBase + elem_base / 2] =
+          (code0 & 0x0f) | static_cast<uint8_t>((code1 & 0x0f) << 4);
 
-  int64_t tile_offset;
-  if (kv_side == 0) {
-    tile_offset =
-        ByteV2DefaultLayout::KPayloadBaseBytes +
-        head_idx * ByteV2DefaultLayout::AlignedKPayloadBytesPerKvHead +
-        (dim_tile * ByteV2DefaultPolicy::CodecTokenTilesPerAllocBlock +
-         token_tile) *
-            kPayloadBytesPerTile;
-  } else {
-    tile_offset =
-        ByteV2DefaultLayout::VPayloadBaseBytes +
-        head_idx * ByteV2DefaultLayout::AlignedVPayloadBytesPerKvHead +
-        (token_tile * kVDimTiles + dim_tile) * kPayloadBytesPerTile;
-  }
-
-  const int elem_base = row_in_tile * kCodecDimBlock + pair_in_dim_tile * 2;
-  page[tile_offset + elem_base] = static_cast<uint8_t>(bits0 & 0xff);
-  page[tile_offset + elem_base + 1] = static_cast<uint8_t>(bits1 & 0xff);
-  const uint8_t code0 = shared_fallback
-                            ? byte_v2_code_nibble(bits0)
-                            : byte_v2_delta_code_nibble(bits0, shared_base);
-  const uint8_t code1 = shared_fallback
-                            ? byte_v2_code_nibble(bits1)
-                            : byte_v2_delta_code_nibble(bits1, shared_base);
-  page[tile_offset + kCodeBase + elem_base / 2] =
-      (code0 & 0x0f) | static_cast<uint8_t>((code1 & 0x0f) << 4);
-
-  if constexpr (ByteV2DefaultLayout::IncludeRawPayloadValue) {
-    const int64_t raw_offset0 =
-        kv_side == 0
-            ? ByteV2DefaultLayout::raw_key_offset(head_idx, token_offset, dim0)
-            : ByteV2DefaultLayout::raw_value_offset(head_idx, token_offset,
-                                                    dim0);
-    const int64_t raw_offset1 =
-        kv_side == 0
-            ? ByteV2DefaultLayout::raw_key_offset(head_idx, token_offset, dim1)
-            : ByteV2DefaultLayout::raw_value_offset(head_idx, token_offset,
-                                                    dim1);
-    byte_v2_store_u16_bytes(page, raw_offset0, bits0);
-    byte_v2_store_u16_bytes(page, raw_offset1, bits1);
+      if constexpr (ByteV2DefaultLayout::IncludeRawPayloadValue) {
+        const int64_t raw_offset0 = kv_side == 0
+                                        ? ByteV2DefaultLayout::raw_key_offset(
+                                              head_idx, token_offset, dim0)
+                                        : ByteV2DefaultLayout::raw_value_offset(
+                                              head_idx, token_offset, dim0);
+        const int64_t raw_offset1 = kv_side == 0
+                                        ? ByteV2DefaultLayout::raw_key_offset(
+                                              head_idx, token_offset, dim1)
+                                        : ByteV2DefaultLayout::raw_value_offset(
+                                              head_idx, token_offset, dim1);
+        byte_v2_store_u16_bytes(page, raw_offset0, bits0);
+        byte_v2_store_u16_bytes(page, raw_offset1, bits1);
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -6919,13 +6956,15 @@ template <typename Layout, bool UsePageUnsafeFlags, bool UseQkMma,
           bool UseFa2Mainloop, bool UseFa2Multiwarp, bool UseFa2Direct,
           int QHeadsPerKv = 4, int QGroupTile = 4,
           int DirectDiagnosticMode = kByteV2DirectDiagnosticCurrent,
-          int SpeculativeQueryLen = 0>
+          int SpeculativeQueryLen = 0, bool UseRaggedSpeculativeQ4 = false>
 void launch_byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier(
     torch::stable::Tensor& output, torch::stable::Tensor& exp_sums,
     torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
     torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
     const int32_t* page_unsafe_flags, torch::stable::Tensor& block_tables,
-    torch::stable::Tensor& seq_lens, double scale, int64_t partition_size) {
+    torch::stable::Tensor& seq_lens, double scale, int64_t partition_size,
+    const int32_t* query_start_locs = nullptr, int num_ragged_requests = 0,
+    int num_actual_tokens = 0) {
   using Policy = typename Layout::TilePolicy;
   constexpr int kThreads = Policy::HeadDim;
   constexpr int kGroupsPerKv = (QHeadsPerKv + QGroupTile - 1) / QGroupTile;
@@ -6936,11 +6975,14 @@ void launch_byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_
   static_assert(QGroupTile <= QHeadsPerKv);
   static_assert(DirectDiagnosticMode == kByteV2DirectDiagnosticCurrent ||
                 UseFa2Direct);
+  static_assert(!UseRaggedSpeculativeQ4 || SpeculativeQueryLen == 4);
 
   const int num_seqs =
-      SpeculativeQueryLen > 0
-          ? static_cast<int>(output.size(0) / SpeculativeQueryLen)
-          : static_cast<int>(output.size(0));
+      UseRaggedSpeculativeQ4
+          ? num_ragged_requests
+          : (SpeculativeQueryLen > 0
+                 ? static_cast<int>(output.size(0) / SpeculativeQueryLen)
+                 : static_cast<int>(output.size(0)));
   const int num_heads = SpeculativeQueryLen > 0
                             ? Layout::NumKvHeadsValue * QHeadsPerKv
                             : static_cast<int>(output.size(1));
@@ -6949,6 +6991,11 @@ void launch_byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_
   }
 
   const int max_num_partitions = exp_sums.size(2);
+  if constexpr (UseRaggedSpeculativeQ4) {
+    const size_t row_reduce_smem = (max_num_partitions + 1) * sizeof(float);
+    STD_TORCH_CHECK(row_reduce_smem <= 48 * 1024,
+                    "ByteV2 ragged Q4 row-packed reduction exceeds 48 KiB");
+  }
   if constexpr (DirectDiagnosticMode ==
                 kByteV2DirectDiagnosticUnnormalizedPartitionOutput) {
     STD_TORCH_CHECK(
@@ -6965,19 +7012,21 @@ void launch_byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_
   byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier_kernel<
       Layout, UsePageUnsafeFlags, UseQkMma, UseFa2Mainloop, UseFa2Multiwarp,
       UseFa2Direct, QHeadsPerKv, QGroupTile, kThreads, DirectDiagnosticMode,
-      SpeculativeQueryLen><<<split_grid, block, 0, stream>>>(
-      reinterpret_cast<float*>(tmp_out.mutable_data_ptr()),
-      reinterpret_cast<float*>(exp_sums.mutable_data_ptr()),
-      max_logits.numel() == 0
-          ? nullptr
-          : reinterpret_cast<float*>(max_logits.mutable_data_ptr()),
-      reinterpret_cast<const uint16_t*>(query.const_data_ptr()),
-      reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
-      page_unsafe_flags, block_tables.const_data_ptr<int32_t>(),
-      seq_lens.const_data_ptr<int32_t>(), static_cast<float>(scale),
-      query.stride(0), query.stride(1), query.stride(2), kv_cache.stride(0),
-      block_tables.stride(0), block_tables.size(1), max_num_partitions,
-      static_cast<int>(partition_size));
+      SpeculativeQueryLen, UseRaggedSpeculativeQ4>
+      <<<split_grid, block, 0, stream>>>(
+          reinterpret_cast<float*>(tmp_out.mutable_data_ptr()),
+          reinterpret_cast<float*>(exp_sums.mutable_data_ptr()),
+          max_logits.numel() == 0
+              ? nullptr
+              : reinterpret_cast<float*>(max_logits.mutable_data_ptr()),
+          reinterpret_cast<const uint16_t*>(query.const_data_ptr()),
+          reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+          page_unsafe_flags, block_tables.const_data_ptr<int32_t>(),
+          seq_lens.const_data_ptr<int32_t>(), query_start_locs,
+          num_actual_tokens, static_cast<float>(scale), query.stride(0),
+          query.stride(1), query.stride(2), kv_cache.stride(0),
+          block_tables.stride(0), block_tables.size(1), max_num_partitions,
+          static_cast<int>(partition_size));
 
   cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(
@@ -7005,18 +7054,20 @@ void launch_byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_
   constexpr bool kUseUnnormalizedOutput =
       DirectDiagnosticMode ==
       kByteV2DirectDiagnosticUnnormalizedPartitionOutput;
-  if constexpr (SpeculativeQueryLen == 16 && !kUseUnnormalizedOutput) {
+  if constexpr ((SpeculativeQueryLen == 16 || UseRaggedSpeculativeQ4) &&
+                !kUseUnnormalizedOutput) {
     const size_t row_reduce_smem = (max_num_partitions + 1) * sizeof(float);
     if (row_reduce_smem <= 48 * 1024) {
       const dim3 row_reduce_grid(num_heads, num_seqs);
       byte_v2_paged_decode_attention_split_k_reduce_speculative_row_kernel<
-          Layout, SpeculativeQueryLen>
+          Layout, SpeculativeQueryLen, UseRaggedSpeculativeQ4>
           <<<row_reduce_grid, block, row_reduce_smem, stream>>>(
               reinterpret_cast<uint16_t*>(output.mutable_data_ptr()),
               reinterpret_cast<const float*>(tmp_out.const_data_ptr()),
               reinterpret_cast<const float*>(exp_sums.const_data_ptr()),
-              seq_lens.const_data_ptr<int32_t>(), output.stride(0),
-              output.stride(1), output.stride(2), max_num_partitions,
+              seq_lens.const_data_ptr<int32_t>(), query_start_locs,
+              num_actual_tokens, output.stride(0), output.stride(1),
+              output.stride(2), max_num_partitions,
               static_cast<int>(partition_size));
     } else {
       byte_v2_paged_decode_attention_split_k_reduce_warp_kernel<
@@ -9487,6 +9538,156 @@ void byte_v2_speculative_verify_gqa(
     }
 #undef BYTE_V2_LAUNCH_Q16_DIAGNOSTIC
   }
+}
+
+void byte_v2_speculative_verify_ragged_q4(
+    torch::stable::Tensor& output, torch::stable::Tensor& exp_sums,
+    torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& page_unsafe_flags,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
+    torch::stable::Tensor& query_start_locs, int64_t num_actual_tokens,
+    double scale, int64_t num_kv_heads, int64_t block_size, int64_t max_seq_len,
+    int64_t partition_size, const std::vector<int64_t>& tile_policy) {
+  using torch::headeronly::ScalarType;
+
+  constexpr int64_t kSpeculativeQueryLen = 4;
+  constexpr int64_t kQueryHeadsPerKv = 4;
+  constexpr int64_t kVirtualRowsPerKv = kSpeculativeQueryLen * kQueryHeadsPerKv;
+  constexpr int64_t kVirtualHeads =
+      ByteV2DefaultLayout::NumKvHeadsValue * kVirtualRowsPerKv;
+
+  STD_TORCH_CHECK(query.device().is_cuda(), "query must be a CUDA tensor");
+  STD_TORCH_CHECK(output.device() == query.device(),
+                  "output and query must be on the same device");
+  STD_TORCH_CHECK(kv_cache.device() == query.device(),
+                  "kv_cache and query must be on the same device");
+  STD_TORCH_CHECK(page_unsafe_flags.device() == query.device(),
+                  "page_unsafe_flags and query must be on the same device");
+  STD_TORCH_CHECK(block_tables.device() == query.device(),
+                  "block_tables and query must be on the same device");
+  STD_TORCH_CHECK(seq_lens.device() == query.device(),
+                  "seq_lens and query must be on the same device");
+  STD_TORCH_CHECK(query_start_locs.device() == query.device(),
+                  "query_start_locs and query must be on the same device");
+  STD_TORCH_CHECK(exp_sums.device() == query.device(),
+                  "exp_sums and query must be on the same device");
+  STD_TORCH_CHECK(tmp_out.device() == query.device(),
+                  "tmp_out and query must be on the same device");
+  STD_TORCH_CHECK(max_logits.device() == query.device(),
+                  "max_logits and query must be on the same device");
+  STD_TORCH_CHECK(max_logits.numel() == 0,
+                  "ByteV2 ragged Q4 does not use max_logits");
+
+  STD_TORCH_CHECK(output.dim() == 3 && query.sizes().equals(output.sizes()),
+                  "query and output must both be [packed_tokens, 32, 128]");
+  STD_TORCH_CHECK(
+      output.size(1) == 32 && output.size(2) == ByteV2DefaultPolicy::HeadDim,
+      "ByteV2 ragged Q4 currently supports 32 query heads and head_dim=128");
+  STD_TORCH_CHECK(num_actual_tokens >= 0 && num_actual_tokens <= output.size(0),
+                  "num_actual_tokens must fit in the packed output");
+  STD_TORCH_CHECK(query_start_locs.dim() == 1 && query_start_locs.size(0) >= 2,
+                  "query_start_locs must contain at least one request");
+  const int64_t num_requests = query_start_locs.size(0) - 1;
+  STD_TORCH_CHECK(num_actual_tokens <= num_requests * kSpeculativeQueryLen,
+                  "ragged Q4 supports at most four tokens per request");
+
+  STD_TORCH_CHECK(kv_cache.dim() == 2,
+                  "kv_cache must be [num_blocks, page_size_bytes]");
+  STD_TORCH_CHECK(page_unsafe_flags.dim() == 1,
+                  "page_unsafe_flags must be a 1D tensor");
+  STD_TORCH_CHECK(block_tables.dim() == 2,
+                  "block_tables must be [num_requests, max_num_blocks]");
+  STD_TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be [num_requests]");
+  STD_TORCH_CHECK(block_tables.size(0) >= num_requests,
+                  "block_tables must contain every request");
+  STD_TORCH_CHECK(seq_lens.size(0) >= num_requests,
+                  "seq_lens must contain every request");
+  STD_TORCH_CHECK(page_unsafe_flags.size(0) >= kv_cache.size(0),
+                  "page_unsafe_flags must cover every kv_cache block");
+
+  STD_TORCH_CHECK(query.scalar_type() == ScalarType::BFloat16,
+                  "ByteV2 ragged Q4 requires bf16 query tensors");
+  STD_TORCH_CHECK(output.scalar_type() == query.scalar_type(),
+                  "output and query dtypes must match");
+  STD_TORCH_CHECK(kv_cache.scalar_type() == ScalarType::Byte,
+                  "kv_cache must use uint8 storage");
+  STD_TORCH_CHECK(page_unsafe_flags.scalar_type() == ScalarType::Int,
+                  "page_unsafe_flags must use int32 storage");
+  STD_TORCH_CHECK(block_tables.scalar_type() == ScalarType::Int,
+                  "block_tables must use int32 storage");
+  STD_TORCH_CHECK(seq_lens.scalar_type() == ScalarType::Int,
+                  "seq_lens must use int32 storage");
+  STD_TORCH_CHECK(query_start_locs.scalar_type() == ScalarType::Int,
+                  "query_start_locs must use int32 storage");
+  STD_TORCH_CHECK(exp_sums.scalar_type() == ScalarType::Float,
+                  "exp_sums must use float32 storage");
+  STD_TORCH_CHECK(tmp_out.scalar_type() == ScalarType::Float,
+                  "tmp_out must use float32 storage");
+  STD_TORCH_CHECK(exp_sums.is_contiguous(), "exp_sums must be contiguous");
+  STD_TORCH_CHECK(tmp_out.is_contiguous(), "tmp_out must be contiguous");
+  STD_TORCH_CHECK(query_start_locs.stride(0) == 1,
+                  "query_start_locs must be contiguous");
+  STD_TORCH_CHECK(seq_lens.stride(0) == 1, "seq_lens must be contiguous");
+  STD_TORCH_CHECK(page_unsafe_flags.stride(0) == 1,
+                  "page_unsafe_flags must be contiguous");
+  STD_TORCH_CHECK(kv_cache.stride(1) == 1,
+                  "kv_cache page dimension must be contiguous");
+  STD_TORCH_CHECK(block_tables.stride(1) == 1,
+                  "block_tables block dimension must be contiguous");
+
+  STD_TORCH_CHECK(num_kv_heads == ByteV2DefaultLayout::NumKvHeadsValue,
+                  "ByteV2 ragged Q4 currently supports 8 KV heads");
+  STD_TORCH_CHECK(block_size == ByteV2DefaultPolicy::AllocBlockTokens,
+                  "ByteV2 ragged Q4 currently supports block_size=16");
+  STD_TORCH_CHECK(
+      max_seq_len > 0 && max_seq_len <= std::numeric_limits<int32_t>::max(),
+      "max_seq_len must fit in int32");
+  STD_TORCH_CHECK(partition_size > 0 && partition_size % block_size == 0,
+                  "partition_size must be positive and divisible by 16");
+  STD_TORCH_CHECK(partition_size <= std::numeric_limits<int>::max(),
+                  "partition_size must fit in int32");
+  STD_TORCH_CHECK(scale > 0.0, "scale must be positive");
+  check_byte_v2_tile_policy(tile_policy);
+  STD_TORCH_CHECK(
+      tile_policy[0] == ByteV2DefaultPolicy::CodecTokenBlock &&
+          tile_policy[1] == ByteV2DefaultPolicy::CodecDimBlock &&
+          tile_policy[2] == ByteV2DefaultPolicy::AllocBlockTokens &&
+          tile_policy[3] == ByteV2DefaultPolicy::ComputeBlockN &&
+          tile_policy[4] == ByteV2DefaultPolicy::HeadDim &&
+          tile_policy[5] == ByteV2DefaultPolicy::HeadDimV,
+      "ByteV2 ragged Q4 requires the default 16x16/BN64/H128 policy");
+  STD_TORCH_CHECK(kv_cache.size(1) >= ByteV2DefaultLayout::PageSizeBytes &&
+                      kv_cache.stride(0) >= ByteV2DefaultLayout::PageSizeBytes,
+                  "kv_cache page is smaller than the ByteV2 V5 layout");
+  STD_TORCH_CHECK(
+      block_tables.size(1) >=
+          (max_seq_len + ByteV2DefaultPolicy::AllocBlockTokens - 1) /
+              ByteV2DefaultPolicy::AllocBlockTokens,
+      "block_tables is too small for max_seq_len");
+
+  const int64_t required_partitions =
+      (max_seq_len + partition_size - 1) / partition_size;
+  STD_TORCH_CHECK(exp_sums.dim() == 3 && exp_sums.size(0) >= num_requests &&
+                      exp_sums.size(1) >= kVirtualHeads &&
+                      exp_sums.size(2) >= required_partitions &&
+                      exp_sums.size(2) > 0,
+                  "exp_sums workspace must be [requests, 128, partitions]");
+  STD_TORCH_CHECK(tmp_out.dim() == 4 && tmp_out.size(0) >= num_requests &&
+                      tmp_out.size(1) >= kVirtualHeads &&
+                      tmp_out.size(2) == exp_sums.size(2) &&
+                      tmp_out.size(2) >= required_partitions &&
+                      tmp_out.size(3) == ByteV2DefaultPolicy::HeadDimV,
+                  "tmp_out workspace must be "
+                  "[requests, 128, partitions, 128]");
+
+  launch_byte_v2_paged_decode_attention_split_k_gqa4_fa2_like_no_fallback_no_outlier<
+      ByteV2DefaultLayout, true, true, false, false, true, 16, 16,
+      kByteV2DirectDiagnosticCurrent, 4, true>(
+      output, exp_sums, max_logits, tmp_out, query, kv_cache,
+      page_unsafe_flags.const_data_ptr<int32_t>(), block_tables, seq_lens,
+      scale, partition_size, query_start_locs.const_data_ptr<int32_t>(),
+      static_cast<int>(num_requests), static_cast<int>(num_actual_tokens));
 }
 
 void byte_v2_speculative_verify_q4(

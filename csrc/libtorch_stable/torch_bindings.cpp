@@ -604,6 +604,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int block_size, int max_seq_len, int partition_size,"
       "    int[] tile_policy) -> ()");
   ops.def(
+      "byte_v2_speculative_verify_ragged_q4("
+      "    Tensor! output, Tensor! exp_sums, Tensor! max_logits,"
+      "    Tensor! tmp_out, Tensor query, Tensor kv_cache,"
+      "    Tensor page_unsafe_flags, Tensor block_tables, Tensor seq_lens,"
+      "    Tensor query_start_locs, int num_actual_tokens, float scale,"
+      "    int num_kv_heads, int block_size, int max_seq_len,"
+      "    int partition_size, int[] tile_policy) -> ()");
+  ops.def(
       "byte_v2_prefill_attention("
       "    Tensor! output, Tensor query, Tensor key, Tensor value,"
       "    Tensor query_start_loc, int max_query_len, float scale,"
@@ -740,6 +748,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
            TORCH_BOX(&byte_v2_speculative_verify_q4));
   ops.impl("byte_v2_speculative_verify_gqa",
            TORCH_BOX(&byte_v2_speculative_verify_gqa));
+  ops.impl("byte_v2_speculative_verify_ragged_q4",
+           TORCH_BOX(&byte_v2_speculative_verify_ragged_q4));
   ops.impl("byte_v2_prefill_attention", TORCH_BOX(&byte_v2_prefill_attention));
 }
 

@@ -36,11 +36,31 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
+  # Apply the ByteV2 integration only to the pinned FetchContent checkout.
+  # A VLLM_FLASH_ATTN_SRC_DIR checkout is developer-owned and may already
+  # contain these changes, so the local-source path must not be patched here.
+  set(VLLM_FLASH_ATTN_BYTE_V2_PATCH
+      "${CMAKE_CURRENT_LIST_DIR}/../patches/vllm_flash_attn_byte_v2.patch")
+  set(VLLM_FLASH_ATTN_BYTE_V2_PATCH_SCRIPT
+      "${CMAKE_CURRENT_LIST_DIR}/../patches/apply_vllm_flash_attn_byte_v2.cmake")
+  file(SHA256 "${VLLM_FLASH_ATTN_BYTE_V2_PATCH}"
+       VLLM_FLASH_ATTN_BYTE_V2_PATCH_HASH)
+  file(SHA256 "${VLLM_FLASH_ATTN_BYTE_V2_PATCH_SCRIPT}"
+       VLLM_FLASH_ATTN_BYTE_V2_PATCH_SCRIPT_HASH)
+  set(VLLM_FLASH_ATTN_BYTE_V2_PATCH_ID
+      "${VLLM_FLASH_ATTN_BYTE_V2_PATCH_HASH}-${VLLM_FLASH_ATTN_BYTE_V2_PATCH_SCRIPT_HASH}")
   FetchContent_Declare(
           vllm-flash-attn
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
           GIT_TAG dd62dac706b1cf7895bd99b18c6cb7e7e117ee25
           GIT_PROGRESS TRUE
+          PATCH_COMMAND
+            ${CMAKE_COMMAND}
+            "-DSOURCE_DIR=<SOURCE_DIR>"
+            "-DPATCH_FILE=${VLLM_FLASH_ATTN_BYTE_V2_PATCH}"
+            "-DPATCH_HASH=${VLLM_FLASH_ATTN_BYTE_V2_PATCH_ID}"
+            -P
+            "${VLLM_FLASH_ATTN_BYTE_V2_PATCH_SCRIPT}"
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
@@ -56,6 +76,14 @@ install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_
 # Fetch the vllm-flash-attn library
 FetchContent_MakeAvailable(vllm-flash-attn)
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
+
+# ByteV2's experimental FA2 paged-KV loader is compiled in the FA2 extension
+# so it can preserve the original mainloop and split-K combine ABI.  Keep the
+# codec layout/loader header in vLLM, where the cache format is defined.
+if(TARGET _vllm_fa2_C)
+  target_include_directories(_vllm_fa2_C PRIVATE
+    ${CMAKE_SOURCE_DIR}/csrc/libtorch_stable/byte_v2)
+endif()
 
 # Restore the install prefix after FA's install rules
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)

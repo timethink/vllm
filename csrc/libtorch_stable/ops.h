@@ -619,6 +619,16 @@ void byte_v2_speculative_verify_gqa(
     int64_t block_size, int64_t max_seq_len, int64_t partition_size,
     const std::vector<int64_t>& tile_policy);
 
+void byte_v2_speculative_verify_ragged_q4(
+    torch::stable::Tensor& output, torch::stable::Tensor& exp_sums,
+    torch::stable::Tensor& max_logits, torch::stable::Tensor& tmp_out,
+    torch::stable::Tensor& query, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& page_unsafe_flags,
+    torch::stable::Tensor& block_tables, torch::stable::Tensor& seq_lens,
+    torch::stable::Tensor& query_start_locs, int64_t num_actual_tokens,
+    double scale, int64_t num_kv_heads, int64_t block_size, int64_t max_seq_len,
+    int64_t partition_size, const std::vector<int64_t>& tile_policy);
+
 void concat_and_cache_mla(torch::stable::Tensor& kv_c,
                           torch::stable::Tensor& k_pe,
                           torch::stable::Tensor& kv_cache,

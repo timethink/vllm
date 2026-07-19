@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import suppress
 
 import torch
 
@@ -12,6 +13,11 @@ _MISSING_KERNEL_MSG = (
     "ByteV2 custom kernels are not registered in this checkout. "
     "Build and register the ByteV2 cache and decode kernels before enabling "
     "the ByteV2 backend."
+)
+_MISSING_FA2_KERNEL_MSG = (
+    "ByteV2 FA2 decode is not registered in this checkout. Build the "
+    "vLLM FlashAttention-2 extension with ByteV2 support before selecting "
+    "BYTE_V2_DECODE_KERNEL=fa2."
 )
 _REQUIRED_BYTE_V2_CUSTOM_OPS = (
     ("_C_cache_ops", "byte_v2_reshape_and_cache"),
@@ -31,9 +37,11 @@ _REQUIRED_BYTE_V2_CUSTOM_OPS = (
     ("_C", "byte_v2_paged_decode_attention_split_k_guarded"),
     ("_C", "byte_v2_speculative_verify_q4"),
     ("_C", "byte_v2_speculative_verify_gqa"),
+    ("_C", "byte_v2_speculative_verify_ragged_q4"),
     ("_C", "byte_v2_prefill_attention"),
 )
 _CUSTOM_OPS_LOAD_ATTEMPTED = False
+_FA2_OPS_LOAD_ATTEMPTED = False
 
 
 def _find_op(namespace: str, op_name: str):
@@ -54,10 +62,32 @@ def _ensure_custom_ops_loaded() -> None:
         pass
 
 
+def _ensure_fa2_ops_loaded() -> None:
+    global _FA2_OPS_LOAD_ATTEMPTED
+    if _FA2_OPS_LOAD_ATTEMPTED:
+        return
+    _FA2_OPS_LOAD_ATTEMPTED = True
+    with suppress(ImportError, OSError):
+        import vllm.vllm_flash_attn  # noqa: F401
+
+
 def _require_op(namespace: str, op_name: str):
     op = _find_op(namespace, op_name)
     if op is None:
         raise NotImplementedError(_MISSING_KERNEL_MSG)
+    return op
+
+
+def _find_fa2_op(op_name: str):
+    _ensure_fa2_ops_loaded()
+    op_namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    return getattr(op_namespace, op_name, None) if op_namespace is not None else None
+
+
+def _require_fa2_op(op_name: str):
+    op = _find_fa2_op(op_name)
+    if op is None:
+        raise NotImplementedError(_MISSING_FA2_KERNEL_MSG)
     return op
 
 
@@ -67,6 +97,11 @@ def byte_v2_custom_ops_are_available() -> bool:
         _find_op(namespace, op_name) is not None
         for namespace, op_name in _REQUIRED_BYTE_V2_CUSTOM_OPS
     )
+
+
+def byte_v2_fa2_decode_is_available() -> bool:
+    """Return whether the optional ByteV2 FA2 decode entry point exists."""
+    return _find_fa2_op("byte_v2_varlen_fwd") is not None
 
 
 def missing_byte_v2_custom_ops() -> tuple[str, ...]:
@@ -407,6 +442,49 @@ def byte_v2_paged_decode_attention(
     )
 
 
+def byte_v2_fa2_paged_decode_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    query_start_locs: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    scale: float,
+    max_seq_len: int,
+    causal: bool,
+) -> None:
+    """Run Q1 ByteV2 decode through the original FA2 split-KV template.
+
+    The extension only replaces FA2's global-to-shared K/V copy policy with
+    ByteV2 decode. QK, softmax, PV, split selection, and combine remain FA2.
+    """
+    _require_fa2_op("byte_v2_varlen_fwd")(
+        query,
+        kv_cache,
+        None,
+        output,
+        query_start_locs,
+        query_start_locs,
+        seq_lens,
+        None,
+        block_tables,
+        None,
+        1,
+        max_seq_len,
+        0.0,
+        scale,
+        False,
+        causal,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+
+
 def byte_v2_paged_decode_attention_split_k(
     output: torch.Tensor,
     exp_sums: torch.Tensor,
@@ -550,6 +628,48 @@ def byte_v2_speculative_verify_gqa(
         block_tables,
         seq_lens,
         speculative_query_len,
+        scale,
+        num_kv_heads,
+        block_size,
+        max_seq_len,
+        partition_size,
+        list(tile_policy),
+    )
+
+
+def byte_v2_speculative_verify_ragged_q4(
+    output: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_unsafe_flags: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_locs: torch.Tensor,
+    *,
+    num_actual_tokens: int,
+    scale: float,
+    num_kv_heads: int,
+    block_size: int,
+    max_seq_len: int,
+    partition_size: int,
+    tile_policy: Sequence[int],
+) -> None:
+    """Run a batched mixed-Q request set through the Q4 shared-KV kernel."""
+    _require_op("_C", "byte_v2_speculative_verify_ragged_q4")(
+        output,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        query,
+        kv_cache,
+        page_unsafe_flags,
+        block_tables,
+        seq_lens,
+        query_start_locs,
+        num_actual_tokens,
         scale,
         num_kv_heads,
         block_size,

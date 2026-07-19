@@ -1,0 +1,818 @@
+diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
+index 11f6249..662c92e 100644
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <cutlass/numeric_types.h>
+ 
++#include <type_traits>
++
+ #include "namespace_config.h"
+ #include "hardware_info.h"
+ #include "flash.h"
+@@ -239,11 +241,24 @@ void set_params_dgrad(Flash_bwd_params &params,
+     params.deterministic = deterministic;
+ }
+ 
+-void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
++void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream,
++                 bool force_split_kernel=false, bool force_byte_v2=false) {
++    TORCH_CHECK((params.blockmask != nullptr) == force_byte_v2,
++                "ByteV2 FA2 host dispatch marker mismatch");
+     FP16_SWITCH(!params.is_bf16, [&] {
+         HEADDIM_SWITCH(params.d, [&] {
+             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+-                if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
++                if (force_byte_v2) {
++                    if constexpr (std::is_same_v<elem_type,
++                                                 cutlass::bfloat16_t> &&
++                                  kHeadDim == 128) {
++                        run_mha_byte_v2_fwd_splitkv_dispatch<
++                            elem_type, kHeadDim, Is_causal>(params, stream);
++                    } else {
++                        TORCH_CHECK(false,
++                                    "ByteV2 FA2 requires BF16 head dim 128");
++                    }
++                } else if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                     run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                 } else {
+                     run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+@@ -512,8 +527,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
+     return {out, softmax_lse};
+ }
+ 
+-std::vector<at::Tensor>
+-mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
++static std::vector<at::Tensor>
++mha_varlen_fwd_impl(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+@@ -534,7 +549,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+                const float softcap,
+                const bool return_softmax,
+                int num_splits,
+-               std::optional<at::Generator> gen_) {
++               std::optional<at::Generator> gen_,
++               const at::Tensor *byte_v2_kv_cache,
++               const at::Tensor *byte_v2_page_unsafe_flags,
++               bool is_byte_v2_call) {
++
++    TORCH_CHECK(is_byte_v2_call == (byte_v2_kv_cache != nullptr),
++                "ByteV2 FA2 wrapper mode/cache mismatch");
+ 
+     // Otherwise the kernel will be launched from cuda:0 device
+     at::cuda::CUDAGuard device_guard{q.device()};
+@@ -713,6 +734,18 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+         params.num_splits = num_splits;
+     }
+ 
++    if (is_byte_v2_call) {
++        // Dense FA2 never consumes blockmask. Reuse that existing field as the
++        // ByteV2 mode/cache pointer so the raw Flash_fwd_params ABI remains
++        // byte-for-byte unchanged across all precompiled FA2 translation units.
++        params.blockmask =
++            reinterpret_cast<int *>(byte_v2_kv_cache->data_ptr());
++        // Paged ByteV2 does not use the raw K batch stride. Carry the page
++        // count here for device-side block-table validation.
++        params.k_batch_stride = byte_v2_kv_cache->size(0);
++        (void)byte_v2_page_unsafe_flags;
++    }
++
+     if (leftpad_k_.has_value()) {
+         auto leftpad_k = leftpad_k_.value();
+         TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running at the same time yet");
+@@ -745,7 +778,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+ 
+     if (max_seqlen_k > 0) {
+         auto stream = at::cuda::getCurrentCUDAStream().stream();
+-        run_mha_fwd(params, stream, paged_KV);
++        run_mha_fwd(params, stream, paged_KV,
++                    /*force_byte_v2=*/is_byte_v2_call);
+     } else {
+         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
+         out.zero_();
+@@ -786,6 +820,138 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+     return {out, softmax_lse};
+ }
+ 
++std::vector<at::Tensor>
++mha_varlen_fwd(at::Tensor &q,
++               const at::Tensor &k,
++               const at::Tensor &v,
++               std::optional<at::Tensor> &out_,
++               const at::Tensor &cu_seqlens_q,
++               const at::Tensor &cu_seqlens_k,
++               std::optional<at::Tensor> &seqused_k,
++               std::optional<const at::Tensor> &leftpad_k_,
++               std::optional<at::Tensor> &block_table_,
++               std::optional<at::Tensor> &alibi_slopes_,
++               int max_seqlen_q,
++               const int max_seqlen_k,
++               const float p_dropout,
++               const float softmax_scale,
++               const bool zero_tensors,
++               bool is_causal,
++               int window_size_left,
++               int window_size_right,
++               const float softcap,
++               const bool return_softmax,
++               int num_splits,
++               std::optional<at::Generator> gen_) {
++    return mha_varlen_fwd_impl(
++        q, k, v, out_, cu_seqlens_q, cu_seqlens_k, seqused_k, leftpad_k_,
++        block_table_, alibi_slopes_, max_seqlen_q, max_seqlen_k, p_dropout,
++        softmax_scale, zero_tensors, is_causal, window_size_left,
++        window_size_right, softcap, return_softmax, num_splits, gen_, nullptr,
++        nullptr, /*is_byte_v2_call=*/false);
++}
++
++std::vector<at::Tensor>
++mha_byte_v2_varlen_fwd(
++        at::Tensor &q,
++        const at::Tensor &byte_v2_kv_cache,
++        std::optional<at::Tensor> &byte_v2_page_unsafe_flags_,
++        std::optional<at::Tensor> &out_,
++        const at::Tensor &cu_seqlens_q,
++        const at::Tensor &cu_seqlens_k,
++        std::optional<at::Tensor> &seqused_k,
++        std::optional<const at::Tensor> &leftpad_k_,
++        std::optional<at::Tensor> &block_table_,
++        std::optional<at::Tensor> &alibi_slopes_,
++        int max_seqlen_q,
++        const int max_seqlen_k,
++        const float p_dropout,
++        const float softmax_scale,
++        const bool zero_tensors,
++        bool is_causal,
++        int window_size_left,
++        int window_size_right,
++        const float softcap,
++        const bool return_softmax,
++        int num_splits,
++        std::optional<at::Generator> gen_) {
++    constexpr int kByteV2PageBlockSize = 16;
++    constexpr int kByteV2NumQueryHeads = 32;
++    constexpr int kByteV2NumKvHeads = 8;
++    constexpr int kByteV2HeadDim = 128;
++    constexpr int kByteV2PageSizeBytes = 52096;
++
++    CHECK_DEVICE(q);
++    CHECK_DEVICE(byte_v2_kv_cache);
++    TORCH_CHECK(q.device() == byte_v2_kv_cache.device(),
++                "query and ByteV2 KV cache must be on the same device");
++    TORCH_CHECK(q.dtype() == torch::kBFloat16,
++                "ByteV2 FA2 only supports BF16 query");
++    TORCH_CHECK(q.dim() == 3 && q.size(1) == kByteV2NumQueryHeads &&
++                    q.size(2) == kByteV2HeadDim,
++                "ByteV2 FA2 query must have shape (total_q, 32, 128)");
++    TORCH_CHECK(q.size(0) > 0 && q.stride(-1) == 1,
++                "ByteV2 FA2 query must be non-empty with contiguous head dimension");
++    TORCH_CHECK(byte_v2_kv_cache.dtype() == torch::kUInt8,
++                "ByteV2 KV cache must have dtype uint8");
++    TORCH_CHECK(byte_v2_kv_cache.dim() == 2,
++                "ByteV2 KV cache must have shape (num_pages, page_size_bytes)");
++    TORCH_CHECK(byte_v2_kv_cache.size(1) == kByteV2PageSizeBytes,
++                "ByteV2 KV cache page size must be 52096 bytes");
++    TORCH_CHECK(byte_v2_kv_cache.is_contiguous(),
++                "ByteV2 KV cache must be contiguous");
++    TORCH_CHECK(byte_v2_kv_cache.size(0) <=
++                    std::numeric_limits<int>::max(),
++                "ByteV2 KV cache has too many pages");
++    TORCH_CHECK(block_table_.has_value(),
++                "ByteV2 FA2 requires a paged KV block table");
++    const at::Tensor &byte_v2_block_table = block_table_.value();
++    TORCH_CHECK(byte_v2_block_table.dim() == 2,
++                "ByteV2 FA2 block table must be rank 2");
++    TORCH_CHECK(
++        max_seqlen_k >= 0 &&
++            static_cast<int64_t>(max_seqlen_k) <=
++                byte_v2_block_table.size(1) * kByteV2PageBlockSize,
++        "ByteV2 FA2 max sequence length exceeds block-table capacity");
++    TORCH_CHECK(p_dropout == 0.0f,
++                "ByteV2 FA2 does not support dropout");
++    TORCH_CHECK(!return_softmax,
++                "ByteV2 FA2 does not return the attention probability matrix");
++
++    const at::Tensor *byte_v2_page_unsafe_flags = nullptr;
++    if (byte_v2_page_unsafe_flags_.has_value()) {
++        const at::Tensor &flags = byte_v2_page_unsafe_flags_.value();
++        CHECK_DEVICE(flags);
++        TORCH_CHECK(flags.device() == q.device(),
++                    "ByteV2 page unsafe flags and query must be on the same device");
++        TORCH_CHECK(flags.dtype() == torch::kInt32,
++                    "ByteV2 page unsafe flags must have dtype int32");
++        TORCH_CHECK(flags.dim() == 1 &&
++                        flags.size(0) == byte_v2_kv_cache.size(0),
++                    "ByteV2 page unsafe flags must have shape (num_pages,)");
++        TORCH_CHECK(flags.is_contiguous(),
++                    "ByteV2 page unsafe flags must be contiguous");
++        byte_v2_page_unsafe_flags = &flags;
++    }
++
++    // The shared host setup expects separate rank-4 BF16 K/V tensors. The
++    // ByteV2 kernel ignores their pointers and strides, so a zero-stride view
++    // backed by the first query row provides the expected logical shape
++    // without allocating or materializing a raw cache.
++    at::Tensor fake_kv = q.as_strided(
++        {byte_v2_kv_cache.size(0), kByteV2PageBlockSize,
++         kByteV2NumKvHeads, kByteV2HeadDim},
++        {0, 0, 0, 1});
++
++    return mha_varlen_fwd_impl(
++        q, fake_kv, fake_kv, out_, cu_seqlens_q, cu_seqlens_k, seqused_k,
++        leftpad_k_, block_table_, alibi_slopes_, max_seqlen_q, max_seqlen_k,
++        p_dropout, softmax_scale, zero_tensors, is_causal, window_size_left,
++        window_size_right, softcap, return_softmax, num_splits, gen_,
++        &byte_v2_kv_cache, byte_v2_page_unsafe_flags,
++        /*is_byte_v2_call=*/true);
++}
++
+ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+ #ifndef FLASHATTENTION_DISABLE_BACKWARD
+     FP16_SWITCH(!params.is_bf16, [&] {
+diff --git a/csrc/flash_attn/flash_api_torch_lib.cpp b/csrc/flash_attn/flash_api_torch_lib.cpp
+index be2d23c..3b2f97e 100644
+--- a/csrc/flash_attn/flash_api_torch_lib.cpp
++++ b/csrc/flash_attn/flash_api_torch_lib.cpp
+@@ -38,6 +38,31 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+                int num_splits,
+                std::optional<at::Generator> gen_);
+ 
++std::vector<at::Tensor>
++mha_byte_v2_varlen_fwd(
++               at::Tensor &q,  // total_q x 32 x 128
++               const at::Tensor &byte_v2_kv_cache,  // num_pages x page_size_bytes, uint8
++               std::optional<at::Tensor> &byte_v2_page_unsafe_flags_,  // num_pages, int32
++               std::optional<at::Tensor> &out_, // total_q x 32 x 128
++               const at::Tensor &cu_seqlens_q,  // b+1
++               const at::Tensor &cu_seqlens_k,  // b+1
++               std::optional<at::Tensor> &seqused_k, // b
++               std::optional<const at::Tensor> &leftpad_k_, // batch_size
++               std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
++               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
++               int max_seqlen_q,
++               const int max_seqlen_k,
++               const float p_dropout,
++               const float softmax_scale,
++               const bool zero_tensors,
++               bool is_causal,
++               int window_size_left,
++               int window_size_right,
++               const float softcap,
++               const bool return_softmax,
++               int num_splits,
++               std::optional<at::Generator> gen_);
++
+ std::vector<at::Tensor>
+ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
+                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+@@ -113,6 +138,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+             "int num_splits, Generator? gen) -> Tensor[]");
+     ops.impl("varlen_fwd", torch::kCUDA, make_pytorch_shim(&mha_varlen_fwd));
+ 
++    ops.def("byte_v2_varlen_fwd(Tensor! q, Tensor byte_v2_kv_cache, Tensor? byte_v2_page_unsafe_flags, "
++            "Tensor!? out, Tensor cu_seqlens_q, Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, "
++            "Tensor? block_table, Tensor? alibi_slopes, int max_seqlen_q, int max_seqlen_k, "
++            "float p_dropout, float softmax_scale, bool zero_tensors, bool is_causal, "
++            "int window_size_left, int window_size_right, float softcap, bool return_softmax, "
++            "int num_splits, Generator? gen) -> Tensor[]");
++    ops.impl("byte_v2_varlen_fwd", torch::kCUDA,
++             make_pytorch_shim(&mha_byte_v2_varlen_fwd));
++
+     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
+             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "
+             "Tensor? alibi_slopes, Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, "
+@@ -139,4 +173,4 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+ 
+ REGISTER_EXTENSION(TORCH_EXTENSION_NAME);
+ 
+-} // namespace FLASH_NAMESPACE
+\ No newline at end of file
++} // namespace FLASH_NAMESPACE
+diff --git a/csrc/flash_attn/src/flash.h b/csrc/flash_attn/src/flash.h
+index 8ffbb62..c8cd5bb 100644
+--- a/csrc/flash_attn/src/flash.h
++++ b/csrc/flash_attn/src/flash.h
+@@ -188,6 +188,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
+ 
+ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
++template<typename T, int Headdim, bool Is_causal> void run_mha_byte_v2_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+ 
+ template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+ 
+diff --git a/csrc/flash_attn/src/flash_fwd_kernel.h b/csrc/flash_attn/src/flash_fwd_kernel.h
+index 7512828..ea4c179 100644
+--- a/csrc/flash_attn/src/flash_fwd_kernel.h
++++ b/csrc/flash_attn/src/flash_fwd_kernel.h
+@@ -13,6 +13,8 @@
+ #include <cutlass/array.h>
+ #include <cutlass/numeric_types.h>
+ 
++#include <type_traits>
++
+ #include "block_info.h"
+ #include "kernel_traits.h"
+ #include "utils.h"
+@@ -27,6 +29,18 @@ using namespace cute;
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
++template <typename Loader, typename = void>
++struct ExternalKvLoaderConfig {
++    static constexpr bool ReuseKvSmem = false;
++};
++
++template <typename Loader>
++struct ExternalKvLoaderConfig<Loader, std::void_t<decltype(Loader::ReuseKvSmem)>> {
++    static constexpr bool ReuseKvSmem = Loader::ReuseKvSmem;
++};
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
+ template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
+ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
+         // When params.unpadded_lse is false, LSE is written as (b, h, seqlen_q) - this is non-variable seqlen path.
+@@ -495,7 +509,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
++template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename ExternalKvLoader = void, typename Params>
+ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
+ 
+     using Element = typename Kernel_traits::Element;
+@@ -512,6 +526,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+     constexpr int kBlockN = Kernel_traits::kBlockN;
+     constexpr int kHeadDim = Kernel_traits::kHeadDim;
+     constexpr int kNWarps = Kernel_traits::kNWarps;
++    constexpr bool Has_external_kv_loader =
++        !std::is_void_v<ExternalKvLoader>;
++    constexpr bool Reuse_kv_smem =
++        Split && ExternalKvLoaderConfig<ExternalKvLoader>::ReuseKvSmem;
++
++    if constexpr (Has_external_kv_loader) {
++        static_assert(kHeadDim == 128, "ByteV2 FA2 loader supports head dim 128");
++        static_assert(!Append_KV, "ByteV2 cache updates are handled outside FA2");
++        if (params.page_block_size != ExternalKvLoader::PageBlockSize) {
++            __trap();
++        }
++    }
+ 
+     using GmemTiledCopyO = std::conditional_t<
+         !Split,
+@@ -607,7 +633,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+                             typename Kernel_traits::SmemLayoutQ{});
+     Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
+-    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
++    Tensor sV = make_tensor(
++        sK.data() + size(sK) * static_cast<int>(!Reuse_kv_smem),
++        typename Kernel_traits::SmemLayoutKV{});
+     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+ 
+@@ -629,12 +657,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+     Tensor tVgV = make_tensor(tVgV_.data(), reshape_thread_tile(tVgV_.layout()));
+     Tensor tVsV = make_tensor(tVsV_.data(), reshape_thread_tile(tVsV_.layout()));
+ 
+-    if (block_table != nullptr) {
++    if constexpr (!Has_external_kv_loader) {
++      if (block_table != nullptr) {
+         auto final_block_size = binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
+         tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+             block_table, params.k_batch_stride, params.k_row_stride, final_block_size);
+         tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+             block_table, params.v_batch_stride, params.v_row_stride, final_block_size);
++      }
+     }
+ 
+     typename Kernel_traits::TiledMma tiled_mma;
+@@ -793,7 +823,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+                 if (n_block > n_block_copy_min) {
+                     tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                         block_table, params.v_batch_stride, params.v_row_stride);
+-                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
++                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size,
+                         block_table, params.k_batch_stride, params.k_row_stride);
+                 }
+             }
+@@ -848,8 +878,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+ 
+     int n_block = n_block_max - 1;
+     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
+-                                                 binfo.actual_seqlen_k - n_block * kBlockN);
++    if constexpr (Has_external_kv_loader) {
++        ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
++            reinterpret_cast<const uint8_t *>(params.blockmask),
++            ExternalKvLoader::PageSizeBytes,
++            static_cast<int>(params.k_batch_stride),
++            block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++            min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
++            tKsK, tKVcKV);
++    } else {
++        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
++                                                     binfo.actual_seqlen_k - n_block * kBlockN);
++    }
+     cute::cp_async_fence();
+ 
+     // FLASH_NAMESPACE::cp_async_wait<0>();
+@@ -880,29 +920,74 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+         clear(acc_s);
+         FLASH_NAMESPACE::cp_async_wait<0>();
++        if constexpr (Has_external_kv_loader) {
++            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
++                reinterpret_cast<const uint8_t *>(params.blockmask),
++                ExternalKvLoader::PageSizeBytes,
++                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
++                tKsK, tKVcKV);
++        }
+         __syncthreads();
+ 
+-        // Advance gV
+-        if (masking_step > 0) {
+-            if (block_table == nullptr) {
+-                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
++        if constexpr (!Reuse_kv_smem) {
++            // Advance gV
++            if (masking_step > 0) {
++                if constexpr (Has_external_kv_loader) {
++                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
++                        reinterpret_cast<const uint8_t *>(params.blockmask),
++                        ExternalKvLoader::PageSizeBytes,
++                        static_cast<int>(params.k_batch_stride),
++                        block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                        kBlockN, tVsV, tKVcKV);
++                } else {
++                    if (block_table == nullptr) {
++                        tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
++                    } else {
++                        tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
++                            block_table, params.v_batch_stride, params.v_row_stride);
++                    }
++                    FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
++                }
+             } else {
+-                tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
+-                    block_table, params.v_batch_stride, params.v_row_stride);
++                // Clear the smem tiles to account for predicated off loads
++                if constexpr (Has_external_kv_loader) {
++                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
++                        reinterpret_cast<const uint8_t *>(params.blockmask),
++                        ExternalKvLoader::PageSizeBytes,
++                        static_cast<int>(params.k_batch_stride),
++                        block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                        min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
++                        tVsV, tKVcKV);
++                } else {
++                    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
++                        gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
++                    );
++                }
+             }
+-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
+-        } else {
+-            // Clear the smem tiles to account for predicated off loads
+-            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+-                gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+-            );
++            cute::cp_async_fence();
+         }
+-        cute::cp_async_fence();
+ 
+         FLASH_NAMESPACE::gemm(
+             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+             smem_thr_copy_Q, smem_thr_copy_K
+         );
++        if constexpr (Reuse_kv_smem) {
++            // Every warp must finish reading K before V overwrites the shared
++            // tile. V can then travel asynchronously while masking executes
++            // in registers.
++            __syncthreads();
++            ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
++                reinterpret_cast<const uint8_t *>(params.blockmask),
++                ExternalKvLoader::PageSizeBytes,
++                static_cast<int>(params.k_batch_stride),
++                block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                masking_step > 0
++                    ? kBlockN
++                    : min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0),
++                          kBlockN),
++                tVsV, tKVcKV);
++            cute::cp_async_fence();
++        }
+         // if (cute::thread0()) { print(acc_s); }
+         if constexpr (Is_softcap){
+             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+@@ -914,22 +999,40 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+         );
+ 
+         FLASH_NAMESPACE::cp_async_wait<0>();
++        if constexpr (Has_external_kv_loader) {
++            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
++                reinterpret_cast<const uint8_t *>(params.blockmask),
++                ExternalKvLoader::PageSizeBytes,
++                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
++                tVsV, tKVcKV);
++        }
+         __syncthreads();
+         // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tVsV); }
+         // __syncthreads();
+ 
+-        if (n_block > n_block_min) {
+-            // Advance gK
+-            if (block_table == nullptr) {
+-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+-            } else {
+-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+-                    block_table, params.k_batch_stride, params.k_row_stride);
++        if constexpr (!Reuse_kv_smem) {
++            if (n_block > n_block_min) {
++                // Advance gK
++                if constexpr (Has_external_kv_loader) {
++                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
++                        reinterpret_cast<const uint8_t *>(params.blockmask),
++                        ExternalKvLoader::PageSizeBytes,
++                        static_cast<int>(params.k_batch_stride),
++                        block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                        kBlockN, kBlockN, tKsK, tKVcKV);
++                } else {
++                    if (block_table == nullptr) {
++                        tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
++                    } else {
++                        tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size,
++                            block_table, params.k_batch_stride, params.k_row_stride);
++                    }
++                    FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
++                }
++                // This cp_async_fence needs to be in the if block, otherwise the synchronization
++                // isn't right and we get race conditions.
++                cute::cp_async_fence();
+             }
+-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
+-            // isn't right and we get race conditions.
+-            cute::cp_async_fence();
+         }
+ 
+         // We have key_padding_mask so we'll need to Check_inf
+@@ -946,6 +1049,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+ 
+         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+ 
++        if constexpr (Reuse_kv_smem) {
++            if (n_block > n_block_min) {
++                // All warps must finish reading V before the next K tile
++                // reuses the same shared-memory region.
++                __syncthreads();
++                ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
++                    reinterpret_cast<const uint8_t *>(params.blockmask),
++                    ExternalKvLoader::PageSizeBytes,
++                    static_cast<int>(params.k_batch_stride),
++                    block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                    kBlockN, kBlockN, tKsK, tKVcKV);
++                cute::cp_async_fence();
++            }
++        }
++
+         // This check is at the end of the loop since we always have at least 1 iteration
+         if (n_masking_steps > 1 && n_block <= n_block_min) {
+             --n_block;
+@@ -958,40 +1076,85 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+         clear(acc_s);
+         FLASH_NAMESPACE::cp_async_wait<0>();
++        if constexpr (Has_external_kv_loader) {
++            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
++                reinterpret_cast<const uint8_t *>(params.blockmask),
++                ExternalKvLoader::PageSizeBytes,
++                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
++                tKsK, tKVcKV);
++        }
+         __syncthreads();
+-        // Advance gV
+-        if (block_table == nullptr) {
+-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+-        } else {
+-            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
+-                block_table, params.v_batch_stride, params.v_row_stride);
++        if constexpr (!Reuse_kv_smem) {
++            // Advance gV
++            if constexpr (Has_external_kv_loader) {
++                ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
++                    reinterpret_cast<const uint8_t *>(params.blockmask),
++                    ExternalKvLoader::PageSizeBytes,
++                    static_cast<int>(params.k_batch_stride),
++                    block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                    kBlockN, tVsV, tKVcKV);
++            } else {
++                if (block_table == nullptr) {
++                    tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
++                } else {
++                    tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
++                        block_table, params.v_batch_stride, params.v_row_stride);
++                }
++                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
++            }
++            cute::cp_async_fence();
+         }
+ 
+-        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
+-        cute::cp_async_fence();
+-
+         FLASH_NAMESPACE::gemm(
+             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+             smem_thr_copy_Q, smem_thr_copy_K
+         );
++        if constexpr (Reuse_kv_smem) {
++            __syncthreads();
++            ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
++                reinterpret_cast<const uint8_t *>(params.blockmask),
++                ExternalKvLoader::PageSizeBytes,
++                static_cast<int>(params.k_batch_stride),
++                block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                kBlockN, tVsV, tKVcKV);
++            cute::cp_async_fence();
++        }
+         if constexpr (Is_softcap){
+             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+         }
+ 
+         FLASH_NAMESPACE::cp_async_wait<0>();
++        if constexpr (Has_external_kv_loader) {
++            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
++                reinterpret_cast<const uint8_t *>(params.blockmask),
++                ExternalKvLoader::PageSizeBytes,
++                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
++                tVsV, tKVcKV);
++        }
+         __syncthreads();
+-        if (n_block > n_block_min) {
+-            // Advance gK
+-            if (block_table == nullptr) {
+-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+-            } else {
+-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+-                    block_table, params.k_batch_stride, params.k_row_stride);            
++        if constexpr (!Reuse_kv_smem) {
++            if (n_block > n_block_min) {
++                // Advance gK
++                if constexpr (Has_external_kv_loader) {
++                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
++                        reinterpret_cast<const uint8_t *>(params.blockmask),
++                        ExternalKvLoader::PageSizeBytes,
++                        static_cast<int>(params.k_batch_stride),
++                        block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                        kBlockN, kBlockN, tKsK, tKVcKV);
++                } else {
++                    if (block_table == nullptr) {
++                        tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
++                    } else {
++                        tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size,
++                            block_table, params.k_batch_stride, params.k_row_stride);
++                    }
++                    FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
++                }
++                // This cp_async_fence needs to be in the if block, otherwise the synchronization
++                // isn't right and we get race conditions.
++                cute::cp_async_fence();
+             }
+-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
+-            // isn't right and we get race conditions.
+-            cute::cp_async_fence();
+         }
+ 
+         mask.template apply_mask</*Causal_mask=*/false>(
+@@ -1005,6 +1168,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+ 
+         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
++
++        if constexpr (Reuse_kv_smem) {
++            if (n_block > n_block_min) {
++                __syncthreads();
++                ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
++                    reinterpret_cast<const uint8_t *>(params.blockmask),
++                    ExternalKvLoader::PageSizeBytes,
++                    static_cast<int>(params.k_batch_stride),
++                    block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                    kBlockN, kBlockN, tKsK, tKVcKV);
++                cute::cp_async_fence();
++            }
++        }
+     }
+ 
+     // Epilogue
+@@ -1108,7 +1284,7 @@ inline __device__ void compute_attn(const Params &params) {
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
++template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename ExternalKvLoader = void, typename Params>
+ inline __device__ void compute_attn_splitkv(const Params &params) {
+     const int m_block = blockIdx.x;
+     // The block index for the batch.
+@@ -1117,7 +1293,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
+     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
+     const int n_split_idx = Split ? blockIdx.y : 0;
+     const int num_n_splits = Split ? gridDim.y : 1;
+-    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
++    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV, ExternalKvLoader>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu b/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu
+index 40559c6..5eb022d 100644
+--- a/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu
++++ b/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu
+@@ -2,10 +2,11 @@
+ // Splitting the different head dimensions to different files to speed up compilation.
+ // This file is auto-generated. See "generate_kernels.py"
+ #include "namespace_config.h"
+-#include "flash_fwd_launch_template.h"
++#include "byte_v2_fa2_launch.cuh"
+ 
+ namespace FLASH_NAMESPACE {
+ 
+ template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(Flash_fwd_params &params, cudaStream_t stream);
++template void run_mha_byte_v2_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(Flash_fwd_params &params, cudaStream_t stream);
+ 
+-} // namespace FLASH_NAMESPACE
+\ No newline at end of file
++} // namespace FLASH_NAMESPACE
+diff --git a/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu b/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu
+index 48500b8..7e6b516 100644
+--- a/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu
++++ b/csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu
+@@ -2,10 +2,11 @@
+ // Splitting the different head dimensions to different files to speed up compilation.
+ // This file is auto-generated. See "generate_kernels.py"
+ #include "namespace_config.h"
+-#include "flash_fwd_launch_template.h"
++#include "byte_v2_fa2_launch.cuh"
+ 
+ namespace FLASH_NAMESPACE {
+ 
+ template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &params, cudaStream_t stream);
++template void run_mha_byte_v2_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &params, cudaStream_t stream);
+ 
+-} // namespace FLASH_NAMESPACE
+\ No newline at end of file
++} // namespace FLASH_NAMESPACE
+diff --git a/csrc/flash_attn/src/generate_kernels.py b/csrc/flash_attn/src/generate_kernels.py
+index 4d8e7ff..1a5417b 100644
+--- a/csrc/flash_attn/src/generate_kernels.py
++++ b/csrc/flash_attn/src/generate_kernels.py
+@@ -27,11 +27,12 @@ void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cu
+ }} // namespace FLASH_NAMESPACE"""
+ 
+ def get_fwd_split_template() -> str:
+-    return NAMESPACE_INCLUDE + """#include "flash_fwd_launch_template.h"
++    return NAMESPACE_INCLUDE + """#include "{FWD_SPLIT_HEADER}"
+ 
+ namespace FLASH_NAMESPACE {{
+ 
+ template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
++{BYTE_V2_INSTANTIATION}
+ 
+ }} // namespace FLASH_NAMESPACE"""
+ 
+@@ -77,11 +78,31 @@ class Kernel:
+             "fwd_sparse": get_fwd_sparse_template,
+         }
+         template_func = template_funcs[self.direction]
+-        return template_func().format(
++        is_byte_v2 = (
++            self.direction == "fwd_split"
++            and self.dtype == "bf16"
++            and self.head_dim == 128
++        )
++        byte_v2_instantiation = ""
++        if is_byte_v2:
++            byte_v2_instantiation = (
++                "template void run_mha_byte_v2_fwd_splitkv_dispatch"
++                f"<{DTYPE_MAP[self.dtype]}, {self.head_dim}, "
++                f"{self.is_causal}>(Flash_fwd_params &params, "
++                "cudaStream_t stream);"
++            )
++        generated = template_func().format(
+             DTYPE=DTYPE_MAP[self.dtype],
+             HEAD_DIM=self.head_dim,
+-            IS_CAUSAL=self.is_causal
++            IS_CAUSAL=self.is_causal,
++            FWD_SPLIT_HEADER=(
++                "byte_v2_fa2_launch.cuh"
++                if is_byte_v2
++                else "flash_fwd_launch_template.h"
++            ),
++            BYTE_V2_INSTANTIATION=byte_v2_instantiation,
+         )
++        return generated + ("\n" if is_byte_v2 else "")
+ 
+     @property
+     def filename(self) -> str:

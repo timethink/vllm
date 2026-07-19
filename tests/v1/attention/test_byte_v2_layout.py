@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -40,6 +44,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_reshape_and_cache,
     byte_v2_reshape_and_cache_sideband_high,
     byte_v2_speculative_verify_gqa,
+    byte_v2_speculative_verify_ragged_q4,
     byte_v2_update_cache_raw_staging,
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
@@ -1017,6 +1022,185 @@ def test_byte_v2_decode_raw_fallback_defaults_off(monkeypatch):
     assert byte_v2_attn_module._decode_raw_fallback_enabled() is True
 
 
+def test_byte_v2_decode_kernel_mode_defaults_to_legacy(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_DECODE_KERNEL", raising=False)
+
+    assert byte_v2_attn_module._decode_kernel_mode() == "legacy"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("legacy", "legacy"),
+        ("fa2", "fa2"),
+        ("auto", "auto"),
+        ("FA2", "fa2"),
+    ],
+)
+def test_byte_v2_decode_kernel_mode_accepts_valid_values(
+    monkeypatch,
+    value,
+    expected,
+):
+    monkeypatch.setenv("BYTE_V2_DECODE_KERNEL", value)
+
+    assert byte_v2_attn_module._decode_kernel_mode() == expected
+
+
+@pytest.mark.parametrize("value", ["", "raw", "fa3"])
+def test_byte_v2_decode_kernel_mode_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("BYTE_V2_DECODE_KERNEL", value)
+
+    assert byte_v2_attn_module._decode_kernel_mode() == "legacy"
+
+
+def test_byte_v2_explicit_fa2_decode_fails_closed_when_op_is_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setenv("BYTE_V2_DECODE_KERNEL", "fa2")
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_decode_is_available",
+        lambda: False,
+    )
+
+    with pytest.raises(RuntimeError, match="FA2 extension op is unavailable"):
+        byte_v2_attn_module.ByteV2AttentionImpl(
+            num_heads=32,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=8,
+        )
+
+
+def test_byte_v2_fa2_decode_rejects_non_q1_metadata(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_DECODE_KERNEL", "fa2")
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_decode_is_available",
+        lambda: True,
+    )
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+
+    reason = impl._fa2_decode_incompatibility(
+        torch.empty((2, 32, 128), dtype=torch.bfloat16),
+        torch.empty((1,), dtype=torch.uint8),
+        torch.empty((2, 32, 128), dtype=torch.bfloat16),
+        SimpleNamespace(max_query_len=2),
+    )
+
+    assert reason == "only Q1 decode is supported"
+
+
+def test_byte_v2_forward_prefers_fa2_decode_and_slices_metadata(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_DECODE_KERNEL", "fa2")
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_decode_is_available",
+        lambda: True,
+    )
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    monkeypatch.setattr(
+        impl,
+        "_fa2_decode_incompatibility",
+        lambda *args: None,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_fa2_decode(
+        output_arg,
+        query_arg,
+        kv_cache_arg,
+        query_start_locs_arg,
+        block_tables_arg,
+        seq_lens_arg,
+        *,
+        scale,
+        max_seq_len,
+        causal,
+    ):
+        captured.update(
+            output=output_arg,
+            query=query_arg,
+            kv_cache=kv_cache_arg,
+            query_start_locs=query_start_locs_arg,
+            block_tables=block_tables_arg,
+            seq_lens=seq_lens_arg,
+            scale=scale,
+            max_seq_len=max_seq_len,
+            causal=causal,
+        )
+        output_arg.fill_(7)
+
+    def fail_legacy_decode(*args, **kwargs):
+        del args, kwargs
+        pytest.fail("legacy decode must not run after FA2 handles the request")
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_paged_decode_attention",
+        fake_fa2_decode,
+    )
+    monkeypatch.setattr(impl, "_run_paged_decode", fail_legacy_decode)
+
+    batch_size = 2
+    query = torch.empty((batch_size, 32, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    kv_cache = torch.empty(
+        (4, ByteV2PageLayoutV5().page_size_bytes),
+        dtype=torch.uint8,
+    )
+    query_start_locs = torch.tensor([0, 1, 2], dtype=torch.int32)
+    block_table = torch.tensor(
+        [[0, 1, 2], [3, 4, 5], [6, 7, 8]],
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([33, 65, 97], dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        max_query_len=1,
+        query_start_loc=query_start_locs,
+        block_table=block_table,
+        seq_lens=seq_lens,
+        max_seq_len=65,
+        causal=True,
+    )
+
+    result = impl.forward(
+        None,
+        query,
+        torch.empty((0,), dtype=torch.bfloat16),
+        torch.empty((0,), dtype=torch.bfloat16),
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert captured["output"] is output
+    assert captured["query"] is query
+    assert captured["kv_cache"] is kv_cache
+    assert captured["query_start_locs"] is query_start_locs
+    torch.testing.assert_close(captured["block_tables"], block_table[:batch_size])
+    torch.testing.assert_close(captured["seq_lens"], seq_lens[:batch_size])
+    assert tuple(captured["block_tables"].shape) == (batch_size, 3)
+    assert tuple(captured["seq_lens"].shape) == (batch_size,)
+    assert captured["scale"] == 0.125
+    assert captured["max_seq_len"] == 65
+    assert captured["causal"] is True
+    torch.testing.assert_close(output, torch.full_like(output, 7))
+
+
 def test_byte_v2_decode_no_outlier_fast_path_defaults_off(monkeypatch):
     monkeypatch.delenv("BYTE_V2_DECODE_ASSUME_NO_OUTLIER", raising=False)
     assert byte_v2_attn_module._decode_assume_no_outlier_enabled() is False
@@ -1108,6 +1292,62 @@ def test_byte_v2_speculative_verify_gqa_defaults_off(monkeypatch):
 
     monkeypatch.setenv("BYTE_V2_SPECULATIVE_VERIFY_GQA", "1")
     assert byte_v2_attn_module._speculative_verify_gqa_enabled() is True
+
+
+def test_byte_v2_speculative_verify_ragged_q4_defaults_off(monkeypatch):
+    env_name = "BYTE_V2_SPECULATIVE_VERIFY_RAGGED_Q4"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._speculative_verify_ragged_q4_enabled() is False
+
+    monkeypatch.setenv(env_name, "1")
+    assert byte_v2_attn_module._speculative_verify_ragged_q4_enabled() is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_speculative_verify_ragged_q4_accepts_compiled_padding(
+    monkeypatch,
+):
+    monkeypatch.setenv("BYTE_V2_SPECULATIVE_VERIFY_RAGGED_Q4", "1")
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    query_start_locs_cpu = torch.tensor([0, 1, 5, 6, 7], dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=7,
+        max_query_len=4,
+        query_start_loc=query_start_locs_cpu.cuda(),
+        query_start_loc_cpu=query_start_locs_cpu,
+        seq_lens=torch.full((4,), 64, dtype=torch.int32, device="cuda"),
+        seq_lens_cpu=torch.full((4,), 64, dtype=torch.int32),
+        block_table=torch.zeros((4, 4), dtype=torch.int32, device="cuda"),
+        causal=True,
+    )
+    query = torch.empty((8, 32, 128), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty_like(query)
+    kv_cache = torch.empty((1,), dtype=torch.uint8, device="cuda")
+
+    assert (
+        impl._speculative_ragged_q4_num_requests(
+            query,
+            kv_cache,
+            output,
+            attn_metadata,
+        )
+        == 4
+    )
+    attn_metadata.seq_lens_cpu = None
+    assert (
+        impl._speculative_ragged_q4_num_requests(
+            query,
+            kv_cache,
+            output,
+            attn_metadata,
+        )
+        is None
+    )
 
 
 def test_byte_v2_cached_prefix_q16_defaults_off(monkeypatch):
@@ -1295,6 +1535,23 @@ def test_byte_v2_gqa_fa2_direct_uses_auto_partition(monkeypatch):
     assert impl._auto_gqa_fa2_direct_num_splits(8192, 2) == 8
     assert impl._auto_gqa_fa2_direct_num_splits(32768, 2) == 64
     assert impl._decode_partition_size(2048, num_decode_tokens=4) == 512
+    assert impl._decode_partition_size(2072, num_decode_tokens=4) == 528
+    assert (
+        impl._decode_partition_size(
+            2072,
+            num_decode_tokens=4,
+            seq_len_sum=6630,
+        )
+        == 64
+    )
+    assert (
+        impl._decode_partition_size(
+            2072,
+            num_decode_tokens=4,
+            seq_len_sum=6631,
+        )
+        == 528
+    )
     assert impl._decode_partition_size(4096, num_decode_tokens=4) == 1024
     assert impl._decode_partition_size(8192, num_decode_tokens=4) == 256
     assert impl._decode_partition_size(16384, num_decode_tokens=4) == 512
@@ -1359,6 +1616,141 @@ def test_byte_v2_unnormalized_partition_output_fails_closed_for_non_gqa4(
     assert max_logits.shape == (0,)
 
 
+def test_byte_v2_split_k_workspace_keeps_backing_storage_for_smaller_batches(
+    monkeypatch,
+):
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_PACKED", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_ASSUME_NO_OUTLIER", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_LIKE", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_DIRECT", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_UNNORMALIZED_PARTITION_OUTPUT", "1")
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_MIN_SEQ_LEN", raising=False)
+
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    large_output = torch.empty((4, 32, 128), dtype=torch.bfloat16)
+    large = impl._get_split_k_workspace(
+        large_output,
+        4096,
+        num_decode_tokens=4,
+        use_gqa_packed=True,
+    )
+    large_ptrs = tuple(tensor.data_ptr() for tensor in large)
+
+    for num_tokens in (2, 1):
+        output = torch.empty((num_tokens, 32, 128), dtype=torch.bfloat16)
+        exp_sums, max_logits, tmp_out = impl._get_split_k_workspace(
+            output,
+            4096,
+            num_decode_tokens=num_tokens,
+            use_gqa_packed=True,
+        )
+
+        assert (exp_sums.shape[0], max_logits.shape[0], tmp_out.shape[0]) == (
+            num_tokens,
+            num_tokens,
+            num_tokens,
+        )
+        assert (
+            tuple(tensor.data_ptr() for tensor in (exp_sums, max_logits, tmp_out))
+            == large_ptrs
+        )
+        assert exp_sums.is_contiguous()
+        assert max_logits.is_contiguous()
+        assert tmp_out.is_contiguous()
+
+
+def test_byte_v2_split_k_workspace_reserves_ragged_b4_partitions(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_PACKED", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_ASSUME_NO_OUTLIER", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_LIKE", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_GQA_FA2_DIRECT", "1")
+    monkeypatch.setenv("BYTE_V2_DECODE_UNNORMALIZED_PARTITION_OUTPUT", "1")
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_MIN_SEQ_LEN", raising=False)
+    monkeypatch.delenv("BYTE_V2_DECODE_GQA_PACKED_PARTITION_SIZE", raising=False)
+
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    output = torch.empty((4, 32, 128), dtype=torch.bfloat16)
+    uniform = impl._get_split_k_workspace(
+        output,
+        2072,
+        num_decode_tokens=4,
+        use_gqa_packed=True,
+        partition_size=528,
+    )
+    uniform_ptrs = tuple(tensor.data_ptr() for tensor in uniform)
+    assert tuple(tensor.shape for tensor in uniform) == (
+        (4, 32, 4),
+        (4, 32, 4),
+        (4, 32, 4, 128),
+    )
+
+    ragged = impl._get_split_k_workspace(
+        output,
+        2072,
+        num_decode_tokens=4,
+        use_gqa_packed=True,
+        partition_size=64,
+    )
+
+    assert tuple(tensor.shape for tensor in ragged) == (
+        (4, 32, 33),
+        (4, 32, 33),
+        (4, 32, 33, 128),
+    )
+    assert tuple(tensor.data_ptr() for tensor in ragged) == uniform_ptrs
+
+
+def test_byte_v2_ragged_q4_uses_independent_stable_workspace(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_SPECULATIVE_VERIFY_RAGGED_Q4", "1")
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    decode_output = torch.empty((4, 32, 128), dtype=torch.bfloat16)
+    decode_workspace = impl._get_split_k_workspace(
+        decode_output,
+        4096,
+        num_decode_tokens=4,
+        use_gqa_packed=True,
+    )
+    decode_ptrs = tuple(tensor.data_ptr() for tensor in decode_workspace)
+
+    padded_output = torch.empty((8, 32, 128), dtype=torch.bfloat16)
+    exp_sums, max_logits, tmp_out = impl._get_speculative_ragged_q4_workspace(
+        padded_output,
+        4096,
+        num_requests=4,
+        partition_size=64,
+    )
+
+    assert exp_sums.shape == (4, 128, 64)
+    assert max_logits.shape == (0,)
+    assert tmp_out.shape == (4, 128, 64, 128)
+    assert exp_sums.data_ptr() != decode_workspace[0].data_ptr()
+    assert tmp_out.data_ptr() != decode_workspace[2].data_ptr()
+    repeated_decode_workspace = impl._get_split_k_workspace(
+        decode_output,
+        4096,
+        num_decode_tokens=4,
+        use_gqa_packed=True,
+    )
+    assert tuple(tensor.data_ptr() for tensor in repeated_decode_workspace) == (
+        decode_ptrs
+    )
+
+
 @pytest.mark.parametrize("q_heads_per_kv", [1, 2, 4, 8, 16, 32])
 def test_byte_v2_gqa_fa2_direct_allows_grouped_q_per_kv(
     monkeypatch,
@@ -1398,6 +1790,14 @@ def test_byte_v2_gqa_packed_keeps_explicit_partition(monkeypatch):
     assert impl._decode_partition_size(2048) == 128
     assert impl._decode_partition_size(4096) == 128
     assert impl._decode_partition_size(8192, num_decode_tokens=4) == 128
+    assert (
+        impl._decode_partition_size(
+            2072,
+            num_decode_tokens=4,
+            seq_len_sum=0,
+        )
+        == 128
+    )
 
 
 def test_byte_v2_decode_validation_disables_unsafe_fast_path(monkeypatch):
@@ -2286,11 +2686,13 @@ def test_byte_v2_attention_metadata_builder_preserves_common_prefix_len():
     query_start_loc = torch.tensor([0, 2], dtype=torch.int32)
     common_attn_metadata = SimpleNamespace(
         num_actual_tokens=2,
+        num_reqs=1,
         max_query_len=2,
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc.cpu(),
         max_seq_len=50,
         seq_lens=torch.tensor([50], dtype=torch.int32),
+        _seq_lens_cpu=torch.tensor([50], dtype=torch.int32),
         block_table_tensor=torch.zeros((1, 4), dtype=torch.int32),
         slot_mapping=torch.arange(2, dtype=torch.int64),
         causal=True,
@@ -2302,6 +2704,7 @@ def test_byte_v2_attention_metadata_builder_preserves_common_prefix_len():
     )
 
     assert metadata.common_prefix_len == 48
+    assert metadata.seq_len_sum == 50
     assert metadata.tile_policy == DEFAULT_BYTE_V2_TILE_POLICY
 
 
@@ -2432,6 +2835,119 @@ def test_byte_v2_attention_forward_uses_prefill_fallback_when_not_decode_compati
             )
         ).float(),
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    (
+        "seq_lens",
+        "force_outliers",
+        "permute_pages",
+        "shared_prefix_blocks",
+        "num_splits",
+    ),
+    [
+        pytest.param((73,), True, False, 0, 0, id="q1-seq73-outliers"),
+        pytest.param(
+            (73, 128, 4105),
+            True,
+            True,
+            4,
+            4,
+            id="q1-ragged-permuted-shared-prefix-split4",
+        ),
+    ],
+)
+def test_byte_v2_fa2_cuda_matches_raw_fa2_bitwise(
+    seq_lens,
+    force_outliers,
+    permute_pages,
+    shared_prefix_blocks,
+    num_splits,
+):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+
+    from scripts.byte_v2_fa2_oracle import (
+        compare_byte_v2_and_raw,
+        fa2_oracle_ops_are_available,
+        make_inputs,
+    )
+
+    if not fa2_oracle_ops_are_available():
+        pytest.skip("ByteV2 and raw FA2 extension ops are not registered")
+
+    tensors = make_inputs(
+        seq_lens,
+        query_len=1,
+        force_outliers=force_outliers,
+        permute_pages=permute_pages,
+        shared_prefix_blocks=shared_prefix_blocks,
+    )
+    block_table = tensors["block_table"]
+    assert isinstance(block_table, torch.Tensor)
+    block_table_cpu = block_table.cpu()
+    if permute_pages:
+        active_rows = [
+            block_table_cpu[seq_idx, : (seq_len + 15) // 16].tolist()
+            for seq_idx, seq_len in enumerate(seq_lens)
+        ]
+        assert any(row != sorted(row) for row in active_rows)
+    if shared_prefix_blocks:
+        expected_prefix = block_table_cpu[0, :shared_prefix_blocks]
+        for seq_idx in range(1, len(seq_lens)):
+            torch.testing.assert_close(
+                block_table_cpu[seq_idx, :shared_prefix_blocks],
+                expected_prefix,
+            )
+
+    result = compare_byte_v2_and_raw(
+        tensors,
+        query_len=1,
+        iterations=1,
+        num_splits=num_splits,
+    )
+
+    assert result["out_mismatch"] == 0
+    assert result["lse_mismatch"] == 0
+    assert result["out_max_abs"] == 0.0
+    assert result["lse_max_abs"] == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "fatal_option",
+    [
+        "--inject-overflow",
+        "--inject-fallback",
+        "--stress-pool-overflow",
+    ],
+)
+def test_byte_v2_fa2_fatal_v5_page_fails_closed_in_subprocess(fatal_option):
+    from scripts.byte_v2_fa2_oracle import fa2_oracle_ops_are_available
+
+    if not fa2_oracle_ops_are_available():
+        pytest.skip("ByteV2 and raw FA2 extension ops are not registered")
+
+    repo_root = Path(__file__).resolve().parents[3]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/byte_v2_fa2_oracle.py",
+            "--seq-len",
+            "16",
+            "--byte-only",
+            fatal_option,
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, combined_output
+    assert "fatal_test" in combined_output
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3177,6 +3693,51 @@ def test_byte_v2_raw_staging_commit_matches_direct_cache(num_tokens):
     assert torch.all(valid_rows.cpu() == 0)
     assert int(next_staging_slot.cpu().item()) == 0
     assert int(overflow.cpu().item()) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_direct_cache_update_handles_unaligned_request_boundaries():
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    sequence_lengths = (1, 15, 8, 9)
+    num_tokens = sum(sequence_lengths)
+    torch.manual_seed(20260717)
+    key = torch.randn(num_tokens, 8, 128, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    slot_mapping = torch.tensor(
+        [
+            physical_block * layout.tile_policy.alloc_block_tokens + row
+            for physical_block, sequence_length in enumerate(sequence_lengths)
+            for row in range(sequence_length)
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    cache = torch.zeros(
+        (len(sequence_lengths), layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    byte_v2_reshape_and_cache(
+        key,
+        value,
+        cache,
+        slot_mapping,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+
+    _assert_byte_v2_cache_decodes_tokens(
+        cache,
+        key,
+        value,
+        slot_mapping,
+        layout=layout,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -4252,6 +4813,175 @@ def test_byte_v2_speculative_verify_gqa_cuda_matches_causal_raw_reference(
         expected.cpu().to(torch.bfloat16).float(),
         atol=5e-3,
         rtol=5e-3,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_lens", [(1, 4, 0, 1), (0, 1, 2, 3, 4)])
+def test_byte_v2_speculative_verify_ragged_q4_cuda_matches_raw_reference(
+    query_lens,
+):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_unsafe_flags"):
+        pytest.skip("ByteV2 unsafe flags custom op is not registered")
+    if not _has_torch_op("_C", "byte_v2_speculative_verify_ragged_q4"):
+        pytest.skip("ByteV2 ragged Q4 custom op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    num_requests = len(query_lens)
+    seq_len = 64
+    partition_size = 32
+    blocks_per_request = seq_len // layout.tile_policy.alloc_block_tokens
+    num_blocks = num_requests * blocks_per_request
+    num_cache_tokens = num_requests * seq_len
+
+    key_bits = torch.zeros(
+        (num_cache_tokens, 8, 128),
+        dtype=torch.int16,
+        device="cuda",
+    )
+    value_bits = torch.zeros_like(key_bits)
+    local_token = torch.arange(num_cache_tokens, device="cuda") % seq_len
+    request_idx = torch.arange(num_cache_tokens, device="cuda") // seq_len
+    token_high_bits = (32 + local_token % 8).to(torch.int16)
+    key_low_bits = (0x55 + request_idx).to(torch.int16)
+    value_low_bits = (0x66 + request_idx).to(torch.int16)
+    key_bits[:, :, 0] = (token_high_bits.view(-1, 1) << 8) | key_low_bits.view(-1, 1)
+    value_bits[:, :, 1] = (
+        (token_high_bits + 16).view(-1, 1) << 8
+    ) | value_low_bits.view(-1, 1)
+    key = key_bits.view(torch.bfloat16)
+    value = value_bits.view(torch.bfloat16)
+
+    slot_mapping = torch.arange(
+        num_cache_tokens,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    kv_cache = torch.zeros(
+        (num_blocks, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    byte_v2_reshape_and_cache(
+        key,
+        value,
+        kv_cache,
+        slot_mapping,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+    page_unsafe_flags = torch.empty(
+        (num_blocks,),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    byte_v2_update_cache_unsafe_flags(
+        page_unsafe_flags,
+        kv_cache,
+        slot_mapping,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+
+    query_start_locs_list = [0]
+    for query_len in query_lens:
+        query_start_locs_list.append(query_start_locs_list[-1] + query_len)
+    num_query_tokens = query_start_locs_list[-1]
+    padded_query_tokens = num_query_tokens + 1
+    query_base = torch.arange(
+        padded_query_tokens * 32 * 128,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    query = (
+        ((query_base % 127) / 31)
+        .reshape(padded_query_tokens, 32, 128)
+        .to(torch.bfloat16)
+    )
+    output = torch.full_like(query, 17.0)
+    block_tables = torch.arange(
+        num_blocks,
+        dtype=torch.int32,
+        device="cuda",
+    ).reshape(num_requests, blocks_per_request)
+    seq_lens = torch.full(
+        (num_requests,),
+        seq_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    query_start_locs = torch.tensor(
+        query_start_locs_list,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    num_partitions = (seq_len + partition_size - 1) // partition_size
+    exp_sums = torch.empty(
+        (num_requests, 128, num_partitions),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    max_logits = torch.empty((0,), dtype=torch.float32, device="cuda")
+    tmp_out = torch.empty(
+        (num_requests, 128, num_partitions, 128),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    scale = 0.125
+
+    byte_v2_speculative_verify_ragged_q4(
+        output,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        query,
+        kv_cache,
+        page_unsafe_flags,
+        block_tables,
+        seq_lens,
+        query_start_locs,
+        num_actual_tokens=num_query_tokens,
+        scale=scale,
+        num_kv_heads=8,
+        block_size=16,
+        max_seq_len=seq_len,
+        partition_size=partition_size,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+
+    query_float = query[:num_query_tokens].float()
+    key_float = key.float().reshape(num_requests, seq_len, 8, 128)
+    value_float = value.float().reshape(num_requests, seq_len, 8, 128)
+    expected = torch.empty_like(query_float)
+    for request_idx, query_len in enumerate(query_lens):
+        query_start = query_start_locs_list[request_idx]
+        for token_idx in range(query_len):
+            token_seq_len = seq_len - (query_len - 1) + token_idx
+            output_token_idx = query_start + token_idx
+            for head_idx in range(32):
+                kv_head_idx = head_idx // 4
+                scores = torch.matmul(
+                    key_float[request_idx, :token_seq_len, kv_head_idx],
+                    query_float[output_token_idx, head_idx],
+                )
+                probs = torch.softmax(scores * scale, dim=0)
+                expected[output_token_idx, head_idx] = torch.matmul(
+                    probs,
+                    value_float[request_idx, :token_seq_len, kv_head_idx],
+                )
+    torch.testing.assert_close(
+        output[:num_query_tokens].cpu().float(),
+        expected.cpu().to(torch.bfloat16).float(),
+        atol=5e-3,
+        rtol=5e-3,
+    )
+    torch.testing.assert_close(
+        output[num_query_tokens:],
+        torch.full_like(output[num_query_tokens:], 17.0),
+        atol=0,
+        rtol=0,
     )
 
 
