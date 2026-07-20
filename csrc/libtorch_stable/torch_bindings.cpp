@@ -894,6 +894,17 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                           int alloc_block_tokens) -> ()");
 
   ops.def(
+      "byte_v2_hydrate_raw_staging_from_hybrid_cache("
+      "                           Tensor! raw_staging, Tensor kv_cache,"
+      "                           Tensor persistent_raw_staging,"
+      "                           Tensor page_to_raw_slot,"
+      "                           Tensor staging_to_physical_block,"
+      "                           Tensor valid_rows,"
+      "                           int codec_token_block,"
+      "                           int codec_dim_block,"
+      "                           int alloc_block_tokens) -> ()");
+
+  ops.def(
       "byte_v2_release_raw_staging("
       "                           Tensor! block_to_staging_slot,"
       "                           Tensor! staging_to_physical_block,"
@@ -920,6 +931,28 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                           int codec_token_block,"
       "                           int codec_dim_block,"
       "                           int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_commit_raw_staging_to_hybrid_cache("
+      "                           Tensor raw_staging, Tensor! kv_cache,"
+      "                           Tensor! persistent_raw_staging,"
+      "                           Tensor! page_to_raw_slot,"
+      "                           Tensor! free_raw_slots,"
+      "                           Tensor! free_raw_slot_count,"
+      "                           Tensor! raw_pool_overflow,"
+      "                           Tensor staging_to_physical_block,"
+      "                           Tensor valid_rows,"
+      "                           int codec_token_block,"
+      "                           int codec_dim_block,"
+      "                           int alloc_block_tokens) -> ()");
+
+  ops.def(
+      "byte_v2_reset_raw_fallback_pages("
+      "                           Tensor! page_to_raw_slot,"
+      "                           Tensor! free_raw_slots,"
+      "                           Tensor! free_raw_slot_count,"
+      "                           Tensor! raw_pool_overflow,"
+      "                           Tensor physical_block_ids) -> ()");
 
   ops.def(
       "byte_v2_update_cache_raw_staging("
@@ -1073,12 +1106,18 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
            TORCH_BOX(&byte_v2_prepare_raw_staging));
   ops.impl("byte_v2_hydrate_raw_staging_from_cache",
            TORCH_BOX(&byte_v2_hydrate_raw_staging_from_cache));
+  ops.impl("byte_v2_hydrate_raw_staging_from_hybrid_cache",
+           TORCH_BOX(&byte_v2_hydrate_raw_staging_from_hybrid_cache));
   ops.impl("byte_v2_release_raw_staging",
            TORCH_BOX(&byte_v2_release_raw_staging));
   ops.impl("byte_v2_release_raw_staging_and_update_flags",
            TORCH_BOX(&byte_v2_release_raw_staging_and_update_flags));
   ops.impl("byte_v2_commit_raw_staging_to_cache",
            TORCH_BOX(&byte_v2_commit_raw_staging_to_cache));
+  ops.impl("byte_v2_commit_raw_staging_to_hybrid_cache",
+           TORCH_BOX(&byte_v2_commit_raw_staging_to_hybrid_cache));
+  ops.impl("byte_v2_reset_raw_fallback_pages",
+           TORCH_BOX(&byte_v2_reset_raw_fallback_pages));
   ops.impl("byte_v2_update_cache_raw_staging",
            TORCH_BOX(&byte_v2_update_cache_raw_staging));
   ops.impl("byte_v2_collect_cache_stats",

@@ -1,5 +1,5 @@
 diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
-index 11f6249..662c92e 100644
+index 11f6249..5633222 100644
 --- a/csrc/flash_attn/flash_api.cpp
 +++ b/csrc/flash_attn/flash_api.cpp
 @@ -11,6 +11,8 @@
@@ -49,7 +49,7 @@ index 11f6249..662c92e 100644
                 const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-@@ -534,7 +549,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+@@ -534,7 +549,18 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                 const float softcap,
                 const bool return_softmax,
                 int num_splits,
@@ -57,14 +57,19 @@ index 11f6249..662c92e 100644
 +               std::optional<at::Generator> gen_,
 +               const at::Tensor *byte_v2_kv_cache,
 +               const at::Tensor *byte_v2_page_unsafe_flags,
++               const at::Tensor *byte_v2_raw_staging,
++               const at::Tensor *byte_v2_page_to_raw_slot,
 +               bool is_byte_v2_call) {
 +
 +    TORCH_CHECK(is_byte_v2_call == (byte_v2_kv_cache != nullptr),
 +                "ByteV2 FA2 wrapper mode/cache mismatch");
++    TORCH_CHECK((byte_v2_raw_staging == nullptr) ==
++                    (byte_v2_page_to_raw_slot == nullptr),
++                "ByteV2 FA2 raw staging/map mismatch");
  
      // Otherwise the kernel will be launched from cuda:0 device
      at::cuda::CUDAGuard device_guard{q.device()};
-@@ -713,6 +734,18 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+@@ -713,6 +739,29 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
          params.num_splits = num_splits;
      }
  
@@ -77,13 +82,24 @@ index 11f6249..662c92e 100644
 +        // Paged ByteV2 does not use the raw K batch stride. Carry the page
 +        // count here for device-side block-table validation.
 +        params.k_batch_stride = byte_v2_kv_cache->size(0);
++        if (byte_v2_raw_staging != nullptr) {
++            constexpr int64_t kByteV2RawValueOffsetBytes = 32768;
++            auto *raw_base = static_cast<uint8_t *>(
++                byte_v2_raw_staging->data_ptr());
++            params.k_ptr = raw_base;
++            params.v_ptr = raw_base + kByteV2RawValueOffsetBytes;
++            // Append_KV is compile-time false for the ByteV2 dispatch, so its
++            // V-new pointer is an ABI-stable carrier for the page side table.
++            params.vnew_ptr = byte_v2_page_to_raw_slot->data_ptr<int>();
++            params.v_batch_stride = byte_v2_raw_staging->size(0);
++        }
 +        (void)byte_v2_page_unsafe_flags;
 +    }
 +
      if (leftpad_k_.has_value()) {
          auto leftpad_k = leftpad_k_.value();
          TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running at the same time yet");
-@@ -745,7 +778,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+@@ -745,7 +794,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
  
      if (max_seqlen_k > 0) {
          auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -93,7 +109,7 @@ index 11f6249..662c92e 100644
      } else {
          // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
          out.zero_();
-@@ -786,6 +820,138 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+@@ -786,6 +836,243 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
      return {out, softmax_lse};
  }
  
@@ -125,13 +141,15 @@ index 11f6249..662c92e 100644
 +        block_table_, alibi_slopes_, max_seqlen_q, max_seqlen_k, p_dropout,
 +        softmax_scale, zero_tensors, is_causal, window_size_left,
 +        window_size_right, softcap, return_softmax, num_splits, gen_, nullptr,
-+        nullptr, /*is_byte_v2_call=*/false);
++        nullptr, nullptr, nullptr, /*is_byte_v2_call=*/false);
 +}
 +
-+std::vector<at::Tensor>
-+mha_byte_v2_varlen_fwd(
++static std::vector<at::Tensor>
++mha_byte_v2_varlen_fwd_impl(
 +        at::Tensor &q,
 +        const at::Tensor &byte_v2_kv_cache,
++        const at::Tensor *byte_v2_raw_staging,
++        const at::Tensor *byte_v2_page_to_raw_slot,
 +        std::optional<at::Tensor> &byte_v2_page_unsafe_flags_,
 +        std::optional<at::Tensor> &out_,
 +        const at::Tensor &cu_seqlens_q,
@@ -157,6 +175,11 @@ index 11f6249..662c92e 100644
 +    constexpr int kByteV2NumKvHeads = 8;
 +    constexpr int kByteV2HeadDim = 128;
 +    constexpr int kByteV2PageSizeBytes = 52096;
++    constexpr int kByteV2RawSlotSizeBytes = 65536;
++
++    TORCH_CHECK((byte_v2_raw_staging == nullptr) ==
++                    (byte_v2_page_to_raw_slot == nullptr),
++                "ByteV2 FA2 raw staging/map mismatch");
 +
 +    CHECK_DEVICE(q);
 +    CHECK_DEVICE(byte_v2_kv_cache);
@@ -180,6 +203,35 @@ index 11f6249..662c92e 100644
 +    TORCH_CHECK(byte_v2_kv_cache.size(0) <=
 +                    std::numeric_limits<int>::max(),
 +                "ByteV2 KV cache has too many pages");
++    if (byte_v2_raw_staging != nullptr) {
++        TORCH_CHECK(byte_v2_raw_staging->is_cuda(),
++                    "ByteV2 raw staging must be on CUDA");
++        TORCH_CHECK(byte_v2_page_to_raw_slot->is_cuda(),
++                    "ByteV2 page-to-raw-slot map must be on CUDA");
++        TORCH_CHECK(byte_v2_raw_staging->device() == q.device() &&
++                        byte_v2_page_to_raw_slot->device() == q.device(),
++                    "ByteV2 raw staging, page map, and query must be on the same device");
++        TORCH_CHECK(byte_v2_raw_staging->dtype() == torch::kUInt8,
++                    "ByteV2 raw staging must have dtype uint8");
++        TORCH_CHECK(byte_v2_raw_staging->dim() == 2 &&
++                        byte_v2_raw_staging->size(1) ==
++                            kByteV2RawSlotSizeBytes,
++                    "ByteV2 raw staging must have shape (num_slots, 65536)");
++        TORCH_CHECK(byte_v2_raw_staging->size(0) > 0 &&
++                        byte_v2_raw_staging->size(0) <=
++                            std::numeric_limits<int>::max(),
++                    "ByteV2 raw staging slot count is invalid");
++        TORCH_CHECK(byte_v2_raw_staging->is_contiguous(),
++                    "ByteV2 raw staging must be contiguous");
++        TORCH_CHECK(byte_v2_page_to_raw_slot->dtype() == torch::kInt32,
++                    "ByteV2 page-to-raw-slot map must have dtype int32");
++        TORCH_CHECK(byte_v2_page_to_raw_slot->dim() == 1 &&
++                        byte_v2_page_to_raw_slot->size(0) ==
++                            byte_v2_kv_cache.size(0),
++                    "ByteV2 page-to-raw-slot map must have shape (num_pages,)");
++        TORCH_CHECK(byte_v2_page_to_raw_slot->is_contiguous(),
++                    "ByteV2 page-to-raw-slot map must be contiguous");
++    }
 +    TORCH_CHECK(block_table_.has_value(),
 +                "ByteV2 FA2 requires a paged KV block table");
 +    const at::Tensor &byte_v2_block_table = block_table_.value();
@@ -226,17 +278,86 @@ index 11f6249..662c92e 100644
 +        p_dropout, softmax_scale, zero_tensors, is_causal, window_size_left,
 +        window_size_right, softcap, return_softmax, num_splits, gen_,
 +        &byte_v2_kv_cache, byte_v2_page_unsafe_flags,
++        byte_v2_raw_staging, byte_v2_page_to_raw_slot,
 +        /*is_byte_v2_call=*/true);
++}
++
++std::vector<at::Tensor>
++mha_byte_v2_varlen_fwd(
++        at::Tensor &q,
++        const at::Tensor &byte_v2_kv_cache,
++        std::optional<at::Tensor> &byte_v2_page_unsafe_flags_,
++        std::optional<at::Tensor> &out_,
++        const at::Tensor &cu_seqlens_q,
++        const at::Tensor &cu_seqlens_k,
++        std::optional<at::Tensor> &seqused_k,
++        std::optional<const at::Tensor> &leftpad_k_,
++        std::optional<at::Tensor> &block_table_,
++        std::optional<at::Tensor> &alibi_slopes_,
++        int max_seqlen_q,
++        const int max_seqlen_k,
++        const float p_dropout,
++        const float softmax_scale,
++        const bool zero_tensors,
++        bool is_causal,
++        int window_size_left,
++        int window_size_right,
++        const float softcap,
++        const bool return_softmax,
++        int num_splits,
++        std::optional<at::Generator> gen_) {
++    return mha_byte_v2_varlen_fwd_impl(
++        q, byte_v2_kv_cache, nullptr, nullptr,
++        byte_v2_page_unsafe_flags_, out_, cu_seqlens_q, cu_seqlens_k,
++        seqused_k, leftpad_k_, block_table_, alibi_slopes_, max_seqlen_q,
++        max_seqlen_k, p_dropout, softmax_scale, zero_tensors, is_causal,
++        window_size_left, window_size_right, softcap, return_softmax,
++        num_splits, gen_);
++}
++
++std::vector<at::Tensor>
++mha_byte_v2_hybrid_varlen_fwd(
++        at::Tensor &q,
++        const at::Tensor &byte_v2_kv_cache,
++        const at::Tensor &byte_v2_raw_staging,
++        const at::Tensor &byte_v2_page_to_raw_slot,
++        std::optional<at::Tensor> &byte_v2_page_unsafe_flags_,
++        std::optional<at::Tensor> &out_,
++        const at::Tensor &cu_seqlens_q,
++        const at::Tensor &cu_seqlens_k,
++        std::optional<at::Tensor> &seqused_k,
++        std::optional<const at::Tensor> &leftpad_k_,
++        std::optional<at::Tensor> &block_table_,
++        std::optional<at::Tensor> &alibi_slopes_,
++        int max_seqlen_q,
++        const int max_seqlen_k,
++        const float p_dropout,
++        const float softmax_scale,
++        const bool zero_tensors,
++        bool is_causal,
++        int window_size_left,
++        int window_size_right,
++        const float softcap,
++        const bool return_softmax,
++        int num_splits,
++        std::optional<at::Generator> gen_) {
++    return mha_byte_v2_varlen_fwd_impl(
++        q, byte_v2_kv_cache, &byte_v2_raw_staging,
++        &byte_v2_page_to_raw_slot, byte_v2_page_unsafe_flags_, out_,
++        cu_seqlens_q, cu_seqlens_k, seqused_k, leftpad_k_, block_table_,
++        alibi_slopes_, max_seqlen_q, max_seqlen_k, p_dropout, softmax_scale,
++        zero_tensors, is_causal, window_size_left, window_size_right, softcap,
++        return_softmax, num_splits, gen_);
 +}
 +
  void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
  #ifndef FLASHATTENTION_DISABLE_BACKWARD
      FP16_SWITCH(!params.is_bf16, [&] {
 diff --git a/csrc/flash_attn/flash_api_torch_lib.cpp b/csrc/flash_attn/flash_api_torch_lib.cpp
-index be2d23c..3b2f97e 100644
+index be2d23c..d32a517 100644
 --- a/csrc/flash_attn/flash_api_torch_lib.cpp
 +++ b/csrc/flash_attn/flash_api_torch_lib.cpp
-@@ -38,6 +38,31 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
+@@ -38,6 +38,58 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                 int num_splits,
                 std::optional<at::Generator> gen_);
  
@@ -265,10 +386,37 @@ index be2d23c..3b2f97e 100644
 +               int num_splits,
 +               std::optional<at::Generator> gen_);
 +
++std::vector<at::Tensor>
++mha_byte_v2_hybrid_varlen_fwd(
++               at::Tensor &q,  // total_q x 32 x 128
++               const at::Tensor &byte_v2_kv_cache,  // num_pages x 52096, uint8
++               const at::Tensor &byte_v2_raw_staging,  // num_slots x 65536, uint8
++               const at::Tensor &byte_v2_page_to_raw_slot,  // num_pages, int32
++               std::optional<at::Tensor> &byte_v2_page_unsafe_flags_,
++               std::optional<at::Tensor> &out_, // total_q x 32 x 128
++               const at::Tensor &cu_seqlens_q,  // b+1
++               const at::Tensor &cu_seqlens_k,  // b+1
++               std::optional<at::Tensor> &seqused_k, // b
++               std::optional<const at::Tensor> &leftpad_k_, // batch_size
++               std::optional<at::Tensor> &block_table_,
++               std::optional<at::Tensor> &alibi_slopes_,
++               int max_seqlen_q,
++               const int max_seqlen_k,
++               const float p_dropout,
++               const float softmax_scale,
++               const bool zero_tensors,
++               bool is_causal,
++               int window_size_left,
++               int window_size_right,
++               const float softcap,
++               const bool return_softmax,
++               int num_splits,
++               std::optional<at::Generator> gen_);
++
  std::vector<at::Tensor>
  mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
                  const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-@@ -113,6 +138,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+@@ -113,6 +165,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
              "int num_splits, Generator? gen) -> Tensor[]");
      ops.impl("varlen_fwd", torch::kCUDA, make_pytorch_shim(&mha_varlen_fwd));
  
@@ -281,10 +429,22 @@ index be2d23c..3b2f97e 100644
 +    ops.impl("byte_v2_varlen_fwd", torch::kCUDA,
 +             make_pytorch_shim(&mha_byte_v2_varlen_fwd));
 +
++    ops.def("byte_v2_hybrid_varlen_fwd(Tensor! q, Tensor byte_v2_kv_cache, "
++            "Tensor byte_v2_raw_staging, Tensor byte_v2_page_to_raw_slot, "
++            "Tensor? byte_v2_page_unsafe_flags, Tensor!? out, "
++            "Tensor cu_seqlens_q, Tensor cu_seqlens_k, Tensor? seqused_k, "
++            "Tensor? leftpad_k, Tensor? block_table, Tensor? alibi_slopes, "
++            "int max_seqlen_q, int max_seqlen_k, float p_dropout, "
++            "float softmax_scale, bool zero_tensors, bool is_causal, "
++            "int window_size_left, int window_size_right, float softcap, "
++            "bool return_softmax, int num_splits, Generator? gen) -> Tensor[]");
++    ops.impl("byte_v2_hybrid_varlen_fwd", torch::kCUDA,
++             make_pytorch_shim(&mha_byte_v2_hybrid_varlen_fwd));
++
      ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
              "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "
              "Tensor? alibi_slopes, Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, "
-@@ -139,4 +173,4 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+@@ -139,4 +212,4 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
  
  REGISTER_EXTENSION(TORCH_EXTENSION_NAME);
  
@@ -304,7 +464,7 @@ index 8ffbb62..c8cd5bb 100644
  template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
  
 diff --git a/csrc/flash_attn/src/flash_fwd_kernel.h b/csrc/flash_attn/src/flash_fwd_kernel.h
-index 7512828..ea4c179 100644
+index 7512828..3f82db0 100644
 --- a/csrc/flash_attn/src/flash_fwd_kernel.h
 +++ b/csrc/flash_attn/src/flash_fwd_kernel.h
 @@ -13,6 +13,8 @@
@@ -399,7 +559,7 @@ index 7512828..ea4c179 100644
                          block_table, params.k_batch_stride, params.k_row_stride);
                  }
              }
-@@ -848,8 +878,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -848,8 +878,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
  
      int n_block = n_block_max - 1;
      // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
@@ -407,10 +567,7 @@ index 7512828..ea4c179 100644
 -                                                 binfo.actual_seqlen_k - n_block * kBlockN);
 +    if constexpr (Has_external_kv_loader) {
 +        ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
-+            reinterpret_cast<const uint8_t *>(params.blockmask),
-+            ExternalKvLoader::PageSizeBytes,
-+            static_cast<int>(params.k_batch_stride),
-+            block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++            params, block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
 +            min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
 +            tKsK, tKVcKV);
 +    } else {
@@ -420,14 +577,13 @@ index 7512828..ea4c179 100644
      cute::cp_async_fence();
  
      // FLASH_NAMESPACE::cp_async_wait<0>();
-@@ -880,29 +920,74 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -880,29 +917,64 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
          clear(acc_s);
          FLASH_NAMESPACE::cp_async_wait<0>();
 +        if constexpr (Has_external_kv_loader) {
 +            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
-+                reinterpret_cast<const uint8_t *>(params.blockmask),
-+                ExternalKvLoader::PageSizeBytes,
++                params, block_table, n_block, kBlockN,
 +                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
 +                tKsK, tKVcKV);
 +        }
@@ -442,10 +598,7 @@ index 7512828..ea4c179 100644
 +            if (masking_step > 0) {
 +                if constexpr (Has_external_kv_loader) {
 +                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
-+                        reinterpret_cast<const uint8_t *>(params.blockmask),
-+                        ExternalKvLoader::PageSizeBytes,
-+                        static_cast<int>(params.k_batch_stride),
-+                        block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                        params, block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
 +                        kBlockN, tVsV, tKVcKV);
 +                } else {
 +                    if (block_table == nullptr) {
@@ -462,10 +615,7 @@ index 7512828..ea4c179 100644
 +                // Clear the smem tiles to account for predicated off loads
 +                if constexpr (Has_external_kv_loader) {
 +                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
-+                        reinterpret_cast<const uint8_t *>(params.blockmask),
-+                        ExternalKvLoader::PageSizeBytes,
-+                        static_cast<int>(params.k_batch_stride),
-+                        block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                        params, block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
 +                        min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
 +                        tVsV, tKVcKV);
 +                } else {
@@ -494,10 +644,7 @@ index 7512828..ea4c179 100644
 +            // in registers.
 +            __syncthreads();
 +            ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
-+                reinterpret_cast<const uint8_t *>(params.blockmask),
-+                ExternalKvLoader::PageSizeBytes,
-+                static_cast<int>(params.k_batch_stride),
-+                block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                params, block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
 +                masking_step > 0
 +                    ? kBlockN
 +                    : min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0),
@@ -508,14 +655,13 @@ index 7512828..ea4c179 100644
          // if (cute::thread0()) { print(acc_s); }
          if constexpr (Is_softcap){
              FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
-@@ -914,22 +999,40 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -914,22 +986,36 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          );
  
          FLASH_NAMESPACE::cp_async_wait<0>();
 +        if constexpr (Has_external_kv_loader) {
 +            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
-+                reinterpret_cast<const uint8_t *>(params.blockmask),
-+                ExternalKvLoader::PageSizeBytes,
++                params, block_table, n_block, kBlockN,
 +                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
 +                tVsV, tKVcKV);
 +        }
@@ -535,10 +681,7 @@ index 7512828..ea4c179 100644
 +                // Advance gK
 +                if constexpr (Has_external_kv_loader) {
 +                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
-+                        reinterpret_cast<const uint8_t *>(params.blockmask),
-+                        ExternalKvLoader::PageSizeBytes,
-+                        static_cast<int>(params.k_batch_stride),
-+                        block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                        params, block_table, bidh / params.h_h_k_ratio, n_block - 1,
 +                        kBlockN, kBlockN, tKsK, tKVcKV);
 +                } else {
 +                    if (block_table == nullptr) {
@@ -560,7 +703,7 @@ index 7512828..ea4c179 100644
          }
  
          // We have key_padding_mask so we'll need to Check_inf
-@@ -946,6 +1049,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -946,6 +1032,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
  
          FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
  
@@ -570,10 +713,7 @@ index 7512828..ea4c179 100644
 +                // reuses the same shared-memory region.
 +                __syncthreads();
 +                ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
-+                    reinterpret_cast<const uint8_t *>(params.blockmask),
-+                    ExternalKvLoader::PageSizeBytes,
-+                    static_cast<int>(params.k_batch_stride),
-+                    block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                    params, block_table, bidh / params.h_h_k_ratio, n_block - 1,
 +                    kBlockN, kBlockN, tKsK, tKVcKV);
 +                cute::cp_async_fence();
 +            }
@@ -582,14 +722,13 @@ index 7512828..ea4c179 100644
          // This check is at the end of the loop since we always have at least 1 iteration
          if (n_masking_steps > 1 && n_block <= n_block_min) {
              --n_block;
-@@ -958,40 +1076,85 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -958,40 +1056,74 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
          clear(acc_s);
          FLASH_NAMESPACE::cp_async_wait<0>();
 +        if constexpr (Has_external_kv_loader) {
 +            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
-+                reinterpret_cast<const uint8_t *>(params.blockmask),
-+                ExternalKvLoader::PageSizeBytes,
++                params, block_table, n_block, kBlockN,
 +                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
 +                tKsK, tKVcKV);
 +        }
@@ -604,10 +743,7 @@ index 7512828..ea4c179 100644
 +            // Advance gV
 +            if constexpr (Has_external_kv_loader) {
 +                ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
-+                    reinterpret_cast<const uint8_t *>(params.blockmask),
-+                    ExternalKvLoader::PageSizeBytes,
-+                    static_cast<int>(params.k_batch_stride),
-+                    block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                    params, block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
 +                    kBlockN, tVsV, tKVcKV);
 +            } else {
 +                if (block_table == nullptr) {
@@ -631,10 +767,7 @@ index 7512828..ea4c179 100644
 +        if constexpr (Reuse_kv_smem) {
 +            __syncthreads();
 +            ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/true>(
-+                reinterpret_cast<const uint8_t *>(params.blockmask),
-+                ExternalKvLoader::PageSizeBytes,
-+                static_cast<int>(params.k_batch_stride),
-+                block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
++                params, block_table, bidh / params.h_h_k_ratio, n_block, kBlockN,
 +                kBlockN, tVsV, tKVcKV);
 +            cute::cp_async_fence();
 +        }
@@ -645,8 +778,7 @@ index 7512828..ea4c179 100644
          FLASH_NAMESPACE::cp_async_wait<0>();
 +        if constexpr (Has_external_kv_loader) {
 +            ExternalKvLoader::decode_staged_tile_to_fa2_smem(
-+                reinterpret_cast<const uint8_t *>(params.blockmask),
-+                ExternalKvLoader::PageSizeBytes,
++                params, block_table, n_block, kBlockN,
 +                min(max(binfo.actual_seqlen_k - n_block * kBlockN, 0), kBlockN),
 +                tVsV, tKVcKV);
 +        }
@@ -663,10 +795,7 @@ index 7512828..ea4c179 100644
 +                // Advance gK
 +                if constexpr (Has_external_kv_loader) {
 +                    ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
-+                        reinterpret_cast<const uint8_t *>(params.blockmask),
-+                        ExternalKvLoader::PageSizeBytes,
-+                        static_cast<int>(params.k_batch_stride),
-+                        block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                        params, block_table, bidh / params.h_h_k_ratio, n_block - 1,
 +                        kBlockN, kBlockN, tKsK, tKVcKV);
 +                } else {
 +                    if (block_table == nullptr) {
@@ -688,7 +817,7 @@ index 7512828..ea4c179 100644
          }
  
          mask.template apply_mask</*Causal_mask=*/false>(
-@@ -1005,6 +1168,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -1005,6 +1137,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
  
          FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
@@ -697,10 +826,7 @@ index 7512828..ea4c179 100644
 +            if (n_block > n_block_min) {
 +                __syncthreads();
 +                ExternalKvLoader::template stage_tile_to_fa2_smem</*IsValue=*/false>(
-+                    reinterpret_cast<const uint8_t *>(params.blockmask),
-+                    ExternalKvLoader::PageSizeBytes,
-+                    static_cast<int>(params.k_batch_stride),
-+                    block_table, bidh / params.h_h_k_ratio, n_block - 1,
++                    params, block_table, bidh / params.h_h_k_ratio, n_block - 1,
 +                    kBlockN, kBlockN, tKsK, tKVcKV);
 +                cute::cp_async_fence();
 +            }
@@ -708,7 +834,7 @@ index 7512828..ea4c179 100644
      }
  
      // Epilogue
-@@ -1108,7 +1284,7 @@ inline __device__ void compute_attn(const Params &params) {
+@@ -1108,7 +1250,7 @@ inline __device__ void compute_attn(const Params &params) {
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  
@@ -717,7 +843,7 @@ index 7512828..ea4c179 100644
  inline __device__ void compute_attn_splitkv(const Params &params) {
      const int m_block = blockIdx.x;
      // The block index for the batch.
-@@ -1117,7 +1293,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
+@@ -1117,7 +1259,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
      const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
      const int n_split_idx = Split ? blockIdx.y : 0;
      const int num_n_splits = Split ? gridDim.y : 1;

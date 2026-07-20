@@ -549,6 +549,14 @@ void byte_v2_hydrate_raw_staging_from_cache(
     torch::stable::Tensor& valid_rows, int64_t codec_token_block,
     int64_t codec_dim_block, int64_t alloc_block_tokens);
 
+void byte_v2_hydrate_raw_staging_from_hybrid_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens);
+
 void byte_v2_release_raw_staging(
     torch::stable::Tensor& block_to_staging_slot,
     torch::stable::Tensor& staging_to_physical_block,
@@ -567,6 +575,24 @@ void byte_v2_commit_raw_staging_to_cache(
     torch::stable::Tensor& staging_to_physical_block,
     torch::stable::Tensor& valid_rows, int64_t codec_token_block,
     int64_t codec_dim_block, int64_t alloc_block_tokens);
+
+void byte_v2_commit_raw_staging_to_hybrid_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens);
+
+void byte_v2_reset_raw_fallback_pages(
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    torch::stable::Tensor& physical_block_ids);
 
 void byte_v2_update_cache_raw_staging(
     torch::stable::Tensor& key, torch::stable::Tensor& value,

@@ -57,6 +57,12 @@ void run_flash_byte_v2_splitkv_fwd(Flash_fwd_params& params,
   TORCH_CHECK(is_even_K, "ByteV2 FA2 requires exact head dim 128");
   TORCH_CHECK(params.knew_ptr == nullptr,
               "ByteV2 FA2 does not append KV inside attention");
+  if (params.vnew_ptr != nullptr) {
+    TORCH_CHECK(params.k_ptr != nullptr && params.v_ptr != nullptr,
+                "ByteV2 hybrid FA2 raw staging pointers are missing");
+    TORCH_CHECK(params.v_batch_stride > 0,
+                "ByteV2 hybrid FA2 raw staging must contain a slot");
+  }
   TORCH_CHECK(params.alibi_slopes_ptr == nullptr,
               "ByteV2 FA2 does not support ALiBi");
   TORCH_CHECK(params.softcap <= 0.0f, "ByteV2 FA2 does not support softcap");

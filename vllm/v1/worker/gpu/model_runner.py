@@ -38,6 +38,9 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
+from vllm.model_executor.layers.attention.attention import (
+    bind_byte_v2_raw_staging_workspace,
+)
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
@@ -269,6 +272,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+        self._byte_v2_raw_staging_workspace: object | None = None
+        self._raw_fallback_ids_pin_memory: bool = False
+        self._raw_fallback_id_cap: int = 0
+        self._raw_fallback_ids_pinned: torch.Tensor | None = None
+        self._raw_fallback_ids_gpu: torch.Tensor | None = None
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
@@ -479,18 +487,92 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
+        self._byte_v2_raw_staging_workspace = bind_byte_v2_raw_staging_workspace(
+            self.compilation_config.static_forward_context,
+            self.kv_cache_config,
+            use_ubatching=self.parallel_config.use_ubatching,
+        )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+        pin_memory = is_pin_memory_available()
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
-            is_pin_memory_available(),
+            pin_memory,
             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
             kernel_block_sizes=self.kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             static_forward_context=self.compilation_config.static_forward_context,
         )
+        self._init_raw_fallback_reset(pin_memory)
+
+    def _zero_block_ids(self, block_ids: list[int]) -> None:
+        """Reset attention sidecars, then zero the compact KV cache blocks."""
+        assert self.kv_block_zeroer is not None
+        self._reset_raw_fallback_pages(block_ids)
+        self.kv_block_zeroer.zero_block_ids(block_ids)
+
+    def _reset_raw_fallback_pages(self, block_ids: list[int]) -> None:
+        """Reset attention sidecar state associated with KV cache blocks."""
+        reset_fns = self._get_raw_fallback_reset_fns()
+        if not block_ids or not reset_fns:
+            return
+        if not hasattr(self, "_raw_fallback_ids_pin_memory"):
+            self._init_raw_fallback_reset(is_pin_memory_available())
+
+        n_blocks = len(block_ids)
+        if n_blocks > self._raw_fallback_id_cap:
+            self._raw_fallback_id_cap = max(8192, n_blocks * 2)
+            self._raw_fallback_ids_pinned = torch.empty(
+                self._raw_fallback_id_cap,
+                dtype=torch.int32,
+                pin_memory=self._raw_fallback_ids_pin_memory,
+            )
+            self._raw_fallback_ids_gpu = torch.empty(
+                self._raw_fallback_id_cap,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        ids_pinned = self._raw_fallback_ids_pinned
+        ids_gpu = self._raw_fallback_ids_gpu
+        assert ids_pinned is not None and ids_gpu is not None
+        ids_pinned[:n_blocks].numpy()[:] = block_ids
+        block_ids_tensor = ids_gpu[:n_blocks]
+        block_ids_tensor.copy_(ids_pinned[:n_blocks], non_blocking=True)
+        for reset_fn in reset_fns:
+            reset_fn(block_ids_tensor)
+
+    def _init_raw_fallback_reset(self, pin_memory: bool) -> None:
+        """Allocate reusable block-ID staging buffers when reset is supported."""
+        reset_fns = self._get_raw_fallback_reset_fns()
+        self._raw_fallback_ids_pin_memory = pin_memory
+        self._raw_fallback_id_cap = 0
+        self._raw_fallback_ids_pinned = None
+        self._raw_fallback_ids_gpu = None
+        if not reset_fns:
+            return
+        self._raw_fallback_id_cap = 8192
+        self._raw_fallback_ids_pinned = torch.empty(
+            self._raw_fallback_id_cap,
+            dtype=torch.int32,
+            pin_memory=pin_memory,
+        )
+        self._raw_fallback_ids_gpu = torch.empty(
+            self._raw_fallback_id_cap,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def _get_raw_fallback_reset_fns(self) -> list[Any]:
+        """Return attention reset hooks without extending module lifetimes."""
+        reset_fns = []
+        for layer in self.compilation_config.static_forward_context.values():
+            impl = getattr(layer, "impl", None)
+            reset_fn = getattr(impl, "reset_raw_fallback_pages", None)
+            if callable(reset_fn):
+                reset_fns.append(reset_fn)
+        return reset_fns
 
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
@@ -814,8 +896,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
-            assert self.kv_block_zeroer is not None
-            self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor

@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    byte_v2_hybrid_raw_fallback_enabled,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -254,6 +255,9 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+            ) or (
+                type(self.kv_cache_spec) is ByteV2FullAttentionSpec
+                and byte_v2_hybrid_raw_fallback_enabled()
             ):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
@@ -286,6 +290,9 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+            ) or (
+                type(self.kv_cache_spec) is ByteV2FullAttentionSpec
+                and byte_v2_hybrid_raw_fallback_enabled()
             ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
@@ -370,6 +377,21 @@ class SingleTypeKVCacheManager(ABC):
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
+
+        if (
+            type(self.kv_cache_spec) is ByteV2FullAttentionSpec
+            and byte_v2_hybrid_raw_fallback_enabled()
+        ):
+            # Uncached tail blocks become truly dead when their final request
+            # reference is released. Reuse the zero/reset notification path so
+            # ByteV2 can unpublish any raw sidecar slot immediately instead of
+            # holding a scarce emergency slot until this block ID is allocated
+            # again. Prefix-cached blocks retain their sidecar until eviction.
+            self.new_block_ids.extend(
+                block.block_id
+                for block in req_blocks
+                if block.block_hash is None and block.ref_cnt == 1
+            )
 
         # Free blocks in reverse order so that the tail blocks are
         # freed first.

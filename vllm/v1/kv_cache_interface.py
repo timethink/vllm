@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from collections import Counter
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
@@ -24,6 +25,37 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.byte_v2_layout import ByteV2TilePolicy
 
 logger = init_logger(__name__)
+
+
+BYTE_V2_DEFAULT_RAW_STAGING_SLOTS = 128
+_BYTE_V2_RAW_STAGING_SLOTS_ENV = "BYTE_V2_FA2_RAW_STAGING_SLOTS"
+
+
+def byte_v2_hybrid_raw_fallback_enabled() -> bool:
+    """Return whether the experimental persistent ByteV2 sidecar is enabled."""
+    value = os.environ.get("BYTE_V2_FA2_HYBRID_RAW_FALLBACK")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def byte_v2_raw_staging_slots() -> int:
+    """Return the strictly validated shared ByteV2 staging-slot count."""
+    value = os.environ.get(_BYTE_V2_RAW_STAGING_SLOTS_ENV)
+    if value is None:
+        return BYTE_V2_DEFAULT_RAW_STAGING_SLOTS
+    try:
+        slots = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{_BYTE_V2_RAW_STAGING_SLOTS_ENV} must be a positive integer, "
+            f"got {value!r}"
+        ) from error
+    if slots <= 0:
+        raise ValueError(
+            f"{_BYTE_V2_RAW_STAGING_SLOTS_ENV} must be positive, got {value!r}"
+        )
+    return slots
 
 
 # ---------------------------------------------------------------------------
@@ -1013,11 +1045,38 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    byte_v2_raw_fallback_slots: int = 0
+    """Persistent raw fallback slots allocated per actual ByteV2 layer."""
+    byte_v2_raw_fallback_sidecar_bytes: int = 0
+    """Total persistent ByteV2 sidecar bytes for this worker."""
+    byte_v2_raw_staging_slots: int = 0
+    """Raw staging slots in the runner-owned cross-layer workspace."""
+    byte_v2_raw_staging_workspace_bytes: int = 0
+    """Total bytes in the runner-owned ByteV2 staging workspace."""
 
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
 
     @property
+    def has_byte_v2_layers(self) -> bool:
+        return self.num_byte_v2_layers > 0
+
+    @property
+    def num_byte_v2_layers(self) -> int:
+        """Return the number of actual ByteV2 layers on this worker."""
+        num_layers = 0
+        for group in self.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, ByteV2FullAttentionSpec):
+                num_layers += len(group.layer_names)
+            elif isinstance(spec, UniformTypeKVCacheSpecs):
+                num_layers += sum(
+                    isinstance(spec.kv_cache_specs[layer_name], ByteV2FullAttentionSpec)
+                    for layer_name in group.layer_names
+                )
+        return num_layers
+
+    @property
     def needs_kv_cache_zeroing(self) -> bool:
-        return self.has_mamba_layers
+        return self.has_mamba_layers or self.byte_v2_raw_fallback_slots > 0

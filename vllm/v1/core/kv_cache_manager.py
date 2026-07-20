@@ -155,6 +155,9 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self._reset_all_blocks_for_byte_v2 = (
+            kv_cache_config.byte_v2_raw_fallback_slots > 0
+        )
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -477,6 +480,16 @@ class KVCacheManager:
         """
         if not self.block_pool.reset_prefix_cache():
             return False
+        if self._reset_all_blocks_for_byte_v2:
+            # A global prefix reset makes every cached physical block
+            # evictable at once. Queue the complete block namespace through
+            # the existing worker reset path so scarce raw sidecar slots are
+            # reclaimed immediately, rather than only as those IDs happen to
+            # be allocated again. Compact zeroing is conservative but safe for
+            # this explicit, infrequent control operation.
+            managers = self.coordinator.single_type_managers
+            if managers:
+                managers[0].new_block_ids.extend(range(self.block_pool.num_gpu_blocks))
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True

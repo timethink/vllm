@@ -14,11 +14,95 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     ChunkedLocalAttentionManager,
+    FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import ChunkedLocalAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
+    ChunkedLocalAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    SlidingWindowSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
+
+
+def get_byte_v2_manager(*, enable_caching: bool) -> FullAttentionManager:
+    spec = ByteV2FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        dtype=torch.uint8,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=8,
+        enable_caching=enable_caching,
+        hash_block_size=spec.block_size,
+    )
+    return FullAttentionManager(
+        spec,
+        block_pool=block_pool,
+        enable_caching=enable_caching,
+        kv_cache_group_id=0,
+        scheduler_block_size=spec.block_size,
+    )
+
+
+def test_byte_v2_reports_allocated_and_dead_uncached_blocks_for_reset(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    manager = get_byte_v2_manager(enable_caching=False)
+
+    allocated = manager.allocate_new_blocks("request", 16, 16)
+    assert len(allocated) == 1
+    block_id = allocated[0].block_id
+    assert manager.take_new_block_ids() == [block_id]
+
+    manager.free("request")
+    assert manager.take_new_block_ids() == [block_id]
+
+
+def test_byte_v2_default_off_does_not_accumulate_reset_notifications(monkeypatch):
+    monkeypatch.delenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", raising=False)
+    manager = get_byte_v2_manager(enable_caching=False)
+
+    manager.allocate_new_blocks("request", 16, 16)
+    manager.free("request")
+
+    assert manager.take_new_block_ids() == []
+
+
+def test_byte_v2_retains_prefix_cached_block_until_reuse(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    manager = get_byte_v2_manager(enable_caching=True)
+    allocated = manager.allocate_new_blocks("request", 16, 16)
+    block = allocated[0]
+    manager.take_new_block_ids()
+    block.block_hash = make_block_hash_with_group_id(BlockHash(b"prefix"), 0)
+
+    manager.free("request")
+
+    assert manager.take_new_block_ids() == []
+
+
+def test_byte_v2_config_requests_block_zero_notifications_only_with_sidecar():
+    manager = get_byte_v2_manager(enable_caching=False)
+    config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=["layer"],
+                kv_cache_spec=manager.kv_cache_spec,
+            )
+        ],
+    )
+
+    assert config.has_byte_v2_layers
+    assert not config.needs_kv_cache_zeroing
+
+    config.byte_v2_raw_fallback_slots = 1
+    assert config.needs_kv_cache_zeroing
 
 
 def get_sliding_window_manager(sliding_window_spec, block_pool, enable_caching=True):

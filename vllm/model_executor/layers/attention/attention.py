@@ -699,6 +699,102 @@ def get_attention_context(
     return attn_metadata, attn_layer, kv_cache, layer_slot_mapping
 
 
+def bind_byte_v2_raw_staging_workspace(
+    static_forward_context: dict[str, Any],
+    kv_cache_config: object,
+    *,
+    use_ubatching: bool,
+) -> object | None:
+    """Allocate one compatible raw staging workspace and bind all layers."""
+    num_staging_slots = int(getattr(kv_cache_config, "byte_v2_raw_staging_slots", 0))
+    planned_bytes = int(
+        getattr(kv_cache_config, "byte_v2_raw_staging_workspace_bytes", 0)
+    )
+    num_raw_slots = int(getattr(kv_cache_config, "byte_v2_raw_fallback_slots", 0))
+    num_blocks = int(getattr(kv_cache_config, "num_blocks", 0))
+    if use_ubatching and (num_staging_slots > 0 or planned_bytes > 0):
+        raise RuntimeError(
+            "ByteV2 hybrid raw fallback does not support ubatching because its "
+            "raw staging workspace is single-lane"
+        )
+
+    specs_and_impls: list[tuple[object, object, torch.Tensor]] = []
+    seen_impls: set[int] = set()
+    for layer in static_forward_context.values():
+        impl = getattr(layer, "impl", None)
+        if impl is None or id(impl) in seen_impls:
+            continue
+        spec_fn = getattr(impl, "raw_staging_workspace_spec", None)
+        if not callable(spec_fn):
+            continue
+        seen_impls.add(id(impl))
+        spec = spec_fn(layer.kv_cache, num_staging_slots)
+        if spec is not None:
+            bind_raw_plan = getattr(impl, "bind_raw_fallback_plan", None)
+            if not callable(bind_raw_plan) or num_raw_slots <= 0:
+                raise RuntimeError(
+                    "Active ByteV2 hybrid fallback is missing its planned raw "
+                    "sidecar slot count"
+                )
+            bind_raw_plan(
+                num_blocks=num_blocks,
+                num_raw_slots=num_raw_slots,
+            )
+            specs_and_impls.append((spec, impl, layer.kv_cache))
+
+    if not specs_and_impls:
+        if num_staging_slots != 0 or planned_bytes != 0:
+            raise RuntimeError(
+                "The KV-cache planner reserved a ByteV2 raw staging workspace, "
+                "but no active attention implementation requested it"
+            )
+        return None
+    if num_staging_slots <= 0 or planned_bytes <= 0:
+        raise RuntimeError(
+            "Active ByteV2 hybrid fallback is missing its planned raw staging "
+            "workspace budget"
+        )
+
+    first_spec = specs_and_impls[0][0]
+    for spec, _, _ in specs_and_impls[1:]:
+        if spec != first_spec:
+            raise RuntimeError(
+                "ByteV2 layers require incompatible raw staging workspaces: "
+                f"{first_spec!r} != {spec!r}"
+            )
+    actual_bytes_value = getattr(first_spec, "nbytes", None)
+    if not isinstance(actual_bytes_value, int):
+        raise RuntimeError("ByteV2 raw staging workspace spec has no byte size")
+    actual_bytes = actual_bytes_value
+    if actual_bytes != planned_bytes:
+        raise RuntimeError(
+            "ByteV2 raw staging workspace budget mismatch: planner reserved "
+            f"{planned_bytes} bytes, runtime requires {actual_bytes} bytes"
+        )
+    allocate = getattr(first_spec, "allocate", None)
+    if not callable(allocate):
+        raise RuntimeError("ByteV2 raw staging workspace spec is not allocatable")
+    workspace = allocate()
+    for _, impl, kv_cache in specs_and_impls:
+        initialize_raw_state = getattr(
+            impl,
+            "initialize_raw_fallback_state",
+            None,
+        )
+        if not callable(initialize_raw_state):
+            raise RuntimeError(
+                "ByteV2 attention implementation cannot initialize raw sidecar"
+            )
+        initialize_raw_state(kv_cache)
+        bind = getattr(impl, "bind_raw_staging_workspace", None)
+        if not callable(bind):
+            raise RuntimeError(
+                "ByteV2 attention implementation cannot bind raw staging"
+            )
+        bind(workspace)
+    return workspace
+
+
 def unified_kv_cache_update(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -709,18 +805,35 @@ def unified_kv_cache_update(
     the data dependency between them to ensure torch.compile preserves ordering.
     """
     layer_name = _resolve_layer_name(layer_name)
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
-        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
-            attn_layer,
-            key,
-            value,
-            kv_cache,
-            layer_slot_mapping,
+        update_with_metadata = getattr(
+            attn_layer.impl,
+            "do_kv_cache_update_with_metadata",
+            None,
         )
+        if callable(update_with_metadata):
+            update_with_metadata(
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+                attn_metadata,
+            )
+        else:
+            attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+            )
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 

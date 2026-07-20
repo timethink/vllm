@@ -104,6 +104,23 @@ def byte_v2_fa2_decode_is_available() -> bool:
     return _find_fa2_op("byte_v2_varlen_fwd") is not None
 
 
+def byte_v2_fa2_hybrid_decode_is_available() -> bool:
+    """Return whether the experimental compact/raw FA2 entry point exists."""
+    return _find_fa2_op("byte_v2_hybrid_varlen_fwd") is not None
+
+
+def byte_v2_hybrid_cache_update_is_available() -> bool:
+    """Return whether persistent raw fallback update ops are registered."""
+    return all(
+        _find_op("_C_cache_ops", op_name) is not None
+        for op_name in (
+            "byte_v2_hydrate_raw_staging_from_hybrid_cache",
+            "byte_v2_commit_raw_staging_to_hybrid_cache",
+            "byte_v2_reset_raw_fallback_pages",
+        )
+    )
+
+
 def missing_byte_v2_custom_ops() -> tuple[str, ...]:
     """Return the missing ByteV2 custom op qualified names."""
     return tuple(
@@ -277,6 +294,32 @@ def byte_v2_hydrate_raw_staging_from_cache(
     )
 
 
+def byte_v2_hydrate_raw_staging_from_hybrid_cache(
+    raw_staging: torch.Tensor,
+    kv_cache: torch.Tensor,
+    persistent_raw_staging: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    staging_to_physical_block: torch.Tensor,
+    valid_rows: torch.Tensor,
+    *,
+    codec_token_block: int,
+    codec_dim_block: int,
+    alloc_block_tokens: int,
+) -> None:
+    """Hydrate transient pages from compact or authoritative raw storage."""
+    _require_op("_C_cache_ops", "byte_v2_hydrate_raw_staging_from_hybrid_cache")(
+        raw_staging,
+        kv_cache,
+        persistent_raw_staging,
+        page_to_raw_slot,
+        staging_to_physical_block,
+        valid_rows,
+        codec_token_block,
+        codec_dim_block,
+        alloc_block_tokens,
+    )
+
+
 def byte_v2_release_raw_staging(
     block_to_staging_slot: torch.Tensor,
     staging_to_physical_block: torch.Tensor,
@@ -337,6 +380,55 @@ def byte_v2_commit_raw_staging_to_cache(
         codec_token_block,
         codec_dim_block,
         alloc_block_tokens,
+    )
+
+
+def byte_v2_commit_raw_staging_to_hybrid_cache(
+    raw_staging: torch.Tensor,
+    kv_cache: torch.Tensor,
+    persistent_raw_staging: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    free_raw_slots: torch.Tensor,
+    free_raw_slot_count: torch.Tensor,
+    raw_pool_overflow: torch.Tensor,
+    staging_to_physical_block: torch.Tensor,
+    valid_rows: torch.Tensor,
+    *,
+    codec_token_block: int,
+    codec_dim_block: int,
+    alloc_block_tokens: int,
+) -> None:
+    """Commit compact pages and publish exact raw fallback pages atomically."""
+    _require_op("_C_cache_ops", "byte_v2_commit_raw_staging_to_hybrid_cache")(
+        raw_staging,
+        kv_cache,
+        persistent_raw_staging,
+        page_to_raw_slot,
+        free_raw_slots,
+        free_raw_slot_count,
+        raw_pool_overflow,
+        staging_to_physical_block,
+        valid_rows,
+        codec_token_block,
+        codec_dim_block,
+        alloc_block_tokens,
+    )
+
+
+def byte_v2_reset_raw_fallback_pages(
+    page_to_raw_slot: torch.Tensor,
+    free_raw_slots: torch.Tensor,
+    free_raw_slot_count: torch.Tensor,
+    raw_pool_overflow: torch.Tensor,
+    physical_block_ids: torch.Tensor,
+) -> None:
+    """Unpublish raw pages and return their slots to the free stack."""
+    _require_op("_C_cache_ops", "byte_v2_reset_raw_fallback_pages")(
+        page_to_raw_slot,
+        free_raw_slots,
+        free_raw_slot_count,
+        raw_pool_overflow,
+        physical_block_ids,
     )
 
 
@@ -477,6 +569,50 @@ def byte_v2_fa2_paged_decode_attention(
         block_tables,
         None,
         1,
+        max_seq_len,
+        0.0,
+        scale,
+        False,
+        causal,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+
+
+def byte_v2_fa2_hybrid_paged_decode_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    raw_staging: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    query_start_locs: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    scale: float,
+    max_query_len: int,
+    max_seq_len: int,
+    causal: bool,
+) -> None:
+    """Run FA2 over mixed compact and authoritative raw pages."""
+    _require_fa2_op("byte_v2_hybrid_varlen_fwd")(
+        query,
+        kv_cache,
+        raw_staging,
+        page_to_raw_slot,
+        None,
+        output,
+        query_start_locs,
+        query_start_locs,
+        seq_lens,
+        None,
+        block_tables,
+        None,
+        max_query_len,
         max_seq_len,
         0.0,
         scale,

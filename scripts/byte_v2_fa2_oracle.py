@@ -9,7 +9,10 @@ from collections.abc import Sequence
 
 import torch
 
-from vllm.v1.attention.backends.byte_v2_layout import ByteV2PageLayoutV5
+from vllm.v1.attention.backends.byte_v2_layout import (
+    ByteV2PageLayoutV5,
+    ByteV2RawStagingLayout,
+)
 from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_fa2_decode_is_available,
     byte_v2_reshape_and_cache,
@@ -92,6 +95,17 @@ def fa2_oracle_ops_are_available() -> bool:
     return (
         op_namespace is not None
         and getattr(op_namespace, "varlen_fwd", None) is not None
+    )
+
+
+def hybrid_fa2_oracle_ops_are_available() -> bool:
+    """Return whether the hybrid ByteV2 and raw FA2 ops are registered."""
+    if not fa2_oracle_ops_are_available():
+        return False
+    op_namespace = getattr(torch.ops, "_vllm_fa2_C", None)
+    return (
+        op_namespace is not None
+        and getattr(op_namespace, "byte_v2_hybrid_varlen_fwd", None) is not None
     )
 
 
@@ -291,6 +305,69 @@ def make_inputs(
     }
 
 
+def add_hybrid_raw_pages(
+    tensors: dict[str, torch.Tensor | float | int],
+    raw_physical_pages: Sequence[int],
+    *,
+    reverse_raw_slots: bool = True,
+    poison_compact_pages: bool = True,
+) -> None:
+    """Attach an authoritative raw sidecar for selected physical pages.
+
+    The sidecar deliberately uses ByteV2's existing head-major staging
+    layout, not raw FA2's row-major paged-cache layout. Reversing raw slots
+    proves that the loader follows the side table rather than assuming that a
+    physical page id is also a raw slot id. Selected compact pages are
+    poisoned by default so an implementation that ignores the raw map cannot
+    pass the oracle accidentally.
+    """
+    raw_key = tensors["key"]
+    raw_value = tensors["value"]
+    byte_cache = tensors["byte_cache"]
+    assert isinstance(raw_key, torch.Tensor)
+    assert isinstance(raw_value, torch.Tensor)
+    assert isinstance(byte_cache, torch.Tensor)
+
+    pages = tuple(dict.fromkeys(int(page) for page in raw_physical_pages))
+    num_pages = byte_cache.size(0)
+    if any(page < 0 or page >= num_pages for page in pages):
+        raise ValueError("raw physical page is outside the compact cache")
+
+    staging_layout = ByteV2RawStagingLayout()
+    assert staging_layout.slot_size_bytes == 65536
+    assert staging_layout.value_base_bytes == 32768
+    num_raw_slots = max(len(pages), 1)
+    raw_staging_bf16 = torch.zeros(
+        (num_raw_slots, 2, 8, 16, 128),
+        dtype=torch.bfloat16,
+        device=byte_cache.device,
+    )
+    page_to_raw_slot = torch.full(
+        (num_pages,),
+        -1,
+        dtype=torch.int32,
+        device=byte_cache.device,
+    )
+    slot_order = list(range(len(pages)))
+    if reverse_raw_slots:
+        slot_order.reverse()
+    for physical_page, raw_slot in zip(pages, slot_order):
+        raw_staging_bf16[raw_slot, 0].copy_(raw_key[physical_page].permute(1, 0, 2))
+        raw_staging_bf16[raw_slot, 1].copy_(raw_value[physical_page].permute(1, 0, 2))
+        page_to_raw_slot[physical_page] = raw_slot
+    if poison_compact_pages:
+        for physical_page in pages:
+            byte_cache[physical_page].zero_()
+
+    raw_staging = raw_staging_bf16.view(torch.uint8).reshape(
+        num_raw_slots, staging_layout.slot_size_bytes
+    )
+    assert raw_staging.stride() == (staging_layout.slot_size_bytes, 1)
+    assert raw_staging.data_ptr() % 16 == 0
+    tensors["raw_staging"] = raw_staging
+    tensors["page_to_raw_slot"] = page_to_raw_slot
+
+
 def _run_attention_pair(
     tensors: dict[str, torch.Tensor | float | int],
     *,
@@ -381,6 +458,79 @@ def compare_byte_v2_and_raw(
         num_splits=num_splits,
         byte_out=byte_out,
         byte_lse=byte_lse,
+        raw_out=raw_out,
+        raw_lse=raw_lse,
+    )
+
+
+def compare_hybrid_byte_v2_and_raw(
+    tensors: dict[str, torch.Tensor | float | int],
+    *,
+    query_len: int = 1,
+    iterations: int = 1,
+    num_splits: int = 0,
+) -> dict[str, int | float | list[int]]:
+    """Run hybrid ByteV2 and raw FA2 and return bitwise mismatch counts."""
+    if iterations <= 0:
+        raise ValueError("iterations must be positive")
+    if not 0 <= num_splits <= 128:
+        raise ValueError("num_splits must be between 0 and 128")
+    query = tensors["query"]
+    raw_staging = tensors["raw_staging"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    max_seq_len = tensors["max_seq_len"]
+    assert isinstance(query, torch.Tensor)
+    assert isinstance(raw_staging, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    assert isinstance(max_seq_len, int)
+    common = (
+        tensors["cu_seqlens_q"],
+        tensors["dummy_cu_seqlens_k"],
+        tensors["seq_lens"],
+        None,
+        tensors["block_table"],
+        None,
+        query_len,
+        max_seq_len,
+        0.0,
+        tensors["scale"],
+        False,
+        True,
+        -1,
+        -1,
+        0.0,
+        False,
+        num_splits,
+        None,
+    )
+    hybrid_out = hybrid_lse = raw_out = raw_lse = None
+    for _ in range(iterations):
+        hybrid_out, hybrid_lse = torch.ops._vllm_fa2_C.byte_v2_hybrid_varlen_fwd(
+            query,
+            tensors["byte_cache"],
+            raw_staging,
+            page_to_raw_slot,
+            None,
+            torch.empty_like(query),
+            *common,
+        )
+        raw_out, raw_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+            query,
+            tensors["key"],
+            tensors["value"],
+            torch.empty_like(query),
+            *common,
+        )
+    torch.accelerator.synchronize()
+    assert hybrid_out is not None and hybrid_lse is not None
+    assert raw_out is not None and raw_lse is not None
+    return _comparison_result(
+        tensors,
+        query_len=query_len,
+        iterations=iterations,
+        num_splits=num_splits,
+        byte_out=hybrid_out,
+        byte_lse=hybrid_lse,
         raw_out=raw_out,
         raw_lse=raw_lse,
     )

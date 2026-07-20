@@ -14,6 +14,7 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends import byte_v2_attn as byte_v2_attn_module
+from vllm.v1.attention.backends import byte_v2_ops as byte_v2_ops_module
 from vllm.v1.attention.backends.byte_v2_layout import (
     BYTE_V2_MACRO_DESCRIPTOR_BYTES,
     BYTE_V2_MAX_MACRO_PAGES,
@@ -1396,6 +1397,171 @@ def test_byte_v2_cached_prefix_q16_defaults_off(monkeypatch):
 
     monkeypatch.setenv("BYTE_V2_CACHED_PREFIX_Q16", "1")
     assert byte_v2_attn_module._cached_prefix_q16_enabled() is True
+
+
+def test_byte_v2_hybrid_cached_prefill_uses_generic_fa2_reader(monkeypatch):
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.scale = 0.125
+    state = SimpleNamespace(
+        raw_pages=torch.empty((2, 65_536), dtype=torch.uint8),
+        page_to_raw_slot=torch.full((4,), -1, dtype=torch.int32),
+    )
+    impl.raw_fallback_store = SimpleNamespace(state=lambda _: state)
+    query = torch.empty((5, 32, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    kv_cache = torch.empty((4, 52_096), dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        num_actual_tokens=5,
+        query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        block_table=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        seq_lens=torch.tensor([18, 35], dtype=torch.int32),
+        max_query_len=3,
+        max_seq_len=35,
+        causal=True,
+        common_prefix_len=0,
+    )
+    calls = []
+
+    def fake_hybrid_fa2(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_hybrid_paged_decode_attention",
+        fake_hybrid_fa2,
+    )
+
+    result = impl._forward_prefill_from_cache(query, kv_cache, output, metadata)
+
+    assert result is output
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0].data_ptr() == output.data_ptr()
+    assert args[1].data_ptr() == query.data_ptr()
+    assert args[3] is state.raw_pages
+    assert args[4] is state.page_to_raw_slot
+    assert torch.equal(args[5], metadata.query_start_loc)
+    assert torch.equal(args[6], metadata.block_table)
+    assert torch.equal(args[7], metadata.seq_lens)
+    assert kwargs == {
+        "scale": 0.125,
+        "max_query_len": 3,
+        "max_seq_len": 35,
+        "causal": True,
+    }
+
+
+def test_byte_v2_hybrid_cached_prefill_rejects_noncausal_metadata():
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.raw_fallback_store = object()
+    metadata = SimpleNamespace(causal=False, common_prefix_len=0)
+
+    with pytest.raises(RuntimeError, match="require causal attention"):
+        impl._forward_prefill_from_cache(
+            torch.empty((2, 32, 128), dtype=torch.bfloat16),
+            torch.empty((1, 52_096), dtype=torch.uint8),
+            torch.empty((2, 32, 128), dtype=torch.bfloat16),
+            metadata,
+        )
+
+
+def test_byte_v2_hybrid_fa2_wrapper_forwards_generic_query_length(monkeypatch):
+    calls = []
+
+    def fake_op(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(byte_v2_ops_module, "_require_fa2_op", lambda _: fake_op)
+    query = torch.empty((6, 32, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    kv_cache = torch.empty((4, 52_096), dtype=torch.uint8)
+    raw_pages = torch.empty((1, 65_536), dtype=torch.uint8)
+    page_map = torch.full((4,), -1, dtype=torch.int32)
+    query_start_locs = torch.tensor([0, 2, 6], dtype=torch.int32)
+
+    byte_v2_ops_module.byte_v2_fa2_hybrid_paged_decode_attention(
+        output,
+        query,
+        kv_cache,
+        raw_pages,
+        page_map,
+        query_start_locs,
+        torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        torch.tensor([18, 36], dtype=torch.int32),
+        scale=0.125,
+        max_query_len=4,
+        max_seq_len=36,
+        causal=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][12] == 4
+    assert calls[0][13] == 36
+
+
+def test_byte_v2_hybrid_cached_prefill_bypasses_legacy_spec_fastpaths():
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.raw_fallback_store = object()
+    impl._prefill_has_cached_context = lambda _: True
+    expected = torch.empty((1, 1, 1))
+    impl._forward_prefill_from_cache = lambda *args: expected
+
+    def unexpected_spec_route(*_args):
+        raise AssertionError("legacy speculative cache reader was used")
+
+    impl._speculative_gqa_query_len = unexpected_spec_route
+    query = torch.empty((4, 32, 128), dtype=torch.bfloat16)
+    key = torch.empty((4, 8, 128), dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+
+    result = impl._forward_prefill(
+        query,
+        key,
+        value,
+        torch.empty((1, 52_096), dtype=torch.uint8),
+        torch.empty_like(query),
+        SimpleNamespace(),
+    )
+
+    assert result is expected
+
+
+def test_byte_v2_hybrid_rejects_cross_layer_kv_sharing(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+
+    with pytest.raises(RuntimeError, match="cross-layer KV-cache sharing"):
+        byte_v2_attn_module.ByteV2AttentionImpl(
+            num_heads=32,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=8,
+            kv_sharing_target_layer_name="model.layers.0.self_attn",
+        )
+
+
+def test_byte_v2_hybrid_rejects_unsupported_local_head_shape(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+
+    with pytest.raises(RuntimeError, match="Hq=32, Hkv=8"):
+        byte_v2_attn_module.ByteV2AttentionImpl(
+            num_heads=16,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=4,
+        )
+
+
+def test_byte_v2_hybrid_rejects_nondefault_tile_policy(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_COMPUTE_BLOCK_N", "128")
+
+    with pytest.raises(RuntimeError, match="default ByteV2 V5 tile policy"):
+        byte_v2_attn_module.ByteV2AttentionImpl(
+            num_heads=32,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=8,
+        )
 
 
 def test_byte_v2_decode_partition_size_uses_long_context_default(monkeypatch):
@@ -3070,6 +3236,714 @@ def test_byte_v2_fa2_cuda_matches_raw_fa2_bitwise(
     assert result["lse_mismatch"] == 0
     assert result["out_max_abs"] == 0.0
     assert result["lse_max_abs"] == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    (
+        "seq_lens",
+        "query_len",
+        "raw_page_mode",
+        "permute_pages",
+        "shared_prefix_blocks",
+        "num_splits",
+    ),
+    [
+        pytest.param((73,), 1, "none", False, 0, 0, id="all-compact"),
+        pytest.param((73,), 1, "tail", False, 0, 0, id="raw-tail"),
+        pytest.param((128,), 1, "mixed", False, 0, 0, id="mixed-n128"),
+        pytest.param((128,), 1, "all", False, 0, 1, id="all-raw-nonsplit"),
+        pytest.param(
+            (73, 128, 4105),
+            1,
+            "ragged",
+            True,
+            4,
+            4,
+            id="ragged-permuted-shared-prefix-split4",
+        ),
+        pytest.param(
+            (33, 47),
+            4,
+            "ragged",
+            True,
+            1,
+            1,
+            id="generic-q4-ragged-mixed-partial",
+        ),
+    ],
+)
+def test_byte_v2_hybrid_fa2_cuda_matches_raw_fa2_bitwise(
+    seq_lens,
+    query_len,
+    raw_page_mode,
+    permute_pages,
+    shared_prefix_blocks,
+    num_splits,
+):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+
+    from scripts.byte_v2_fa2_oracle import (
+        add_hybrid_raw_pages,
+        compare_hybrid_byte_v2_and_raw,
+        hybrid_fa2_oracle_ops_are_available,
+        make_inputs,
+    )
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    tensors = make_inputs(
+        seq_lens,
+        query_len=query_len,
+        force_outliers=True,
+        permute_pages=permute_pages,
+        shared_prefix_blocks=shared_prefix_blocks,
+    )
+    block_table = tensors["block_table"]
+    assert isinstance(block_table, torch.Tensor)
+    table = block_table.cpu()
+    active_rows = [
+        table[seq_idx, : (seq_len + 15) // 16].tolist()
+        for seq_idx, seq_len in enumerate(seq_lens)
+    ]
+    if raw_page_mode == "none":
+        raw_pages = []
+    elif raw_page_mode == "tail":
+        raw_pages = [active_rows[0][-1]]
+    elif raw_page_mode == "mixed":
+        raw_pages = active_rows[0][1::3]
+    elif raw_page_mode == "all":
+        raw_pages = active_rows[0]
+    else:
+        raw_pages = sorted(
+            {page for row in active_rows for page in (row[len(row) // 2], row[-1])}
+        )
+    if query_len > 1:
+        active_pages = {page for row in active_rows for page in row}
+        assert len(set(seq_lens)) > 1
+        assert any(seq_len % 16 for seq_len in seq_lens)
+        assert 0 < len(set(raw_pages)) < len(active_pages)
+    add_hybrid_raw_pages(tensors, raw_pages, reverse_raw_slots=True)
+
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    assert int((page_to_raw_slot >= 0).sum()) == len(set(raw_pages))
+    if raw_pages:
+        page_to_raw_slot_cpu = page_to_raw_slot.cpu()
+        assert any(
+            int(page_to_raw_slot_cpu[physical_page]) != physical_page
+            for physical_page in raw_pages
+        )
+    else:
+        assert bool((page_to_raw_slot == -1).all())
+    result = compare_hybrid_byte_v2_and_raw(
+        tensors,
+        query_len=query_len,
+        iterations=1,
+        num_splits=num_splits,
+    )
+
+    assert result["out_mismatch"] == 0
+    assert result["lse_mismatch"] == 0
+    assert result["out_max_abs"] == 0.0
+    assert result["lse_max_abs"] == 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_hybrid_fa2_python_wrapper_q4_matches_raw_bitwise():
+    from scripts.byte_v2_fa2_oracle import (
+        add_hybrid_raw_pages,
+        hybrid_fa2_oracle_ops_are_available,
+        make_inputs,
+    )
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    query_len = 4
+    tensors = make_inputs(
+        (33, 47),
+        query_len=query_len,
+        force_outliers=True,
+        permute_pages=True,
+        shared_prefix_blocks=1,
+    )
+    block_table = tensors["block_table"]
+    query = tensors["query"]
+    assert isinstance(block_table, torch.Tensor)
+    assert isinstance(query, torch.Tensor)
+    active_pages = block_table[:, :3].detach().cpu().flatten().tolist()
+    add_hybrid_raw_pages(tensors, sorted(set(active_pages[1::2])))
+
+    hybrid_out = torch.empty_like(query)
+    byte_v2_ops_module.byte_v2_fa2_hybrid_paged_decode_attention(
+        hybrid_out,
+        query,
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        tensors["page_to_raw_slot"],
+        tensors["cu_seqlens_q"],
+        block_table,
+        tensors["seq_lens"],
+        scale=float(tensors["scale"]),
+        max_query_len=query_len,
+        max_seq_len=int(tensors["max_seq_len"]),
+        causal=True,
+    )
+    raw_out, _ = torch.ops._vllm_fa2_C.varlen_fwd(
+        query,
+        tensors["key"],
+        tensors["value"],
+        torch.empty_like(query),
+        tensors["cu_seqlens_q"],
+        tensors["dummy_cu_seqlens_k"],
+        tensors["seq_lens"],
+        None,
+        block_table,
+        None,
+        query_len,
+        int(tensors["max_seq_len"]),
+        0.0,
+        float(tensors["scale"]),
+        False,
+        True,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+    torch.accelerator.synchronize()
+
+    assert int((hybrid_out.view(torch.int16) != raw_out.view(torch.int16)).sum()) == 0
+
+
+def _run_byte_v2_hybrid_fa2_subprocess(probe: str):
+    probe_source = r"""
+import sys
+
+import torch
+import vllm.vllm_flash_attn  # noqa: F401
+
+from scripts.byte_v2_fa2_oracle import (
+    add_hybrid_raw_pages,
+    compare_hybrid_byte_v2_and_raw,
+    make_inputs,
+)
+from vllm.v1.attention.backends.byte_v2_layout import ByteV2PageLayoutV5
+
+probe = sys.argv[1]
+tensors = make_inputs((16,), query_len=1, force_outliers=True)
+block_table = tensors["block_table"]
+byte_cache = tensors["byte_cache"]
+assert isinstance(block_table, torch.Tensor)
+assert isinstance(byte_cache, torch.Tensor)
+raw_page = int(block_table[0, 0].item())
+add_hybrid_raw_pages(tensors, [raw_page])
+
+if probe == "invalid-high-slot":
+    baseline = compare_hybrid_byte_v2_and_raw(
+        tensors,
+        query_len=1,
+        iterations=1,
+        num_splits=1,
+    )
+    assert baseline["out_mismatch"] == 0
+    assert baseline["lse_mismatch"] == 0
+    raw_staging = tensors["raw_staging"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(raw_staging, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    page_to_raw_slot[raw_page] = raw_staging.size(0)
+    print({"hybrid_invalid_map_probe": probe}, flush=True)
+    compare_hybrid_byte_v2_and_raw(
+        tensors,
+        query_len=1,
+        iterations=1,
+        num_splits=1,
+    )
+    print({"hybrid_invalid_map_unexpected_success": probe}, flush=True)
+    raise SystemExit(0)
+
+layout = ByteV2PageLayoutV5()
+if probe == "overflow":
+    byte_cache[raw_page, layout.outlier_pool_overflow_offset] = 1
+elif probe == "fallback":
+    for kv_head in range(layout.num_kv_heads):
+        byte_cache[
+            raw_page,
+            layout.k_fallback_mask_offset(kv_head=kv_head),
+        ] = 1
+        byte_cache[
+            raw_page,
+            layout.v_fallback_mask_offset(kv_head=kv_head),
+        ] = 1
+elif probe == "poison":
+    byte_cache[raw_page].zero_()
+else:
+    raise ValueError(f"unknown hybrid probe: {probe}")
+
+result = compare_hybrid_byte_v2_and_raw(
+    tensors,
+    query_len=1,
+    iterations=1,
+    num_splits=1,
+)
+assert result["out_mismatch"] == 0, result
+assert result["lse_mismatch"] == 0, result
+assert result["out_max_abs"] == 0.0, result
+assert result["lse_max_abs"] == 0.0, result
+print({"hybrid_recovery_ok": probe}, flush=True)
+"""
+    repo_root = Path(__file__).resolve().parents[3]
+    return subprocess.run(
+        [sys.executable, "-c", probe_source, probe],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("probe", ["overflow", "fallback", "poison"])
+def test_byte_v2_hybrid_fa2_raw_page_recovers_in_subprocess(probe):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+
+    from scripts.byte_v2_fa2_oracle import hybrid_fa2_oracle_ops_are_available
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    completed = _run_byte_v2_hybrid_fa2_subprocess(probe)
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined_output
+    assert f"'hybrid_recovery_ok': '{probe}'" in combined_output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_hybrid_fa2_invalid_raw_slot_fails_closed_in_subprocess():
+    if not _has_torch_op("_C_cache_ops", "byte_v2_reshape_and_cache"):
+        pytest.skip("ByteV2 cache custom op is not registered")
+
+    from scripts.byte_v2_fa2_oracle import hybrid_fa2_oracle_ops_are_available
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    probe = "invalid-high-slot"
+    completed = _run_byte_v2_hybrid_fa2_subprocess(probe)
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, combined_output
+    assert "hybrid_invalid_map_probe" in combined_output
+    assert "hybrid_invalid_map_unexpected_success" not in combined_output
+
+
+_BYTE_V2_HYBRID_WRITER_OPS = (
+    "byte_v2_prepare_raw_staging",
+    "byte_v2_hydrate_raw_staging_from_hybrid_cache",
+    "byte_v2_append_raw_staging",
+    "byte_v2_commit_raw_staging_to_hybrid_cache",
+    "byte_v2_reset_raw_fallback_pages",
+    "byte_v2_release_raw_staging",
+)
+
+
+def _byte_v2_hybrid_writer_ops_are_available() -> bool:
+    return all(
+        _has_torch_op("_C_cache_ops", op_name) for op_name in _BYTE_V2_HYBRID_WRITER_OPS
+    )
+
+
+def _make_byte_v2_hybrid_writer_case(
+    *,
+    seq_len: int = 16,
+    force_outliers: bool = False,
+    force_pool_overflow: bool = False,
+    raw_pool_slots: int = 1,
+):
+    from scripts.byte_v2_fa2_oracle import make_inputs
+
+    tensors = make_inputs((seq_len,), query_len=1, force_outliers=force_outliers)
+    raw_key = tensors["key"]
+    raw_value = tensors["value"]
+    byte_cache = tensors["byte_cache"]
+    assert isinstance(raw_key, torch.Tensor)
+    assert isinstance(raw_value, torch.Tensor)
+    assert isinstance(byte_cache, torch.Tensor)
+
+    if force_pool_overflow:
+        bit_indices = torch.arange(
+            raw_key.numel(),
+            dtype=torch.int32,
+            device=raw_key.device,
+        )
+        # Sixteen adjacent BF16 high-byte bins overflow the shared outlier
+        # pool while keeping every value finite and at most roughly 2.0.
+        high7 = (bit_indices % 16) + 48
+        lows = bit_indices % 251
+        forced_key = ((high7 << 8) | lows).to(torch.int16).view(torch.bfloat16)
+        forced_value = (
+            (((((bit_indices + 5) % 16) + 48) << 8) | ((lows + 17) % 251))
+            .to(torch.int16)
+            .view(torch.bfloat16)
+        )
+        raw_key.copy_(forced_key.reshape_as(raw_key))
+        raw_value.copy_(forced_value.reshape_as(raw_value))
+
+    byte_cache.zero_()
+    layout = ByteV2RawStagingLayout()
+    num_pages = byte_cache.size(0)
+    persistent_raw_staging = torch.zeros(
+        (raw_pool_slots, layout.slot_size_bytes),
+        dtype=torch.uint8,
+        device=byte_cache.device,
+    )
+    page_to_raw_slot = torch.full(
+        (num_pages,),
+        -1,
+        dtype=torch.int32,
+        device=byte_cache.device,
+    )
+    tensors["raw_staging"] = persistent_raw_staging
+    tensors["page_to_raw_slot"] = page_to_raw_slot
+    state = SimpleNamespace(
+        transient_raw_staging=torch.zeros(
+            (num_pages, layout.slot_size_bytes),
+            dtype=torch.uint8,
+            device=byte_cache.device,
+        ),
+        block_to_staging_slot=torch.full(
+            (num_pages,), -1, dtype=torch.int32, device=byte_cache.device
+        ),
+        staging_to_physical_block=torch.full(
+            (num_pages,), -1, dtype=torch.int32, device=byte_cache.device
+        ),
+        valid_rows=torch.zeros(
+            (num_pages,), dtype=torch.int32, device=byte_cache.device
+        ),
+        next_staging_slot=torch.zeros(
+            (1,), dtype=torch.int32, device=byte_cache.device
+        ),
+        staging_overflow=torch.zeros((1,), dtype=torch.int32, device=byte_cache.device),
+        free_raw_slots=torch.arange(
+            raw_pool_slots - 1,
+            -1,
+            -1,
+            dtype=torch.int32,
+            device=byte_cache.device,
+        ),
+        free_raw_slot_count=torch.full(
+            (1,), raw_pool_slots, dtype=torch.int32, device=byte_cache.device
+        ),
+        raw_pool_overflow=torch.zeros(
+            (1,), dtype=torch.int32, device=byte_cache.device
+        ),
+    )
+    slot_mapping = torch.arange(seq_len, dtype=torch.int64, device=byte_cache.device)
+    return tensors, state, slot_mapping
+
+
+def _byte_v2_hybrid_writer_update(
+    tensors,
+    state,
+    slot_mapping: torch.Tensor,
+    *,
+    before_commit=None,
+) -> None:
+    raw_key = tensors["key"]
+    raw_value = tensors["value"]
+    byte_cache = tensors["byte_cache"]
+    persistent_raw_staging = tensors["raw_staging"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(raw_key, torch.Tensor)
+    assert isinstance(raw_value, torch.Tensor)
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(persistent_raw_staging, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+
+    key = raw_key.view(-1, 8, 128).index_select(0, slot_mapping)
+    value = raw_value.view(-1, 8, 128).index_select(0, slot_mapping)
+    ops = torch.ops._C_cache_ops
+    ops.byte_v2_prepare_raw_staging(
+        slot_mapping,
+        state.block_to_staging_slot,
+        state.staging_to_physical_block,
+        state.valid_rows,
+        state.next_staging_slot,
+        state.staging_overflow,
+        16,
+    )
+    ops.byte_v2_hydrate_raw_staging_from_hybrid_cache(
+        state.transient_raw_staging,
+        byte_cache,
+        persistent_raw_staging,
+        page_to_raw_slot,
+        state.staging_to_physical_block,
+        state.valid_rows,
+        16,
+        16,
+        16,
+    )
+    ops.byte_v2_append_raw_staging(
+        key,
+        value,
+        state.transient_raw_staging,
+        slot_mapping,
+        state.block_to_staging_slot,
+        16,
+        16,
+        16,
+    )
+    if before_commit is not None:
+        before_commit()
+    ops.byte_v2_commit_raw_staging_to_hybrid_cache(
+        state.transient_raw_staging,
+        byte_cache,
+        persistent_raw_staging,
+        page_to_raw_slot,
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        state.raw_pool_overflow,
+        state.staging_to_physical_block,
+        state.valid_rows,
+        16,
+        16,
+        16,
+    )
+    ops.byte_v2_release_raw_staging(
+        state.block_to_staging_slot,
+        state.staging_to_physical_block,
+        state.valid_rows,
+        state.next_staging_slot,
+        state.staging_overflow,
+    )
+
+
+def _byte_v2_hybrid_writer_reset(tensors, state, physical_block_ids) -> None:
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    torch.ops._C_cache_ops.byte_v2_reset_raw_fallback_pages(
+        page_to_raw_slot,
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        state.raw_pool_overflow,
+        physical_block_ids,
+    )
+
+
+def _assert_byte_v2_hybrid_writer_matches_raw(tensors) -> None:
+    from scripts.byte_v2_fa2_oracle import compare_hybrid_byte_v2_and_raw
+
+    result = compare_hybrid_byte_v2_and_raw(
+        tensors,
+        query_len=1,
+        iterations=1,
+        num_splits=1,
+    )
+    assert result["out_mismatch"] == 0, result
+    assert result["lse_mismatch"] == 0, result
+    assert result["out_max_abs"] == 0.0, result
+    assert result["lse_max_abs"] == 0.0, result
+
+
+def _require_byte_v2_hybrid_writer_reader_ops() -> None:
+    if not _byte_v2_hybrid_writer_ops_are_available():
+        pytest.skip("ByteV2 hybrid writer custom ops are not registered")
+
+    from scripts.byte_v2_fa2_oracle import hybrid_fa2_oracle_ops_are_available
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_hybrid_writer_ordinary_outliers_remain_compact_bitwise():
+    _require_byte_v2_hybrid_writer_reader_ops()
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(force_outliers=True)
+
+    _byte_v2_hybrid_writer_update(tensors, state, slot_mapping)
+    torch.accelerator.synchronize()
+
+    byte_cache = tensors["byte_cache"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    cache = byte_cache.cpu()
+    layout = ByteV2PageLayoutV5()
+    stats = collect_byte_v2_fallback_stats(cache, layout=layout)
+    assert stats.overlay_tiles > 0
+    assert stats.fallback_tiles == 0
+    assert _load_u32_bytes(cache, 0, layout.outlier_pool_overflow_offset) == 0
+    assert bool((page_to_raw_slot == -1).all())
+    assert int(state.free_raw_slot_count.cpu().item()) == 1
+    assert int(state.raw_pool_overflow.cpu().item()) == 0
+    _assert_byte_v2_hybrid_writer_matches_raw(tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_hybrid_writer_pool_overflow_publishes_raw_bitwise():
+    _require_byte_v2_hybrid_writer_reader_ops()
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        force_pool_overflow=True
+    )
+
+    _byte_v2_hybrid_writer_update(tensors, state, slot_mapping)
+    torch.accelerator.synchronize()
+
+    byte_cache = tensors["byte_cache"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    cache = byte_cache.cpu()
+    layout = ByteV2PageLayoutV5()
+    assert _load_u32_bytes(cache, 0, layout.outlier_pool_overflow_offset) != 0
+    assert int(page_to_raw_slot[0].cpu().item()) >= 0
+    assert int(state.free_raw_slot_count.cpu().item()) == 0
+    assert int(state.raw_pool_overflow.cpu().item()) == 0
+    _assert_byte_v2_hybrid_writer_matches_raw(tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_hybrid_writer_updates_existing_raw_page_bitwise():
+    _require_byte_v2_hybrid_writer_reader_ops()
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        force_pool_overflow=True
+    )
+
+    _byte_v2_hybrid_writer_update(tensors, state, slot_mapping[:15])
+    torch.accelerator.synchronize()
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    byte_cache = tensors["byte_cache"]
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    assert isinstance(byte_cache, torch.Tensor)
+    raw_slot = int(page_to_raw_slot[0].cpu().item())
+    assert raw_slot >= 0
+
+    # Make the compact page unusable so the next hydrate must follow the raw map.
+    byte_cache[0].zero_()
+    _byte_v2_hybrid_writer_update(tensors, state, slot_mapping[15:])
+    torch.accelerator.synchronize()
+
+    assert int(page_to_raw_slot[0].cpu().item()) == raw_slot
+    assert int(state.free_raw_slot_count.cpu().item()) == 0
+    assert int(state.raw_pool_overflow.cpu().item()) == 0
+    persistent_raw = tensors["raw_staging"]
+    raw_key = tensors["key"]
+    raw_value = tensors["value"]
+    assert isinstance(persistent_raw, torch.Tensor)
+    assert isinstance(raw_key, torch.Tensor)
+    assert isinstance(raw_value, torch.Tensor)
+    persistent_bf16 = persistent_raw.view(torch.bfloat16).reshape(-1, 2, 8, 16, 128)
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 0].permute(1, 0, 2),
+        raw_key[0],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 1].permute(1, 0, 2),
+        raw_value[0],
+        atol=0,
+        rtol=0,
+    )
+    _assert_byte_v2_hybrid_writer_matches_raw(tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_hybrid_writer_duplicate_reset_reuses_slot_without_leak():
+    if not _byte_v2_hybrid_writer_ops_are_available():
+        pytest.skip("ByteV2 hybrid writer custom ops are not registered")
+
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        seq_len=32,
+        force_pool_overflow=True,
+        raw_pool_slots=1,
+    )
+    byte_cache = tensors["byte_cache"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+
+    for physical_page in (0, 1, 0, 1):
+        byte_cache[physical_page].zero_()
+        page_slots = slot_mapping[physical_page * 16 : (physical_page + 1) * 16]
+        _byte_v2_hybrid_writer_update(tensors, state, page_slots)
+        torch.accelerator.synchronize()
+        assert int(page_to_raw_slot[physical_page].cpu().item()) == 0
+        assert int(state.free_raw_slot_count.cpu().item()) == 0
+        assert int(state.raw_pool_overflow.cpu().item()) == 0
+
+        duplicate_ids = torch.tensor(
+            [physical_page, physical_page],
+            dtype=torch.int32,
+            device=byte_cache.device,
+        )
+        _byte_v2_hybrid_writer_reset(tensors, state, duplicate_ids)
+        torch.accelerator.synchronize()
+        assert bool((page_to_raw_slot == -1).all())
+        assert int(state.free_raw_slot_count.cpu().item()) == 1
+        assert int(state.free_raw_slots[0].cpu().item()) == 0
+        assert int(state.raw_pool_overflow.cpu().item()) == 0
+
+
+def _byte_v2_hybrid_writer_pool_exhaustion_probe() -> None:
+    assert _byte_v2_hybrid_writer_ops_are_available()
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        seq_len=32,
+        force_pool_overflow=True,
+        raw_pool_slots=1,
+    )
+    _byte_v2_hybrid_writer_update(tensors, state, slot_mapping[:16])
+    torch.accelerator.synchronize()
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    assert int(page_to_raw_slot[0].cpu().item()) == 0
+    assert int(state.free_raw_slot_count.cpu().item()) == 0
+
+    def announce_commit() -> None:
+        torch.accelerator.synchronize()
+        print({"hybrid_raw_pool_exhaustion_probe": "commit"}, flush=True)
+
+    _byte_v2_hybrid_writer_update(
+        tensors,
+        state,
+        slot_mapping[16:],
+        before_commit=announce_commit,
+    )
+    torch.accelerator.synchronize()
+    print({"hybrid_raw_pool_exhaustion_unexpected_success": True}, flush=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_hybrid_writer_raw_pool_exhaustion_fails_closed_subprocess():
+    if not _byte_v2_hybrid_writer_ops_are_available():
+        pytest.skip("ByteV2 hybrid writer custom ops are not registered")
+
+    probe_source = r"""
+import runpy
+import sys
+
+namespace = runpy.run_path(sys.argv[1])
+namespace["_byte_v2_hybrid_writer_pool_exhaustion_probe"]()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", probe_source, str(Path(__file__).resolve())],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, combined_output
+    assert "hybrid_raw_pool_exhaustion_probe" in combined_output
+    assert "hybrid_raw_pool_exhaustion_unexpected_success" not in combined_output
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

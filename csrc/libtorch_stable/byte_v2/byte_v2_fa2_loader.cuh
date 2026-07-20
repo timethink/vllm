@@ -15,6 +15,7 @@ namespace vllm::byte_v2::fa2 {
 
 using Layout = ByteV2PageLayoutV5<>;
 using Policy = Layout::TilePolicy;
+using RawLayout = ByteV2RawStagingLayout<Policy, Layout::NumKvHeadsValue>;
 
 static_assert(Policy::CodecTokenBlock == 16);
 static_assert(Policy::CodecDimBlock == 16);
@@ -26,6 +27,8 @@ static_assert(Layout::CodecExponentCodeBits == 4);
 static_assert(!Layout::IncludeRawPayloadValue);
 static_assert(Layout::OutlierEntriesPerTileValue <= 0x1ff);
 static_assert(Layout::OutlierPoolEntriesValue <= 0x7ff);
+static_assert(RawLayout::SlotSizeBytes == 65536);
+static_assert(RawLayout::ValueBaseBytes == 32768);
 
 #ifndef VLLM_BYTE_V2_FA2_STAGE_MODE
   #define VLLM_BYTE_V2_FA2_STAGE_MODE 2
@@ -121,11 +124,85 @@ __device__ __forceinline__ uint4 decode_bf16x8(uint64_t lows, uint32_t codes,
           __byte_perm(lows_4567, highs_4567, kInterleaveHigh)};
 }
 
+// The persistent raw sidecar uses the existing ByteV2 staging layout:
+// [K/V, kv_head, row, dim].  Each FA2 copy thread owns sixteen aligned BF16
+// values for eight rows, so it can populate the final shared-memory tile with
+// the same 16-byte transactions as raw paged FA2.  Returning true tells the
+// post-copy decoder that this thread's page is already materialized BF16.
+template <typename DstTensor>
+__device__ __forceinline__ bool stage_raw_page_to_fa2_smem(
+    const uint8_t* raw_side_base, int num_raw_slots,
+    const int* page_to_raw_slot, int physical_page, int kv_head, int row0,
+    int valid_rows, DstTensor& dst) {
+  if (page_to_raw_slot == nullptr) {
+    return false;
+  }
+  const int raw_slot = page_to_raw_slot[physical_page];
+  if (raw_slot == -1) {
+    return false;
+  }
+  if (raw_side_base == nullptr || raw_slot < 0 || raw_slot >= num_raw_slots ||
+      reinterpret_cast<uintptr_t>(raw_side_base) % alignof(uint4) != 0) {
+    __trap();
+  }
+
+  constexpr int kElementsPerVector = 8;
+  constexpr int kRowsPerThread = 8;
+  constexpr int kDimVectorsPerThread = 2;
+  const int tidx = static_cast<int>(threadIdx.x);
+  const int row_in_page0 = kRowsPerThread * ((tidx >> 3) & 1);
+  const int dim_in_tile0 = kElementsPerVector * (tidx & 1);
+  const uint8_t* raw_slot_base =
+      raw_side_base + static_cast<int64_t>(raw_slot) * RawLayout::SlotSizeBytes;
+
+#pragma unroll 1
+  for (int k = 0; k < kDimVectorsPerThread; ++k) {
+    const int dim_tile = 4 * k + ((tidx & 7) >> 1);
+    const int dim0 = dim_tile * Policy::CodecDimBlock + dim_in_tile0;
+#pragma unroll 1
+    for (int m = 0; m < kRowsPerThread; ++m) {
+      const int row = row_in_page0 + m;
+      const bool valid = row0 + m < valid_rows;
+      const int raw_offset =
+          ((kv_head * Policy::AllocBlockTokens + row) * Policy::HeadDim +
+           dim0) *
+          RawLayout::RawElementBytesValue;
+      cute::SM80_CP_ASYNC_CACHEALWAYS_ZFILL<uint4>::copy(
+          *reinterpret_cast<const uint4*>(raw_slot_base + raw_offset),
+          *reinterpret_cast<uint4*>(&dst(0, m, k)), valid);
+    }
+  }
+  return true;
+}
+
+__device__ __forceinline__ bool thread_page_is_raw(int num_pages,
+                                                   int num_raw_slots,
+                                                   const int* page_to_raw_slot,
+                                                   const int* block_table,
+                                                   int n_block, int block_n) {
+  if (page_to_raw_slot == nullptr) {
+    return false;
+  }
+  const int logical_page =
+      n_block * (block_n / Policy::AllocBlockTokens) +
+      static_cast<int>(threadIdx.x) / Policy::CodecDimBlock;
+  const int physical_page = block_table[logical_page];
+  if (physical_page < 0 || physical_page >= num_pages) {
+    __trap();
+  }
+  const int raw_slot = page_to_raw_slot[physical_page];
+  if (raw_slot < -1 || raw_slot >= num_raw_slots) {
+    __trap();
+  }
+  return raw_slot >= 0;
+}
+
 template <bool IsValue, typename DstTensor, typename CoordTensor>
 __device__ __forceinline__ void stage_tile_to_fa2_smem_scalar(
-    const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int num_pages,
-    const int* block_table, int kv_head, int n_block, int block_n,
-    int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const uint8_t* byte_v2_cache, const uint8_t* raw_side_base,
+    const int* page_to_raw_slot, int64_t page_stride_bytes, int num_pages,
+    int num_raw_slots, const int* block_table, int kv_head, int n_block,
+    int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
   constexpr int kElementsPerVector = 8;
   constexpr int kRowsPerThread = 8;
   constexpr int kDimVectorsPerThread = 2;
@@ -162,6 +239,11 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_scalar(
   const int physical_page = block_table[logical_page];
   if (physical_page < 0 || physical_page >= num_pages) {
     __trap();
+  }
+  if (stage_raw_page_to_fa2_smem(raw_side_base, num_raw_slots, page_to_raw_slot,
+                                 physical_page, kv_head, row0, valid_rows,
+                                 dst)) {
+    return;
   }
   const uint8_t* page =
       byte_v2_cache + static_cast<int64_t>(physical_page) * page_stride_bytes;
@@ -255,8 +337,10 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_scalar(
 
 template <typename DstTensor, typename CoordTensor>
 __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_scalar(
-    const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int valid_rows,
-    DstTensor& dst, const CoordTensor& coords) {
+    const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int num_pages,
+    int num_raw_slots, const int* page_to_raw_slot, const int* block_table,
+    int n_block, int block_n, int valid_rows, DstTensor& dst,
+    const CoordTensor& coords) {
   constexpr int kElementsPerVector = 8;
   constexpr int kRowsPerThread = 8;
   constexpr int kDimVectorsPerThread = 2;
@@ -278,6 +362,10 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_scalar(
         *reinterpret_cast<uint4*>(&dst(0, m, k)) = zero;
       }
     }
+    return;
+  }
+  if (thread_page_is_raw(num_pages, num_raw_slots, page_to_raw_slot,
+                         block_table, n_block, block_n)) {
     return;
   }
 
@@ -357,9 +445,10 @@ __device__ __forceinline__ uint8_t* paired_vector_slot(DstTensor& dst, int m,
 
 template <bool IsValue, typename DstTensor, typename CoordTensor>
 __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
-    const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int num_pages,
-    const int* block_table, int kv_head, int n_block, int block_n,
-    int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const uint8_t* byte_v2_cache, const uint8_t* raw_side_base,
+    const int* page_to_raw_slot, int64_t page_stride_bytes, int num_pages,
+    int num_raw_slots, const int* block_table, int kv_head, int n_block,
+    int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
   constexpr int kRowsPerThread = 8;
 
   CUTE_STATIC_ASSERT_V(cute::size<0>(dst) == cute::Int<8>{});
@@ -394,6 +483,11 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
   const int physical_page = block_table[logical_page];
   if (physical_page < 0 || physical_page >= num_pages) {
     __trap();
+  }
+  if (stage_raw_page_to_fa2_smem(raw_side_base, num_raw_slots, page_to_raw_slot,
+                                 physical_page, kv_head, row0, valid_rows,
+                                 dst)) {
+    return;
   }
   const uint8_t* page =
       byte_v2_cache + static_cast<int64_t>(physical_page) * page_stride_bytes;
@@ -522,8 +616,10 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
 
 template <typename DstTensor, typename CoordTensor>
 __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
-    const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int valid_rows,
-    DstTensor& dst, const CoordTensor& coords) {
+    const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int num_pages,
+    int num_raw_slots, const int* page_to_raw_slot, const int* block_table,
+    int n_block, int block_n, int valid_rows, DstTensor& dst,
+    const CoordTensor& coords) {
   constexpr int kElementsPerVector = 8;
   constexpr int kRowsPerThread = 8;
   CUTE_STATIC_ASSERT_V(cute::size<0>(dst) == cute::Int<8>{});
@@ -547,6 +643,10 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
       *own_slot = zero;
       *partner_slot = zero;
     }
+    return;
+  }
+  if (thread_page_is_raw(num_pages, num_raw_slots, page_to_raw_slot,
+                         block_table, n_block, block_n)) {
     return;
   }
 
@@ -670,32 +770,52 @@ struct Loader {
   static constexpr int Threads = 128;
   static constexpr bool ReuseKvSmem = kReuseKvSmem;
 
-  template <bool IsValue, typename DstTensor, typename CoordTensor>
+  template <bool IsValue, typename Params, typename DstTensor,
+            typename CoordTensor>
   __device__ static __forceinline__ void stage_tile_to_fa2_smem(
-      const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int num_pages,
-      const int* block_table, int kv_head, int n_block, int block_n,
-      int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+      const Params& params, const int* block_table, int kv_head, int n_block,
+      int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* byte_v2_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* raw_slot_base =
+        reinterpret_cast<const uint8_t*>(IsValue ? params.v_ptr : params.k_ptr);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
     if constexpr (kStageMode == 0) {
       fa2::stage_tile_to_fa2_smem_scalar<IsValue>(
-          byte_v2_cache, page_stride_bytes, num_pages, block_table, kv_head,
-          n_block, block_n, valid_rows, dst, coords);
+          byte_v2_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
     } else {
       fa2::stage_tile_to_fa2_smem_paired_16<IsValue>(
-          byte_v2_cache, page_stride_bytes, num_pages, block_table, kv_head,
-          n_block, block_n, valid_rows, dst, coords);
+          byte_v2_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
     }
   }
 
-  template <typename DstTensor, typename CoordTensor>
+  template <typename Params, typename DstTensor, typename CoordTensor>
   __device__ static __forceinline__ void decode_staged_tile_to_fa2_smem(
-      const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int valid_rows,
-      DstTensor& dst, const CoordTensor& coords) {
+      const Params& params, const int* block_table, int n_block, int block_n,
+      int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* byte_v2_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
     if constexpr (kStageMode == 0) {
       fa2::decode_staged_tile_to_fa2_smem_scalar(
-          byte_v2_cache, page_stride_bytes, valid_rows, dst, coords);
+          byte_v2_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
     } else {
       fa2::decode_staged_tile_to_fa2_smem_paired_16(
-          byte_v2_cache, page_stride_bytes, valid_rows, dst, coords);
+          byte_v2_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
     }
   }
 };

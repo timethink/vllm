@@ -14,6 +14,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+_BYTE_V2_PROFILE_OP_NAMES = (
+    "byte_v2_prepare_raw_staging",
+    "byte_v2_hydrate_raw_staging_from_cache",
+    "byte_v2_hydrate_raw_staging_from_hybrid_cache",
+    "byte_v2_append_raw_staging",
+    "byte_v2_commit_raw_staging_to_cache",
+    "byte_v2_commit_raw_staging_to_hybrid_cache",
+    "byte_v2_release_raw_staging",
+    "byte_v2_reshape_and_cache",
+    "byte_v2_reshape_and_cache_sideband_high",
+    "byte_v2_update_cache_single_token",
+    "byte_v2_update_cache_unsafe_flags",
+    "byte_v2_collect_cache_stats",
+    "byte_v2_prefill_attention",
+    "byte_v2_paged_decode_attention",
+    "byte_v2_paged_decode_attention_split_k",
+    "byte_v2_paged_decode_attention_split_k_guarded",
+    "byte_v2_fa2_hybrid_paged_decode_attention",
+    "byte_v2_reset_raw_fallback_pages",
+)
+
 
 def _prepend_venv_bin_to_path() -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -70,6 +91,14 @@ def parse_args() -> argparse.Namespace:
         help="Optional path for machine-readable first/cached profile rows.",
     )
     parser.add_argument(
+        "--collect-hybrid-state",
+        action="store_true",
+        help=(
+            "Collect per-layer persistent raw-fallback state after all timed "
+            "generation work has finished."
+        ),
+    )
+    parser.add_argument(
         "--no-enforce-eager",
         action="store_false",
         dest="enforce_eager",
@@ -119,22 +148,6 @@ def _install_byte_v2_timers():
 
     stats: dict[str, OpStats] = defaultdict(OpStats)
     originals = {}
-    names = (
-        "byte_v2_prepare_raw_staging",
-        "byte_v2_hydrate_raw_staging_from_cache",
-        "byte_v2_append_raw_staging",
-        "byte_v2_commit_raw_staging_to_cache",
-        "byte_v2_release_raw_staging",
-        "byte_v2_reshape_and_cache",
-        "byte_v2_reshape_and_cache_sideband_high",
-        "byte_v2_update_cache_single_token",
-        "byte_v2_update_cache_unsafe_flags",
-        "byte_v2_collect_cache_stats",
-        "byte_v2_prefill_attention",
-        "byte_v2_paged_decode_attention",
-        "byte_v2_paged_decode_attention_split_k",
-        "byte_v2_paged_decode_attention_split_k_guarded",
-    )
 
     def make_wrapper(name: str, fn):
         def wrapper(*args, **kwargs):
@@ -156,7 +169,7 @@ def _install_byte_v2_timers():
 
         return wrapper
 
-    for name in names:
+    for name in _BYTE_V2_PROFILE_OP_NAMES:
         if hasattr(byte_v2_attn, name):
             fn = getattr(byte_v2_attn, name)
             originals[name] = fn
@@ -250,6 +263,84 @@ def _write_profile_jsonl(path: str, rows: list[dict[str, Any]]) -> None:
     with output_path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
+    """Collect ByteV2 raw-sidecar state without allocating or mutating it."""
+    engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(engine, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    static_forward_context = getattr(compilation_config, "static_forward_context", {})
+
+    layers = []
+    initialized = []
+    for layer_name, module in sorted(static_forward_context.items()):
+        impl = getattr(module, "impl", None)
+        if impl is None or not hasattr(impl, "raw_fallback_store"):
+            continue
+        store = impl.raw_fallback_store
+        state = getattr(store, "current_state", None) if store is not None else None
+        layer = {
+            "name": layer_name,
+            "store_enabled": store is not None,
+            "initialized": state is not None,
+            "raw_page_count": None,
+            "free_count": None,
+            "slot_count": None,
+            "fatal": None,
+        }
+        layers.append(layer)
+        if state is not None:
+            initialized.append((layer, state))
+
+    if initialized:
+        import torch
+
+        counters = torch.stack(
+            [
+                torch.stack(
+                    (
+                        state.page_to_raw_slot.ge(0).sum(dtype=torch.int64),
+                        state.free_count.reshape(-1)[0].to(dtype=torch.int64),
+                        state.fatal.reshape(-1)[0].to(dtype=torch.int64),
+                    )
+                )
+                for _, state in initialized
+            ]
+        )
+        counter_rows = counters.detach().cpu().tolist()
+        for (layer, state), (raw_page_count, free_count, fatal) in zip(
+            initialized, counter_rows
+        ):
+            layer["raw_page_count"] = int(raw_page_count)
+            layer["free_count"] = int(free_count)
+            layer["slot_count"] = int(state.raw_pages.shape[0])
+            layer["fatal"] = int(fatal)
+
+    enabled_layer_count = sum(layer["store_enabled"] for layer in layers)
+    fully_initialized = (
+        enabled_layer_count > 0 and len(initialized) == enabled_layer_count
+    )
+    if fully_initialized:
+        raw_page_count = sum(layer["raw_page_count"] for layer in layers)
+        free_count = sum(layer["free_count"] for layer in layers)
+        slot_count = sum(layer["slot_count"] for layer in layers)
+        fatal = max(layer["fatal"] for layer in layers)
+    else:
+        raw_page_count = free_count = slot_count = fatal = None
+
+    return {
+        "enabled": enabled_layer_count > 0,
+        "layer_count": len(layers),
+        "enabled_layer_count": enabled_layer_count,
+        "initialized_layer_count": len(initialized),
+        "fully_initialized": fully_initialized,
+        "raw_page_count": raw_page_count,
+        "free_count": free_count,
+        "slot_count": slot_count,
+        "fatal": fatal,
+        "layers": layers,
+    }
 
 
 def _make_prompt_token_ids(model: str, prompt_len: int) -> list[int]:
@@ -367,6 +458,11 @@ def main() -> None:
             "profile_cached": args.profile_cached,
             "profiles": profile_results,
             "token_ids": token_ids_by_output,
+            "hybrid_raw_fallback_state": (
+                _collect_hybrid_raw_fallback_state(llm)
+                if args.collect_hybrid_state
+                else None
+            ),
         }
         if args.output_jsonl is not None:
             _write_profile_jsonl(args.output_jsonl, [result])

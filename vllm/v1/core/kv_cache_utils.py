@@ -20,6 +20,8 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    BYTE_V2_DEFAULT_RAW_STAGING_SLOTS,
+    ByteV2FullAttentionSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -32,6 +34,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    byte_v2_hybrid_raw_fallback_enabled,
+    byte_v2_raw_staging_slots,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -82,6 +86,198 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 
 logger = init_logger(__name__)
+
+_BYTE_V2_RAW_FALLBACK_SLOTS_ENV = "BYTE_V2_FA2_RAW_FALLBACK_SLOTS"
+_BYTE_V2_RAW_PAGE_BYTES = 65_536
+_BYTE_V2_INT32_BYTES = 4
+_BYTE_V2_RAW_SIDECAR_FIXED_BYTES = 8
+_BYTE_V2_RAW_STAGING_FIXED_BYTES = 8
+
+
+def _byte_v2_raw_fallback_slots_override() -> int | None:
+    value = os.environ.get(_BYTE_V2_RAW_FALLBACK_SLOTS_ENV)
+    if value is None:
+        return None
+    try:
+        slots = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", _BYTE_V2_RAW_FALLBACK_SLOTS_ENV, value)
+        return None
+    if slots <= 0:
+        logger.warning(
+            "Ignoring non-positive %s=%r", _BYTE_V2_RAW_FALLBACK_SLOTS_ENV, value
+        )
+        return None
+    return slots
+
+
+def get_byte_v2_raw_fallback_slots(
+    num_blocks: int, explicit_slots: int | None = None
+) -> int:
+    """Return persistent raw fallback slots allocated per ByteV2 layer."""
+    if num_blocks < 0:
+        raise ValueError("num_blocks must be non-negative")
+    if explicit_slots is not None:
+        if explicit_slots <= 0:
+            raise ValueError("explicit_slots must be positive")
+        return explicit_slots
+    return max(1, num_blocks // 256)
+
+
+def get_byte_v2_raw_fallback_sidecar_bytes(
+    num_blocks: int,
+    num_byte_v2_layers: int,
+    explicit_slots: int | None = None,
+) -> int:
+    """Return persistent ByteV2 sidecar bytes for one worker.
+
+    Per actual ByteV2 layer, the runtime allocates an int32 page-to-slot map,
+    65,536-byte raw pages, an int32 free-slot stack, and two int32 counters.
+    This helper covers only persistent per-layer state. The total ByteV2
+    planner separately adds one runner-owned cross-layer staging workspace.
+    """
+    if num_byte_v2_layers < 0:
+        raise ValueError("num_byte_v2_layers must be non-negative")
+    if num_byte_v2_layers == 0:
+        return 0
+    raw_slots = get_byte_v2_raw_fallback_slots(num_blocks, explicit_slots)
+    bytes_per_layer = (
+        _BYTE_V2_INT32_BYTES * num_blocks
+        + (_BYTE_V2_RAW_PAGE_BYTES + _BYTE_V2_INT32_BYTES) * raw_slots
+        + _BYTE_V2_RAW_SIDECAR_FIXED_BYTES
+    )
+    return num_byte_v2_layers * bytes_per_layer
+
+
+def get_byte_v2_raw_staging_workspace_bytes(
+    num_blocks: int,
+    num_staging_slots: int,
+) -> int:
+    """Return bytes in one runner-owned cross-layer staging workspace."""
+    if num_blocks < 0:
+        raise ValueError("num_blocks must be non-negative")
+    if num_staging_slots <= 0:
+        raise ValueError("num_staging_slots must be positive")
+    return (
+        _BYTE_V2_RAW_PAGE_BYTES * num_staging_slots
+        + _BYTE_V2_INT32_BYTES * num_blocks
+        + 2 * _BYTE_V2_INT32_BYTES * num_staging_slots
+        + _BYTE_V2_RAW_STAGING_FIXED_BYTES
+    )
+
+
+def _get_num_byte_v2_layers(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Count actual ByteV2 layers represented by projected worker groups."""
+    num_layers = 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, ByteV2FullAttentionSpec):
+            num_layers += len(group.layer_names)
+        elif isinstance(spec, UniformTypeKVCacheSpecs):
+            num_layers += sum(
+                isinstance(spec.kv_cache_specs[layer_name], ByteV2FullAttentionSpec)
+                for layer_name in group.layer_names
+            )
+    return num_layers
+
+
+def _validate_byte_v2_hybrid_runtime_config(vllm_config: VllmConfig) -> None:
+    """Reject integrations that do not preserve ByteV2 sidecar state."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is not None and kv_transfer_config.kv_connector is not None:
+        raise ValueError(
+            "ByteV2 hybrid raw fallback does not support KV connectors or KV "
+            "cache offloading"
+        )
+    if vllm_config.cache_config.kv_offloading_size is not None:
+        raise ValueError(
+            "ByteV2 hybrid raw fallback does not support KV connectors or KV "
+            "cache offloading"
+        )
+    if vllm_config.model_config.enable_sleep_mode:
+        raise ValueError(
+            "ByteV2 hybrid raw fallback does not support sleep mode because "
+            "raw sidecar state is not discarded and restored with the KV cache"
+        )
+    parallel_config = vllm_config.parallel_config
+    if (
+        parallel_config.decode_context_parallel_size > 1
+        or parallel_config.prefill_context_parallel_size > 1
+    ):
+        raise ValueError("ByteV2 hybrid raw fallback does not support DCP or PCP")
+    if parallel_config.use_ubatching:
+        raise ValueError(
+            "ByteV2 hybrid raw fallback does not support ubatching or DBO "
+            "because its shared raw staging workspace is single-lane"
+        )
+
+
+def _get_byte_v2_total_cache_bytes(
+    num_blocks: int,
+    pool_bytes_per_block: int,
+    num_byte_v2_layers: int,
+    explicit_slots: int | None = None,
+    raw_staging_slots: int = BYTE_V2_DEFAULT_RAW_STAGING_SLOTS,
+) -> int:
+    """Return compact KV, persistent sidecars, and one shared workspace."""
+    return (
+        pool_bytes_per_block * num_blocks
+        + get_byte_v2_raw_fallback_sidecar_bytes(
+            num_blocks,
+            num_byte_v2_layers,
+            explicit_slots,
+        )
+        + get_byte_v2_raw_staging_workspace_bytes(
+            num_blocks,
+            raw_staging_slots,
+        )
+    )
+
+
+def _get_max_num_blocks_with_byte_v2_sidecar(
+    available_memory: int,
+    pool_bytes_per_block: int,
+    num_byte_v2_layers: int,
+    explicit_slots: int | None = None,
+    raw_staging_slots: int = BYTE_V2_DEFAULT_RAW_STAGING_SLOTS,
+) -> int:
+    """Find the largest block count whose full ByteV2 allocation fits."""
+    if pool_bytes_per_block <= 0:
+        raise ValueError("pool_bytes_per_block must be positive")
+    if num_byte_v2_layers <= 0:
+        raise ValueError("num_byte_v2_layers must be positive")
+
+    minimum_bytes = _get_byte_v2_total_cache_bytes(
+        0,
+        pool_bytes_per_block,
+        num_byte_v2_layers,
+        explicit_slots,
+        raw_staging_slots,
+    )
+    if minimum_bytes > available_memory:
+        raise ValueError(
+            "ByteV2 hybrid raw fallback allocation requires at least "
+            f"{minimum_bytes} bytes, but only {available_memory} bytes were "
+            "profiled as available for the KV cache"
+        )
+
+    low = 0
+    high = max(available_memory // pool_bytes_per_block, 0)
+    while low < high:
+        mid = (low + high + 1) // 2
+        required = _get_byte_v2_total_cache_bytes(
+            mid,
+            pool_bytes_per_block,
+            num_byte_v2_layers,
+            explicit_slots,
+            raw_staging_slots,
+        )
+        if required <= available_memory:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
 
 # The hash seed for the first block of any prefix block sequence.
 #
@@ -1707,6 +1903,12 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    # Preserve worker 0's groups and block namespace, but promote the global
+    # ByteV2 reset requirement. A PP stage without ByteV2 layers can otherwise
+    # suppress reset notifications needed by a later stage with a sidecar.
+    cfg.byte_v2_raw_fallback_slots = max(
+        worker_cfg.byte_v2_raw_fallback_slots for worker_cfg in kv_cache_configs
+    )
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2018,16 +2220,38 @@ def get_kv_cache_configs(
         for worker_spec in kv_cache_specs
     ]
 
+    # Keep the profiled budget separate from the compact-pool capacity passed
+    # to the existing admission and tensor-layout helpers. The distinction is
+    # required when ByteV2 persistent sidecars consume part of that budget.
+    profiled_available_memory = list(available_memory)
+    byte_v2_raw_fallback_enabled = byte_v2_hybrid_raw_fallback_enabled()
+    byte_v2_hybrid_active = byte_v2_raw_fallback_enabled and any(
+        _get_num_byte_v2_layers(groups) > 0 for groups in projected_groups_per_worker
+    )
+    if byte_v2_hybrid_active:
+        _validate_byte_v2_hybrid_runtime_config(vllm_config)
+    raw_slots_override = (
+        _byte_v2_raw_fallback_slots_override() if byte_v2_hybrid_active else None
+    )
+    raw_staging_slots = (
+        byte_v2_raw_staging_slots()
+        if byte_v2_hybrid_active
+        else BYTE_V2_DEFAULT_RAW_STAGING_SLOTS
+    )
+    planned_compact_memory = list(available_memory)
+
     # If `num_gpu_blocks_override` is set, the cache size that will actually
     # be allocated is decoupled from the profiled `available_memory`:
     # `may_override_num_blocks` in `get_kv_cache_config_from_groups` clamps
-    # `num_blocks` to the override. Reflect that in `available_memory` here so
-    # auto-fit, the admission check, and the per-worker config builder all
-    # plan against the same effective capacity.
+    # `num_blocks` to the override. Use its compact capacity for auto-fit and
+    # admission, while retaining the original profiled budget for the ByteV2
+    # total-allocation check below.
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
         adjusted_memory: list[int] = []
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+        for worker_index, (groups, avail_mem) in enumerate(
+            zip(projected_groups_per_worker, profiled_available_memory)
+        ):
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
@@ -2037,16 +2261,53 @@ def get_kv_cache_configs(
                 avail_mem // bytes_per_block,
                 override,
             )
+            num_byte_v2_layers = _get_num_byte_v2_layers(groups)
+            if byte_v2_raw_fallback_enabled and num_byte_v2_layers > 0:
+                required_bytes = _get_byte_v2_total_cache_bytes(
+                    override,
+                    bytes_per_block,
+                    num_byte_v2_layers,
+                    raw_slots_override,
+                    raw_staging_slots,
+                )
+                if required_bytes > avail_mem:
+                    raise ValueError(
+                        "ByteV2 hybrid raw fallback cannot honor "
+                        f"num_gpu_blocks_override={override} on worker "
+                        f"{worker_index}: compact KV tensors, persistent "
+                        f"sidecars, and shared staging require {required_bytes} "
+                        "bytes, but only "
+                        f"{avail_mem} bytes were profiled as available"
+                    )
             adjusted_memory.append(override * bytes_per_block)
-        available_memory = adjusted_memory
+        planned_compact_memory = adjusted_memory
+    elif byte_v2_raw_fallback_enabled:
+        adjusted_memory = []
+        for groups, avail_mem in zip(
+            projected_groups_per_worker, profiled_available_memory
+        ):
+            num_byte_v2_layers = _get_num_byte_v2_layers(groups)
+            if num_byte_v2_layers == 0:
+                adjusted_memory.append(avail_mem)
+                continue
+            bytes_per_block = _pool_bytes_per_block(groups)
+            num_blocks = _get_max_num_blocks_with_byte_v2_sidecar(
+                avail_mem,
+                bytes_per_block,
+                num_byte_v2_layers,
+                raw_slots_override,
+                raw_staging_slots,
+            )
+            adjusted_memory.append(num_blocks * bytes_per_block)
+        planned_compact_memory = adjusted_memory
 
     if vllm_config.model_config.original_max_model_len == -1:
         _auto_fit_max_model_len(
-            vllm_config, projected_groups_per_worker, available_memory
+            vllm_config, projected_groups_per_worker, planned_compact_memory
         )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    for groups, avail_mem in zip(projected_groups_per_worker, planned_compact_memory):
         if not groups:
             continue
         _check_enough_kv_cache_memory(
@@ -2058,7 +2319,7 @@ def get_kv_cache_configs(
 
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
+        projected_groups_per_worker, kv_cache_specs, planned_compact_memory
     ):
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker
@@ -2075,7 +2336,9 @@ def get_kv_cache_configs(
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
     )
-    for kv_cache_config in kv_cache_configs:
+    for worker_index, (kv_cache_config, profiled_memory) in enumerate(
+        zip(kv_cache_configs, profiled_available_memory)
+    ):
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
 
@@ -2083,6 +2346,37 @@ def get_kv_cache_configs(
         for tensor in kv_cache_config.kv_cache_tensors:
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
+
+        if byte_v2_raw_fallback_enabled and kv_cache_config.has_byte_v2_layers:
+            raw_slots = get_byte_v2_raw_fallback_slots(
+                min_num_blocks, raw_slots_override
+            )
+            sidecar_bytes = get_byte_v2_raw_fallback_sidecar_bytes(
+                min_num_blocks,
+                kv_cache_config.num_byte_v2_layers,
+                raw_slots_override,
+            )
+            staging_workspace_bytes = get_byte_v2_raw_staging_workspace_bytes(
+                min_num_blocks,
+                raw_staging_slots,
+            )
+            total_bytes = (
+                sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
+                + sidecar_bytes
+                + staging_workspace_bytes
+            )
+            if total_bytes > profiled_memory:
+                raise RuntimeError(
+                    "ByteV2 KV-cache planning exceeded the profiled budget on "
+                    f"worker {worker_index}: planned {total_bytes} bytes but "
+                    f"only {profiled_memory} bytes are available"
+                )
+            kv_cache_config.byte_v2_raw_fallback_slots = raw_slots
+            kv_cache_config.byte_v2_raw_fallback_sidecar_bytes = sidecar_bytes
+            kv_cache_config.byte_v2_raw_staging_slots = raw_staging_slots
+            kv_cache_config.byte_v2_raw_staging_workspace_bytes = (
+                staging_workspace_bytes
+            )
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

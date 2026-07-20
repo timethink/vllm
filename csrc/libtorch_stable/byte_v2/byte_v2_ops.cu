@@ -15,6 +15,7 @@
 #include <cutlass/numeric_types.h>
 #include <cute/tensor.hpp>
 
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -511,23 +512,44 @@ __device__ __forceinline__ int byte_v2_outlier_segment_capacity(int count) {
 }
 
 template <typename Layout>
-__device__ __forceinline__ int byte_v2_allocate_outlier_segment(
+__device__ __forceinline__ int byte_v2_try_allocate_outlier_segment(
     uint8_t* __restrict__ page, int count) {
   if constexpr (!Layout::PagePooledOutliersValue) {
     return 0;
   } else {
     const int capacity = byte_v2_outlier_segment_capacity(count);
-    const unsigned int pool_index = atomicAdd(
-        reinterpret_cast<unsigned int*>(page + Layout::OutlierPoolUsedOffset),
-        static_cast<unsigned int>(capacity));
-    if (pool_index + capacity > Layout::OutlierPoolEntriesValue) {
-      atomicExch(reinterpret_cast<unsigned int*>(
-                     page + Layout::OutlierPoolOverflowOffset),
-                 1u);
-      __trap();
+    auto* __restrict__ pool_used =
+        reinterpret_cast<unsigned int*>(page + Layout::OutlierPoolUsedOffset);
+    unsigned int observed = atomicAdd(pool_used, 0u);
+    while (true) {
+      if (observed > Layout::OutlierPoolEntriesValue ||
+          static_cast<unsigned int>(capacity) >
+              Layout::OutlierPoolEntriesValue - observed) {
+        atomicExch(reinterpret_cast<unsigned int*>(
+                       page + Layout::OutlierPoolOverflowOffset),
+                   1u);
+        return -1;
+      }
+      const unsigned int desired =
+          observed + static_cast<unsigned int>(capacity);
+      const unsigned int prior = atomicCAS(pool_used, observed, desired);
+      if (prior == observed) {
+        return static_cast<int>(observed);
+      }
+      observed = prior;
     }
-    return static_cast<int>(pool_index);
   }
+}
+
+template <typename Layout>
+__device__ __forceinline__ int byte_v2_allocate_outlier_segment(
+    uint8_t* __restrict__ page, int count) {
+  const int pool_index =
+      byte_v2_try_allocate_outlier_segment<Layout>(page, count);
+  if (pool_index < 0) {
+    __trap();
+  }
+  return pool_index;
 }
 
 template <typename Layout>
@@ -6036,7 +6058,10 @@ __global__ void byte_v2_hydrate_raw_staging_from_cache_kernel(
     uint8_t* __restrict__ raw_staging, const uint8_t* __restrict__ kv_cache,
     const int32_t* __restrict__ staging_to_physical_block,
     const int32_t* __restrict__ valid_rows, int64_t num_staging_slots,
-    int64_t raw_staging_stride_slot, int64_t kv_cache_stride_block) {
+    int64_t raw_staging_stride_slot, int64_t kv_cache_stride_block,
+    const uint8_t* __restrict__ persistent_raw_staging,
+    const int32_t* __restrict__ page_to_raw_slot, int64_t persistent_raw_slots,
+    int64_t persistent_raw_stride_slot) {
   constexpr int kBlockSize = ByteV2DefaultPolicy::AllocBlockTokens;
   constexpr int kHeadDim = ByteV2DefaultPolicy::HeadDim;
   constexpr int kHeadDimV = ByteV2DefaultPolicy::HeadDimV;
@@ -6075,30 +6100,53 @@ __global__ void byte_v2_hydrate_raw_staging_from_cache_kernel(
       continue;
     }
 
-    const uint8_t* __restrict__ page =
-        kv_cache + static_cast<int64_t>(physical_block) * kv_cache_stride_block;
-    float value;
     int64_t staging_offset;
     if (kv_side == 0) {
-      value = byte_v2_load_payload_elem<ByteV2DefaultLayout, false>(
-          page,
-          ByteV2DefaultLayout::KPayloadBaseBytes +
-              head_idx * ByteV2DefaultLayout::AlignedKPayloadBytesPerKvHead,
-          head_idx, row, dim);
       staging_offset =
           ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim);
     } else {
-      value = byte_v2_load_payload_elem<ByteV2DefaultLayout, true>(
-          page,
-          ByteV2DefaultLayout::VPayloadBaseBytes +
-              head_idx * ByteV2DefaultLayout::AlignedVPayloadBytesPerKvHead,
-          head_idx, row, dim);
       staging_offset =
           ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim);
     }
-    byte_v2_store_u16_bytes(
-        raw_staging + staging_slot * raw_staging_stride_slot, staging_offset,
-        byte_v2_float_to_bf16_bits(value));
+    uint8_t* __restrict__ staging =
+        raw_staging + staging_slot * raw_staging_stride_slot;
+    if (page_to_raw_slot != nullptr) {
+      const int32_t raw_slot = page_to_raw_slot[physical_block];
+      if (raw_slot < -1) {
+        __trap();
+      }
+      if (raw_slot >= 0) {
+        if (raw_slot >= persistent_raw_slots) {
+          __trap();
+        }
+        const uint8_t* __restrict__ raw_page =
+            persistent_raw_staging +
+            static_cast<int64_t>(raw_slot) * persistent_raw_stride_slot;
+        byte_v2_store_u16_bytes(
+            staging, staging_offset,
+            byte_v2_load_u16_bytes(raw_page, staging_offset));
+        continue;
+      }
+    }
+
+    const uint8_t* __restrict__ page =
+        kv_cache + static_cast<int64_t>(physical_block) * kv_cache_stride_block;
+    const float value =
+        kv_side == 0
+            ? byte_v2_load_payload_elem<ByteV2DefaultLayout, false>(
+                  page,
+                  ByteV2DefaultLayout::KPayloadBaseBytes +
+                      head_idx *
+                          ByteV2DefaultLayout::AlignedKPayloadBytesPerKvHead,
+                  head_idx, row, dim)
+            : byte_v2_load_payload_elem<ByteV2DefaultLayout, true>(
+                  page,
+                  ByteV2DefaultLayout::VPayloadBaseBytes +
+                      head_idx *
+                          ByteV2DefaultLayout::AlignedVPayloadBytesPerKvHead,
+                  head_idx, row, dim);
+    byte_v2_store_u16_bytes(staging, staging_offset,
+                            byte_v2_float_to_bf16_bits(value));
   }
 }
 
@@ -6503,8 +6551,14 @@ __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
     int outlier_pool_index = 0;
     if (has_overlay) {
       outlier_pool_index =
-          byte_v2_allocate_outlier_segment<ByteV2DefaultLayout>(page,
-                                                                outlier_count);
+          byte_v2_try_allocate_outlier_segment<ByteV2DefaultLayout>(
+              page, outlier_count);
+      if (outlier_pool_index < 0) {
+        // The compact page is no longer authoritative. Leave an explicit
+        // fatal marker and let the hybrid commit publish the exact raw page.
+        fallback = 1;
+        has_overlay = 0;
+      }
     }
     if constexpr (FuseMetadataClear) {
       const unsigned int tile_bit = 1u << tile_idx;
@@ -6684,6 +6738,144 @@ __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
           valid_rows, next_staging_slot, completion_counter,
           num_physical_blocks);
     }
+  }
+}
+
+__global__ void byte_v2_persist_raw_fallback_pages_kernel(
+    const uint8_t* __restrict__ raw_staging,
+    const uint8_t* __restrict__ kv_cache,
+    const int32_t* __restrict__ staging_to_physical_block,
+    const int32_t* __restrict__ valid_rows, int64_t num_staging_slots,
+    int64_t raw_staging_stride_slot, int64_t kv_cache_stride_block,
+    uint8_t* __restrict__ persistent_raw_staging, int64_t persistent_raw_slots,
+    int64_t persistent_raw_stride_slot, int32_t* __restrict__ page_to_raw_slot,
+    const int32_t* __restrict__ free_raw_slots,
+    int32_t* __restrict__ free_raw_slot_count,
+    int32_t* __restrict__ raw_pool_overflow, int64_t num_physical_blocks) {
+  const int64_t staging_slot = blockIdx.x;
+  if (staging_slot >= num_staging_slots) {
+    return;
+  }
+
+  __shared__ int32_t shared_raw_slot;
+  __shared__ int32_t shared_should_persist;
+  if (threadIdx.x == 0) {
+    shared_raw_slot = -1;
+    shared_should_persist = 0;
+    const int32_t physical_block = staging_to_physical_block[staging_slot];
+    const int32_t rows = valid_rows[staging_slot];
+    if (physical_block >= 0 && physical_block < num_physical_blocks &&
+        rows > 0) {
+      const uint8_t* __restrict__ page =
+          kv_cache +
+          static_cast<int64_t>(physical_block) * kv_cache_stride_block;
+      const uint32_t compact_pool_overflow = byte_v2_load_u32_bytes(
+          page, ByteV2DefaultLayout::OutlierPoolOverflowOffset);
+      const ByteV2PageUnsafeStats page_stats =
+          byte_v2_collect_page_unsafe_stats(page);
+      int32_t raw_slot = page_to_raw_slot[physical_block];
+      if (raw_slot < -1) {
+        atomicExch(raw_pool_overflow, 1);
+        shared_should_persist = 1;
+      } else if (raw_slot >= 0 || compact_pool_overflow != 0 ||
+                 page_stats.fallback_tiles != 0) {
+        if (raw_slot < 0) {
+          int32_t observed = atomicAdd(free_raw_slot_count, 0);
+          while (observed > 0) {
+            const int32_t prior =
+                atomicCAS(free_raw_slot_count, observed, observed - 1);
+            if (prior == observed) {
+              raw_slot = free_raw_slots[observed - 1];
+              break;
+            }
+            observed = prior;
+          }
+        }
+        if (raw_slot < 0 || raw_slot >= persistent_raw_slots) {
+          atomicExch(raw_pool_overflow, 1);
+          raw_slot = -1;
+        }
+        shared_raw_slot = raw_slot;
+        shared_should_persist = 1;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (shared_should_persist == 0) {
+    return;
+  }
+  if (shared_raw_slot < 0) {
+    __trap();
+    return;
+  }
+
+  const uint8_t* __restrict__ source =
+      raw_staging + staging_slot * raw_staging_stride_slot;
+  uint8_t* __restrict__ destination =
+      persistent_raw_staging +
+      static_cast<int64_t>(shared_raw_slot) * persistent_raw_stride_slot;
+  static_assert(ByteV2DefaultRawStagingLayout::SlotSizeBytes % sizeof(uint4) ==
+                0);
+  constexpr int64_t kVectorsPerRawPage =
+      ByteV2DefaultRawStagingLayout::SlotSizeBytes / sizeof(uint4);
+  const auto* __restrict__ source_vectors =
+      reinterpret_cast<const uint4*>(source);
+  auto* __restrict__ destination_vectors =
+      reinterpret_cast<uint4*>(destination);
+  for (int64_t vector_idx = threadIdx.x; vector_idx < kVectorsPerRawPage;
+       vector_idx += blockDim.x) {
+    destination_vectors[vector_idx] = source_vectors[vector_idx];
+  }
+
+  // Every copy thread must make its own global stores visible before the map
+  // becomes authoritative. A thread-0-only fence would not order stores made
+  // by the other threads in this CTA.
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const int32_t physical_block = staging_to_physical_block[staging_slot];
+    atomicExch(page_to_raw_slot + physical_block, shared_raw_slot);
+  }
+}
+
+__global__ void byte_v2_reset_raw_fallback_pages_kernel(
+    int32_t* __restrict__ page_to_raw_slot,
+    int32_t* __restrict__ free_raw_slots,
+    int32_t* __restrict__ free_raw_slot_count,
+    int32_t* __restrict__ raw_pool_overflow,
+    const int32_t* __restrict__ physical_block_ids, int64_t num_block_ids,
+    int64_t num_physical_blocks, int64_t persistent_raw_slots) {
+  for (int64_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < num_block_ids;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int32_t physical_block = physical_block_ids[index];
+    if (physical_block < 0 || physical_block >= num_physical_blocks) {
+      atomicExch(raw_pool_overflow, 1);
+      __trap();
+      continue;
+    }
+
+    const int32_t raw_slot = atomicExch(page_to_raw_slot + physical_block, -1);
+    if (raw_slot == -1) {
+      continue;
+    }
+    if (raw_slot < 0 || raw_slot >= persistent_raw_slots) {
+      atomicExch(raw_pool_overflow, 1);
+      __trap();
+      continue;
+    }
+
+    // Reset runs as a separate kernel on the same stream as updates and
+    // attention. The kernel boundary orders these slot writes before a later
+    // allocator pop. atomicExch above makes duplicate block IDs idempotent.
+    const int32_t free_index = atomicAdd(free_raw_slot_count, 1);
+    if (free_index < 0 || free_index >= persistent_raw_slots) {
+      atomicExch(raw_pool_overflow, 1);
+      __trap();
+      continue;
+    }
+    free_raw_slots[free_index] = raw_slot;
   }
 }
 
@@ -8243,13 +8435,19 @@ void byte_v2_prepare_raw_staging(
                   cudaGetErrorString(err));
 }
 
-void byte_v2_hydrate_raw_staging_from_cache(
+static void byte_v2_hydrate_raw_staging_from_cache_impl(
     torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
     torch::stable::Tensor& staging_to_physical_block,
     torch::stable::Tensor& valid_rows, int64_t codec_token_block,
-    int64_t codec_dim_block, int64_t alloc_block_tokens) {
+    int64_t codec_dim_block, int64_t alloc_block_tokens,
+    torch::stable::Tensor* persistent_raw_staging,
+    torch::stable::Tensor* page_to_raw_slot) {
   using torch::headeronly::ScalarType;
 
+  STD_TORCH_CHECK(
+      (persistent_raw_staging == nullptr) == (page_to_raw_slot == nullptr),
+      "persistent raw staging and page map must be provided "
+      "together");
   STD_TORCH_CHECK(raw_staging.device().is_cuda(),
                   "raw_staging must be a CUDA tensor");
   STD_TORCH_CHECK(raw_staging.device() == kv_cache.device(),
@@ -8259,6 +8457,13 @@ void byte_v2_hydrate_raw_staging_from_cache(
                   "same device");
   STD_TORCH_CHECK(raw_staging.device() == valid_rows.device(),
                   "raw_staging and valid_rows must be on the same device");
+  if (persistent_raw_staging != nullptr) {
+    STD_TORCH_CHECK(
+        persistent_raw_staging->device() == raw_staging.device() &&
+            page_to_raw_slot->device() == raw_staging.device(),
+        "persistent raw staging, page map, and transient staging must be on "
+        "the same device");
+  }
   check_byte_v2_tile_policy({codec_token_block, codec_dim_block,
                              alloc_block_tokens, alloc_block_tokens,
                              ByteV2DefaultPolicy::HeadDim,
@@ -8271,6 +8476,12 @@ void byte_v2_hydrate_raw_staging_from_cache(
                   "staging_to_physical_block must be int32");
   STD_TORCH_CHECK(valid_rows.scalar_type() == ScalarType::Int,
                   "valid_rows must be int32");
+  if (persistent_raw_staging != nullptr) {
+    STD_TORCH_CHECK(persistent_raw_staging->scalar_type() == ScalarType::Byte,
+                    "persistent_raw_staging must use uint8 storage");
+    STD_TORCH_CHECK(page_to_raw_slot->scalar_type() == ScalarType::Int,
+                    "page_to_raw_slot must be int32");
+  }
   STD_TORCH_CHECK(raw_staging.dim() == 2,
                   "raw_staging must be [num_slots, slot_size_bytes]");
   STD_TORCH_CHECK(kv_cache.dim() == 2,
@@ -8278,6 +8489,14 @@ void byte_v2_hydrate_raw_staging_from_cache(
   STD_TORCH_CHECK(staging_to_physical_block.dim() == 1,
                   "staging_to_physical_block must be [num_slots]");
   STD_TORCH_CHECK(valid_rows.dim() == 1, "valid_rows must be [num_slots]");
+  if (persistent_raw_staging != nullptr) {
+    STD_TORCH_CHECK(
+        persistent_raw_staging->dim() == 2,
+        "persistent_raw_staging must be [num_raw_slots, slot_size_bytes]");
+    STD_TORCH_CHECK(page_to_raw_slot->dim() == 1 &&
+                        page_to_raw_slot->size(0) == kv_cache.size(0),
+                    "page_to_raw_slot must contain one entry per KV block");
+  }
   STD_TORCH_CHECK(valid_rows.size(0) >= staging_to_physical_block.size(0),
                   "valid_rows must contain all staging slots");
   STD_TORCH_CHECK(raw_staging.size(0) >= staging_to_physical_block.size(0),
@@ -8286,6 +8505,20 @@ void byte_v2_hydrate_raw_staging_from_cache(
                   "raw_staging slot dimension must be contiguous");
   STD_TORCH_CHECK(kv_cache.stride(1) == 1,
                   "kv_cache page dimension must be contiguous");
+  if (persistent_raw_staging != nullptr) {
+    STD_TORCH_CHECK(persistent_raw_staging->size(0) > 0,
+                    "persistent_raw_staging must contain at least one slot");
+    STD_TORCH_CHECK(
+        persistent_raw_staging->size(1) >=
+            ByteV2DefaultRawStagingLayout::SlotSizeBytes,
+        "persistent raw slot is smaller than the ByteV2 raw layout");
+    STD_TORCH_CHECK(persistent_raw_staging->stride(0) >=
+                            ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+                        persistent_raw_staging->stride(1) == 1,
+                    "persistent raw slots must be contiguous");
+    STD_TORCH_CHECK(page_to_raw_slot->stride(0) == 1,
+                    "page_to_raw_slot must be contiguous");
+  }
   STD_TORCH_CHECK(
       codec_token_block == ByteV2DefaultPolicy::CodecTokenBlock &&
           codec_dim_block == ByteV2DefaultPolicy::CodecDimBlock &&
@@ -8325,12 +8558,44 @@ void byte_v2_hydrate_raw_staging_from_cache(
       reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
       staging_to_physical_block.const_data_ptr<int32_t>(),
       valid_rows.const_data_ptr<int32_t>(), num_staging_slots,
-      raw_staging.stride(0), kv_cache.stride(0));
+      raw_staging.stride(0), kv_cache.stride(0),
+      persistent_raw_staging == nullptr
+          ? nullptr
+          : reinterpret_cast<const uint8_t*>(
+                persistent_raw_staging->const_data_ptr()),
+      page_to_raw_slot == nullptr ? nullptr
+                                  : page_to_raw_slot->const_data_ptr<int32_t>(),
+      persistent_raw_staging == nullptr ? 0 : persistent_raw_staging->size(0),
+      persistent_raw_staging == nullptr ? 0
+                                        : persistent_raw_staging->stride(0));
   const cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess,
                   "byte_v2_hydrate_raw_staging_from_cache kernel launch "
                   "failed: ",
                   cudaGetErrorString(err));
+}
+
+void byte_v2_hydrate_raw_staging_from_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens) {
+  byte_v2_hydrate_raw_staging_from_cache_impl(
+      raw_staging, kv_cache, staging_to_physical_block, valid_rows,
+      codec_token_block, codec_dim_block, alloc_block_tokens, nullptr, nullptr);
+}
+
+void byte_v2_hydrate_raw_staging_from_hybrid_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens) {
+  byte_v2_hydrate_raw_staging_from_cache_impl(
+      raw_staging, kv_cache, staging_to_physical_block, valid_rows,
+      codec_token_block, codec_dim_block, alloc_block_tokens,
+      &persistent_raw_staging, &page_to_raw_slot);
 }
 
 void byte_v2_release_raw_staging(
@@ -8529,9 +8794,22 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
     torch::stable::Tensor& valid_rows, int64_t codec_token_block,
     int64_t codec_dim_block, int64_t alloc_block_tokens,
     bool fuse_metadata_clear, bool bypass_serial_metadata,
-    bool warp_parallel_histogram) {
+    bool warp_parallel_histogram,
+    torch::stable::Tensor* persistent_raw_staging = nullptr,
+    torch::stable::Tensor* page_to_raw_slot = nullptr,
+    torch::stable::Tensor* free_raw_slots = nullptr,
+    torch::stable::Tensor* free_raw_slot_count = nullptr,
+    torch::stable::Tensor* raw_pool_overflow = nullptr) {
   using torch::headeronly::ScalarType;
 
+  const bool hybrid_commit = persistent_raw_staging != nullptr;
+  STD_TORCH_CHECK(
+      hybrid_commit == (page_to_raw_slot != nullptr) &&
+          hybrid_commit == (free_raw_slots != nullptr) &&
+          hybrid_commit == (free_raw_slot_count != nullptr) &&
+          hybrid_commit == (raw_pool_overflow != nullptr),
+      "persistent raw staging, page map, allocator, and overflow flag must "
+      "be provided together");
   STD_TORCH_CHECK(raw_staging.device().is_cuda(),
                   "raw_staging must be a CUDA tensor");
   STD_TORCH_CHECK(raw_staging.device() == kv_cache.device(),
@@ -8541,6 +8819,16 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
                   "same device");
   STD_TORCH_CHECK(raw_staging.device() == valid_rows.device(),
                   "raw_staging and valid_rows must be on the same device");
+  if (hybrid_commit) {
+    STD_TORCH_CHECK(
+        persistent_raw_staging->device() == raw_staging.device() &&
+            page_to_raw_slot->device() == raw_staging.device() &&
+            free_raw_slots->device() == raw_staging.device() &&
+            free_raw_slot_count->device() == raw_staging.device() &&
+            raw_pool_overflow->device() == raw_staging.device(),
+        "persistent raw state and transient staging must be on the same "
+        "device");
+  }
   check_byte_v2_tile_policy({codec_token_block, codec_dim_block,
                              alloc_block_tokens, alloc_block_tokens,
                              ByteV2DefaultPolicy::HeadDim,
@@ -8553,6 +8841,15 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
                   "staging_to_physical_block must be int32");
   STD_TORCH_CHECK(valid_rows.scalar_type() == ScalarType::Int,
                   "valid_rows must be int32");
+  if (hybrid_commit) {
+    STD_TORCH_CHECK(persistent_raw_staging->scalar_type() == ScalarType::Byte,
+                    "persistent_raw_staging must use uint8 storage");
+    STD_TORCH_CHECK(page_to_raw_slot->scalar_type() == ScalarType::Int &&
+                        free_raw_slots->scalar_type() == ScalarType::Int &&
+                        free_raw_slot_count->scalar_type() == ScalarType::Int &&
+                        raw_pool_overflow->scalar_type() == ScalarType::Int,
+                    "persistent raw map and allocator state must be int32");
+  }
   STD_TORCH_CHECK(raw_staging.dim() == 2,
                   "raw_staging must be [num_slots, slot_size_bytes]");
   STD_TORCH_CHECK(kv_cache.dim() == 2,
@@ -8560,6 +8857,25 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
   STD_TORCH_CHECK(staging_to_physical_block.dim() == 1,
                   "staging_to_physical_block must be [num_slots]");
   STD_TORCH_CHECK(valid_rows.dim() == 1, "valid_rows must be [num_slots]");
+  if (hybrid_commit) {
+    STD_TORCH_CHECK(
+        persistent_raw_staging->dim() == 2 &&
+            persistent_raw_staging->size(0) > 0 &&
+            persistent_raw_staging->size(1) >=
+                ByteV2DefaultRawStagingLayout::SlotSizeBytes,
+        "persistent_raw_staging must contain complete ByteV2 raw slots");
+    STD_TORCH_CHECK(page_to_raw_slot->dim() == 1 &&
+                        page_to_raw_slot->size(0) == kv_cache.size(0),
+                    "page_to_raw_slot must contain one entry per KV block");
+    STD_TORCH_CHECK(
+        free_raw_slots->dim() == 1 &&
+            free_raw_slots->size(0) == persistent_raw_staging->size(0),
+        "free_raw_slots must contain one entry per persistent raw slot");
+    STD_TORCH_CHECK(
+        free_raw_slot_count->dim() == 1 && free_raw_slot_count->size(0) == 1 &&
+            raw_pool_overflow->dim() == 1 && raw_pool_overflow->size(0) == 1,
+        "persistent raw allocator state must be scalar tensors");
+  }
   STD_TORCH_CHECK(valid_rows.size(0) >= staging_to_physical_block.size(0),
                   "valid_rows must contain all staging slots");
   STD_TORCH_CHECK(raw_staging.size(0) >= staging_to_physical_block.size(0),
@@ -8568,6 +8884,28 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
                   "raw_staging slot dimension must be contiguous");
   STD_TORCH_CHECK(kv_cache.stride(1) == 1,
                   "kv_cache page dimension must be contiguous");
+  if (hybrid_commit) {
+    STD_TORCH_CHECK(persistent_raw_staging->stride(0) >=
+                            ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+                        persistent_raw_staging->stride(1) == 1,
+                    "persistent raw slots must be contiguous");
+    STD_TORCH_CHECK(
+        page_to_raw_slot->stride(0) == 1 && free_raw_slots->stride(0) == 1 &&
+            free_raw_slot_count->stride(0) == 1 &&
+            raw_pool_overflow->stride(0) == 1,
+        "persistent raw map and allocator state must be contiguous");
+    STD_TORCH_CHECK(
+        raw_staging.stride(0) % alignof(uint4) == 0 &&
+            persistent_raw_staging->stride(0) % alignof(uint4) == 0 &&
+            reinterpret_cast<uintptr_t>(raw_staging.const_data_ptr()) %
+                    alignof(uint4) ==
+                0 &&
+            reinterpret_cast<uintptr_t>(
+                persistent_raw_staging->const_data_ptr()) %
+                    alignof(uint4) ==
+                0,
+        "transient and persistent raw pages must be 16-byte aligned");
+  }
   STD_TORCH_CHECK(
       codec_token_block == ByteV2DefaultPolicy::CodecTokenBlock &&
           codec_dim_block == ByteV2DefaultPolicy::CodecDimBlock &&
@@ -8675,10 +9013,31 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
             raw_staging.stride(0), kv_cache.stride(0), nullptr, nullptr,
             nullptr, nullptr, 0);
   }
-  const cudaError_t err = cudaGetLastError();
+  cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess,
                   "byte_v2_commit_raw_staging_to_cache kernel launch failed: ",
                   cudaGetErrorString(err));
+  if (hybrid_commit) {
+    constexpr int kPersistThreads = 256;
+    byte_v2_persist_raw_fallback_pages_kernel<<<static_cast<unsigned int>(
+                                                    num_staging_slots),
+                                                kPersistThreads, 0, stream>>>(
+        reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
+        reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+        staging_to_physical_block.const_data_ptr<int32_t>(),
+        valid_rows.const_data_ptr<int32_t>(), num_staging_slots,
+        raw_staging.stride(0), kv_cache.stride(0),
+        reinterpret_cast<uint8_t*>(persistent_raw_staging->mutable_data_ptr()),
+        persistent_raw_staging->size(0), persistent_raw_staging->stride(0),
+        page_to_raw_slot->mutable_data_ptr<int32_t>(),
+        free_raw_slots->const_data_ptr<int32_t>(),
+        free_raw_slot_count->mutable_data_ptr<int32_t>(),
+        raw_pool_overflow->mutable_data_ptr<int32_t>(), kv_cache.size(0));
+    err = cudaGetLastError();
+    STD_TORCH_CHECK(err == cudaSuccess,
+                    "byte_v2 persistent raw fallback kernel launch failed: ",
+                    cudaGetErrorString(err));
+  }
 }
 
 static void byte_v2_commit_single_token_raw_staging_and_release_impl(
@@ -8737,6 +9096,81 @@ void byte_v2_commit_raw_staging_to_cache(
       raw_staging, kv_cache, staging_to_physical_block, valid_rows,
       codec_token_block, codec_dim_block, alloc_block_tokens, false, false,
       false);
+}
+
+void byte_v2_commit_raw_staging_to_hybrid_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, int64_t codec_token_block,
+    int64_t codec_dim_block, int64_t alloc_block_tokens) {
+  byte_v2_commit_raw_staging_to_cache_impl(
+      raw_staging, kv_cache, staging_to_physical_block, valid_rows,
+      codec_token_block, codec_dim_block, alloc_block_tokens, false, false,
+      false, &persistent_raw_staging, &page_to_raw_slot, &free_raw_slots,
+      &free_raw_slot_count, &raw_pool_overflow);
+}
+
+void byte_v2_reset_raw_fallback_pages(
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    torch::stable::Tensor& physical_block_ids) {
+  using torch::headeronly::ScalarType;
+
+  STD_TORCH_CHECK(page_to_raw_slot.device().is_cuda(),
+                  "page_to_raw_slot must be a CUDA tensor");
+  STD_TORCH_CHECK(
+      free_raw_slots.device() == page_to_raw_slot.device() &&
+          free_raw_slot_count.device() == page_to_raw_slot.device() &&
+          raw_pool_overflow.device() == page_to_raw_slot.device() &&
+          physical_block_ids.device() == page_to_raw_slot.device(),
+      "raw fallback reset tensors must be on the same device");
+  STD_TORCH_CHECK(page_to_raw_slot.scalar_type() == ScalarType::Int &&
+                      free_raw_slots.scalar_type() == ScalarType::Int &&
+                      free_raw_slot_count.scalar_type() == ScalarType::Int &&
+                      raw_pool_overflow.scalar_type() == ScalarType::Int &&
+                      physical_block_ids.scalar_type() == ScalarType::Int,
+                  "raw fallback reset tensors must use int32");
+  STD_TORCH_CHECK(
+      page_to_raw_slot.dim() == 1 && free_raw_slots.dim() == 1 &&
+          free_raw_slots.size(0) > 0 && free_raw_slot_count.dim() == 1 &&
+          free_raw_slot_count.size(0) == 1 && raw_pool_overflow.dim() == 1 &&
+          raw_pool_overflow.size(0) == 1 && physical_block_ids.dim() == 1,
+      "raw fallback reset tensors have invalid shapes");
+  STD_TORCH_CHECK(
+      page_to_raw_slot.stride(0) == 1 && free_raw_slots.stride(0) == 1 &&
+          free_raw_slot_count.stride(0) == 1 &&
+          raw_pool_overflow.stride(0) == 1 && physical_block_ids.stride(0) == 1,
+      "raw fallback reset tensors must be contiguous");
+
+  const int64_t num_block_ids = physical_block_ids.size(0);
+  if (num_block_ids == 0) {
+    return;
+  }
+  constexpr int kThreads = 256;
+  const int64_t blocks64 = (num_block_ids + kThreads - 1) / kThreads;
+  const int blocks = static_cast<int>(blocks64 > 65535 ? 65535 : blocks64);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      page_to_raw_slot.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(page_to_raw_slot.get_device_index());
+  byte_v2_reset_raw_fallback_pages_kernel<<<blocks, kThreads, 0, stream>>>(
+      page_to_raw_slot.mutable_data_ptr<int32_t>(),
+      free_raw_slots.mutable_data_ptr<int32_t>(),
+      free_raw_slot_count.mutable_data_ptr<int32_t>(),
+      raw_pool_overflow.mutable_data_ptr<int32_t>(),
+      physical_block_ids.const_data_ptr<int32_t>(), num_block_ids,
+      page_to_raw_slot.size(0), free_raw_slots.size(0));
+  const cudaError_t err = cudaGetLastError();
+  STD_TORCH_CHECK(err == cudaSuccess,
+                  "byte_v2 raw fallback reset kernel launch failed: ",
+                  cudaGetErrorString(err));
 }
 
 void byte_v2_update_cache_raw_staging(

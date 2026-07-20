@@ -39,10 +39,15 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_append_raw_staging,
     byte_v2_collect_cache_stats,
     byte_v2_commit_raw_staging_to_cache,
+    byte_v2_commit_raw_staging_to_hybrid_cache,
     byte_v2_custom_ops_are_available,
     byte_v2_fa2_decode_is_available,
+    byte_v2_fa2_hybrid_decode_is_available,
+    byte_v2_fa2_hybrid_paged_decode_attention,
     byte_v2_fa2_paged_decode_attention,
+    byte_v2_hybrid_cache_update_is_available,
     byte_v2_hydrate_raw_staging_from_cache,
+    byte_v2_hydrate_raw_staging_from_hybrid_cache,
     byte_v2_paged_decode_attention,
     byte_v2_paged_decode_attention_split_k,
     byte_v2_paged_decode_attention_split_k_guarded,
@@ -50,6 +55,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_prepare_raw_staging,
     byte_v2_release_raw_staging,
     byte_v2_release_raw_staging_and_update_flags,
+    byte_v2_reset_raw_fallback_pages,
     byte_v2_reshape_and_cache,
     byte_v2_speculative_verify_gqa,
     byte_v2_speculative_verify_ragged_q4,
@@ -57,6 +63,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
 )
+from vllm.v1.kv_cache_interface import byte_v2_hybrid_raw_fallback_enabled
 
 _BYTE_V2_KERNELS_NOT_READY = "ByteV2 native CUDA kernels are not registered yet"
 _BYTE_V2_MAX_RAW_STAGING_TOKENS = 1024
@@ -440,8 +447,351 @@ class ByteV2AttentionBackend(AttentionBackend):
         return None
 
 
+@dataclass(frozen=True)
+class ByteV2RawFallbackState:
+    """Device tensors backing the experimental compact/raw page store."""
+
+    raw_pages: torch.Tensor
+    page_to_raw_slot: torch.Tensor
+    free_slots: torch.Tensor
+    free_count: torch.Tensor
+    fatal: torch.Tensor
+
+
+class ByteV2RawFallbackStore:
+    """Lazy persistent raw-page sidecar for an experimental runtime checkpoint.
+
+    This store is deliberately separate from the transient update staging
+    buffers. Its persistent allocation is included in the KV-cache plan and
+    its block lifetime is driven by the scheduler's cache-zero/reset
+    notifications. The feature remains experimental and default-off while
+    unsupported runtime integrations are being made fail-closed. A KV-cache
+    address, device, or shape change after first use is rejected because raw
+    page state cannot be transferred safely to a new binding.
+    """
+
+    def __init__(self, *, raw_layout: ByteV2RawStagingLayout) -> None:
+        self.raw_layout = raw_layout
+        self._binding: tuple[int, torch.device, tuple[int, ...]] | None = None
+        self._state: ByteV2RawFallbackState | None = None
+        self._planned_num_blocks: int | None = None
+        self._planned_num_raw_slots: int | None = None
+
+    @property
+    def current_state(self) -> ByteV2RawFallbackState | None:
+        """Return the currently bound state without allocating it."""
+        return self._state
+
+    @staticmethod
+    def _binding_for(
+        kv_cache: torch.Tensor,
+    ) -> tuple[int, torch.device, tuple[int, ...]]:
+        return (
+            kv_cache.data_ptr(),
+            kv_cache.device,
+            tuple(int(dim) for dim in kv_cache.shape),
+        )
+
+    @staticmethod
+    def _num_raw_slots(num_blocks: int) -> int:
+        return _positive_int_env(
+            "BYTE_V2_FA2_RAW_FALLBACK_SLOTS",
+            max(1, num_blocks // 256),
+        )
+
+    def _allocate_state(self, kv_cache: torch.Tensor) -> ByteV2RawFallbackState:
+        num_blocks = int(kv_cache.shape[0])
+        if (
+            self._planned_num_blocks is not None
+            and num_blocks != self._planned_num_blocks
+        ):
+            raise RuntimeError(
+                "ByteV2 raw fallback plan expected "
+                f"{self._planned_num_blocks} blocks, but the bound KV cache has "
+                f"{num_blocks} blocks"
+            )
+        num_raw_slots = self._planned_num_raw_slots
+        if num_raw_slots is None:
+            num_raw_slots = self._num_raw_slots(num_blocks)
+        device = kv_cache.device
+        return ByteV2RawFallbackState(
+            raw_pages=torch.empty(
+                (num_raw_slots, self.raw_layout.slot_size_bytes),
+                dtype=torch.uint8,
+                device=device,
+            ),
+            page_to_raw_slot=torch.full(
+                (num_blocks,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            ),
+            free_slots=torch.arange(
+                num_raw_slots,
+                dtype=torch.int32,
+                device=device,
+            ),
+            free_count=torch.full(
+                (1,),
+                num_raw_slots,
+                dtype=torch.int32,
+                device=device,
+            ),
+            fatal=torch.zeros((1,), dtype=torch.int32, device=device),
+        )
+
+    def bind_plan(self, *, num_blocks: int, num_raw_slots: int) -> None:
+        """Bind the planner's persistent sidecar dimensions before first use."""
+        if num_blocks < 0:
+            raise ValueError("num_blocks must be non-negative")
+        if num_raw_slots <= 0:
+            raise ValueError("num_raw_slots must be positive")
+        if self._state is not None and (
+            num_blocks != self._planned_num_blocks
+            or num_raw_slots != self._planned_num_raw_slots
+        ):
+            raise RuntimeError(
+                "Cannot change the ByteV2 raw fallback plan after sidecar state "
+                "has been allocated"
+            )
+        self._planned_num_blocks = num_blocks
+        self._planned_num_raw_slots = num_raw_slots
+
+    def clear_binding(self) -> None:
+        """Drop profiling-only state after synchronization and graph teardown."""
+        self._binding = None
+        self._state = None
+        self._planned_num_blocks = None
+        self._planned_num_raw_slots = None
+
+    def state(self, kv_cache: torch.Tensor) -> ByteV2RawFallbackState:
+        """Return state for ``kv_cache``, initializing on a new binding."""
+        binding = self._binding_for(kv_cache)
+        if self._state is not None and binding == self._binding:
+            return self._state
+        if self._binding is not None:
+            raise RuntimeError(
+                "ByteV2 hybrid raw fallback KV-cache binding changed after "
+                "first use; cache pointer, device, and shape must remain fixed"
+            )
+        self._binding = binding
+        self._state = self._allocate_state(kv_cache)
+        return self._state
+
+    def reset(self, physical_block_ids: torch.Tensor | None = None) -> None:
+        """Reset all state, or release selected physical block IDs.
+
+        The scheduler uses selective reset before a block ID is reused and when
+        an uncached block becomes dead. Prefix-cached blocks are deliberately
+        retained until they are evicted and subsequently reported for reuse.
+        """
+        state = self._state
+        if state is None:
+            return
+        if physical_block_ids is not None:
+            byte_v2_reset_raw_fallback_pages(
+                state.page_to_raw_slot,
+                state.free_slots,
+                state.free_count,
+                state.fatal,
+                physical_block_ids,
+            )
+            return
+        state.page_to_raw_slot.fill_(-1)
+        state.free_slots.copy_(
+            torch.arange(
+                state.free_slots.shape[0],
+                dtype=torch.int32,
+                device=state.free_slots.device,
+            )
+        )
+        state.free_count.fill_(state.free_slots.shape[0])
+        state.fatal.zero_()
+
+
+@dataclass(frozen=True)
+class ByteV2RawStagingWorkspaceSpec:
+    """Shape and placement of one runner-owned raw staging workspace."""
+
+    num_blocks: int
+    num_staging_slots: int
+    slot_size_bytes: int
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        if self.num_blocks < 0:
+            raise ValueError("num_blocks must be non-negative")
+        if self.num_staging_slots <= 0:
+            raise ValueError("num_staging_slots must be positive")
+        if self.slot_size_bytes <= 0:
+            raise ValueError("slot_size_bytes must be positive")
+
+    @property
+    def nbytes(self) -> int:
+        """Return the exact storage size of all tensors in the workspace."""
+        return (
+            self.num_staging_slots * self.slot_size_bytes
+            + 4 * self.num_blocks
+            + 8 * self.num_staging_slots
+            + 8
+        )
+
+    def allocate(self) -> ByteV2RawStagingWorkspace:
+        """Allocate and initialize the fixed-address workspace tensors."""
+        return ByteV2RawStagingWorkspace(
+            spec=self,
+            raw_staging=torch.empty(
+                (self.num_staging_slots, self.slot_size_bytes),
+                dtype=torch.uint8,
+                device=self.device,
+            ),
+            block_to_staging_slot=torch.full(
+                (self.num_blocks,),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            staging_to_physical_block=torch.full(
+                (self.num_staging_slots,),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            valid_rows=torch.zeros(
+                (self.num_staging_slots,),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            next_staging_slot=torch.zeros(
+                (1,),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            overflow=torch.zeros(
+                (1,),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ByteV2RawStagingWorkspace:
+    """Fixed-address tensors shared serially by all ByteV2 layers."""
+
+    spec: ByteV2RawStagingWorkspaceSpec
+    raw_staging: torch.Tensor
+    block_to_staging_slot: torch.Tensor
+    staging_to_physical_block: torch.Tensor
+    valid_rows: torch.Tensor
+    next_staging_slot: torch.Tensor
+    overflow: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ByteV2RawStagingWave:
+    """A contiguous cache update whose unique-page upper bound fits staging."""
+
+    start: int
+    end: int
+    max_unique_pages: int
+
+
+def _trusted_byte_v2_query_start_locs(
+    attn_metadata: object | None,
+    num_tokens: int,
+) -> list[int] | None:
+    if attn_metadata is None:
+        return None
+    num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+    if not isinstance(num_actual_tokens, int) or isinstance(num_actual_tokens, bool):
+        return None
+    if not 0 <= num_actual_tokens <= num_tokens:
+        return None
+    query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    if not isinstance(query_start_loc_cpu, torch.Tensor):
+        return None
+    if query_start_loc_cpu.device.type != "cpu" or query_start_loc_cpu.ndim != 1:
+        return None
+    if query_start_loc_cpu.dtype not in (torch.int32, torch.int64):
+        return None
+    query_start_locs = [int(value) for value in query_start_loc_cpu.tolist()]
+    if not query_start_locs or query_start_locs[0] != 0:
+        return None
+    if query_start_locs[-1] != num_actual_tokens:
+        return None
+    if any(end < start for start, end in zip(query_start_locs, query_start_locs[1:])):
+        return None
+    return query_start_locs
+
+
+def plan_byte_v2_raw_staging_waves(
+    num_tokens: int,
+    num_staging_slots: int,
+    attn_metadata: object | None = None,
+    *,
+    alloc_block_tokens: int = 16,
+) -> list[ByteV2RawStagingWave]:
+    """Plan page-bounded, stream-ordered staging waves.
+
+    A request segment with ``n`` consecutive logical tokens can touch at most
+    ``ceil((block_size - 1 + n) / block_size)`` pages because its first row is
+    unknown here. Bounds from adjacent requests are summed, which may
+    over-count shared physical pages but can never under-count them.
+    """
+    if num_tokens < 0:
+        raise ValueError("num_tokens must be non-negative")
+    if num_staging_slots <= 0:
+        raise ValueError("num_staging_slots must be positive")
+    if alloc_block_tokens <= 0:
+        raise ValueError("alloc_block_tokens must be positive")
+
+    query_start_locs = _trusted_byte_v2_query_start_locs(
+        attn_metadata,
+        num_tokens,
+    )
+    if query_start_locs is None:
+        conservative_waves = []
+        for start in range(0, num_tokens, num_staging_slots):
+            end = min(start + num_staging_slots, num_tokens)
+            conservative_waves.append(ByteV2RawStagingWave(start, end, end - start))
+        return conservative_waves
+
+    pieces: list[ByteV2RawStagingWave] = []
+    max_consecutive_tokens = alloc_block_tokens * num_staging_slots
+    max_consecutive_tokens -= alloc_block_tokens - 1
+    for request_start, request_end in zip(
+        query_start_locs,
+        query_start_locs[1:],
+    ):
+        start = request_start
+        while start < request_end:
+            end = min(start + max_consecutive_tokens, request_end)
+            num_request_tokens = end - start
+            max_unique_pages = (
+                num_request_tokens + 2 * alloc_block_tokens - 2
+            ) // alloc_block_tokens
+            pieces.append(ByteV2RawStagingWave(start, end, max_unique_pages))
+            start = end
+
+    waves: list[ByteV2RawStagingWave] = []
+    for piece in pieces:
+        if waves and waves[-1].max_unique_pages + piece.max_unique_pages <= (
+            num_staging_slots
+        ):
+            previous = waves[-1]
+            waves[-1] = ByteV2RawStagingWave(
+                previous.start,
+                piece.end,
+                previous.max_unique_pages + piece.max_unique_pages,
+            )
+        else:
+            waves.append(piece)
+    return waves
+
+
 class ByteV2RawStagingManager:
-    """Reusable raw staging buffers for small ByteV2 cache updates."""
+    """Reusable raw staging buffers for ByteV2 cache updates."""
 
     def __init__(
         self,
@@ -449,6 +799,7 @@ class ByteV2RawStagingManager:
         tile_policy: ByteV2TilePolicy,
         num_kv_heads: int,
         max_tokens_per_update: int = _BYTE_V2_MAX_RAW_STAGING_TOKENS,
+        raw_fallback_store: ByteV2RawFallbackStore | None = None,
     ) -> None:
         self.tile_policy = tile_policy
         self.raw_layout = ByteV2RawStagingLayout(
@@ -456,6 +807,8 @@ class ByteV2RawStagingManager:
             num_kv_heads=num_kv_heads,
         )
         self.max_tokens_per_update = max_tokens_per_update
+        self.raw_fallback_store = raw_fallback_store
+        self.shared_workspace: ByteV2RawStagingWorkspace | None = None
 
         self.raw_staging: torch.Tensor | None = None
         self.block_to_staging_slot: torch.Tensor | None = None
@@ -463,6 +816,39 @@ class ByteV2RawStagingManager:
         self.valid_rows: torch.Tensor | None = None
         self.next_staging_slot: torch.Tensor | None = None
         self.overflow: torch.Tensor | None = None
+
+    def bind_shared_workspace(
+        self,
+        workspace: ByteV2RawStagingWorkspace,
+    ) -> None:
+        """Bind a runner-owned workspace without changing tensor addresses."""
+        if self.raw_fallback_store is None:
+            raise RuntimeError(
+                "ByteV2 shared raw staging is only valid with hybrid fallback"
+            )
+        if workspace.spec.slot_size_bytes != self.raw_layout.slot_size_bytes:
+            raise RuntimeError(
+                "ByteV2 raw staging slot-size mismatch: workspace has "
+                f"{workspace.spec.slot_size_bytes} bytes, layer requires "
+                f"{self.raw_layout.slot_size_bytes} bytes"
+            )
+        self.shared_workspace = workspace
+        self.raw_staging = workspace.raw_staging
+        self.block_to_staging_slot = workspace.block_to_staging_slot
+        self.staging_to_physical_block = workspace.staging_to_physical_block
+        self.valid_rows = workspace.valid_rows
+        self.next_staging_slot = workspace.next_staging_slot
+        self.overflow = workspace.overflow
+
+    def clear_shared_workspace(self) -> None:
+        """Drop all references to a profiling-only shared workspace."""
+        self.shared_workspace = None
+        self.raw_staging = None
+        self.block_to_staging_slot = None
+        self.staging_to_physical_block = None
+        self.valid_rows = None
+        self.next_staging_slot = None
+        self.overflow = None
 
     def _should_stage(self, slot_mapping: torch.Tensor) -> bool:
         num_tokens = slot_mapping.shape[0]
@@ -501,12 +887,34 @@ class ByteV2RawStagingManager:
     def _ensure_capacity(
         self,
         kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
+        num_staging_slots: int,
     ) -> bool:
         num_blocks = kv_cache.shape[0]
-        num_staging_slots = min(num_blocks, slot_mapping.shape[0])
         if num_staging_slots <= 0:
             return False
+
+        if self.raw_fallback_store is not None:
+            workspace = self.shared_workspace
+            if workspace is None:
+                raise RuntimeError(
+                    "ByteV2 hybrid raw fallback requires a runner-owned raw "
+                    "staging workspace"
+                )
+            spec = workspace.spec
+            if spec.device != kv_cache.device or spec.num_blocks != num_blocks:
+                raise RuntimeError(
+                    "ByteV2 raw staging workspace does not match the bound KV "
+                    f"cache: workspace=(device={spec.device}, blocks="
+                    f"{spec.num_blocks}), cache=(device={kv_cache.device}, "
+                    f"blocks={num_blocks})"
+                )
+            if num_staging_slots > spec.num_staging_slots:
+                raise RuntimeError(
+                    "ByteV2 raw staging wave requires "
+                    f"{num_staging_slots} pages, but the shared workspace has "
+                    f"only {spec.num_staging_slots} slots"
+                )
+            return True
 
         if not self._needs_reallocation(
             kv_cache=kv_cache,
@@ -608,11 +1016,68 @@ class ByteV2RawStagingManager:
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         page_unsafe_flags: torch.Tensor | None = None,
+        attn_metadata: object | None = None,
     ) -> tuple[bool, bool]:
-        if slot_mapping.shape[0] == 0:
+        num_tokens = slot_mapping.shape[0]
+        if num_tokens == 0:
             return True, False
+        if self.raw_fallback_store is not None:
+            workspace = self.shared_workspace
+            if workspace is None:
+                raise RuntimeError(
+                    "ByteV2 hybrid raw fallback requires a runner-owned raw "
+                    "staging workspace"
+                )
+            hybrid_state = self.raw_fallback_store.state(kv_cache)
+            waves = plan_byte_v2_raw_staging_waves(
+                num_tokens,
+                workspace.spec.num_staging_slots,
+                attn_metadata,
+                alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+            )
+            flags_updated = page_unsafe_flags is not None and bool(waves)
+            for wave in waves:
+                handled, wave_flags_updated = self._update_one_wave(
+                    key=key[wave.start : wave.end],
+                    value=value[wave.start : wave.end],
+                    kv_cache=kv_cache,
+                    slot_mapping=slot_mapping[wave.start : wave.end],
+                    page_unsafe_flags=page_unsafe_flags,
+                    hybrid_state=hybrid_state,
+                    active_slot_capacity=wave.max_unique_pages,
+                )
+                if not handled:
+                    raise RuntimeError(
+                        "ByteV2 hybrid raw fallback update unexpectedly fell "
+                        "through to the direct writer"
+                    )
+                flags_updated = flags_updated and wave_flags_updated
+            return True, flags_updated
+
+        return self._update_one_wave(
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping,
+            page_unsafe_flags=page_unsafe_flags,
+            hybrid_state=None,
+            active_slot_capacity=min(kv_cache.shape[0], num_tokens),
+        )
+
+    def _update_one_wave(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        page_unsafe_flags: torch.Tensor | None,
+        hybrid_state: ByteV2RawFallbackState | None,
+        active_slot_capacity: int,
+    ) -> tuple[bool, bool]:
         if (
-            slot_mapping.shape[0] == 1
+            hybrid_state is None
+            and slot_mapping.shape[0] == 1
             and slot_mapping.is_cuda
             and _native_single_token_update_enabled()
         ):
@@ -630,9 +1095,9 @@ class ByteV2RawStagingManager:
                 return True, page_unsafe_flags is not None
             except NotImplementedError:
                 pass
-        if not self._should_stage(slot_mapping):
+        if hybrid_state is None and not self._should_stage(slot_mapping):
             return False, False
-        if not self._ensure_capacity(kv_cache, slot_mapping):
+        if not self._ensure_capacity(kv_cache, active_slot_capacity):
             return False, False
 
         assert self.raw_staging is not None
@@ -642,7 +1107,6 @@ class ByteV2RawStagingManager:
         assert self.next_staging_slot is not None
         assert self.overflow is not None
 
-        active_slot_capacity = min(kv_cache.shape[0], slot_mapping.shape[0])
         raw_staging = self.raw_staging[:active_slot_capacity]
         staging_to_physical_block = self.staging_to_physical_block[
             :active_slot_capacity
@@ -650,7 +1114,8 @@ class ByteV2RawStagingManager:
         valid_rows = self.valid_rows[:active_slot_capacity]
 
         if (
-            page_unsafe_flags is not None
+            hybrid_state is None
+            and page_unsafe_flags is not None
             and _fused_staging_release_flags_enabled()
             and _native_raw_staging_update_enabled()
             and not _debug_warmup_enabled()
@@ -706,18 +1171,36 @@ class ByteV2RawStagingManager:
                 self.overflow,
                 alloc_block_tokens=self.tile_policy.alloc_block_tokens,
             )
+            if hybrid_state is not None:
+                torch._assert_async(
+                    self.overflow == 0,
+                    "ByteV2 raw staging page bound was exceeded",
+                )
             _debug_sync("raw staging prepare")
             _debug_warmup("raw staging prepare done")
             _debug_warmup("raw staging hydrate start")
-            byte_v2_hydrate_raw_staging_from_cache(
-                raw_staging,
-                kv_cache,
-                staging_to_physical_block,
-                valid_rows,
-                codec_token_block=self.tile_policy.codec_token_block,
-                codec_dim_block=self.tile_policy.codec_dim_block,
-                alloc_block_tokens=self.tile_policy.alloc_block_tokens,
-            )
+            if hybrid_state is None:
+                byte_v2_hydrate_raw_staging_from_cache(
+                    raw_staging,
+                    kv_cache,
+                    staging_to_physical_block,
+                    valid_rows,
+                    codec_token_block=self.tile_policy.codec_token_block,
+                    codec_dim_block=self.tile_policy.codec_dim_block,
+                    alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+                )
+            else:
+                byte_v2_hydrate_raw_staging_from_hybrid_cache(
+                    raw_staging,
+                    kv_cache,
+                    hybrid_state.raw_pages,
+                    hybrid_state.page_to_raw_slot,
+                    staging_to_physical_block,
+                    valid_rows,
+                    codec_token_block=self.tile_policy.codec_token_block,
+                    codec_dim_block=self.tile_policy.codec_dim_block,
+                    alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+                )
             _debug_sync("raw staging hydrate")
             _debug_warmup("raw staging hydrate done")
             _debug_warmup("raw staging append start")
@@ -734,15 +1217,31 @@ class ByteV2RawStagingManager:
             _debug_sync("raw staging append")
             _debug_warmup("raw staging append done")
             _debug_warmup("raw staging commit start")
-            byte_v2_commit_raw_staging_to_cache(
-                raw_staging,
-                kv_cache,
-                staging_to_physical_block,
-                valid_rows,
-                codec_token_block=self.tile_policy.codec_token_block,
-                codec_dim_block=self.tile_policy.codec_dim_block,
-                alloc_block_tokens=self.tile_policy.alloc_block_tokens,
-            )
+            if hybrid_state is None:
+                byte_v2_commit_raw_staging_to_cache(
+                    raw_staging,
+                    kv_cache,
+                    staging_to_physical_block,
+                    valid_rows,
+                    codec_token_block=self.tile_policy.codec_token_block,
+                    codec_dim_block=self.tile_policy.codec_dim_block,
+                    alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+                )
+            else:
+                byte_v2_commit_raw_staging_to_hybrid_cache(
+                    raw_staging,
+                    kv_cache,
+                    hybrid_state.raw_pages,
+                    hybrid_state.page_to_raw_slot,
+                    hybrid_state.free_slots,
+                    hybrid_state.free_count,
+                    hybrid_state.fatal,
+                    staging_to_physical_block,
+                    valid_rows,
+                    codec_token_block=self.tile_policy.codec_token_block,
+                    codec_dim_block=self.tile_policy.codec_dim_block,
+                    alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+                )
             _debug_sync("raw staging commit")
             _debug_warmup("raw staging commit done")
             _debug_warmup("raw staging release start")
@@ -753,8 +1252,13 @@ class ByteV2RawStagingManager:
             )
             _debug_sync("raw staging release")
             _debug_warmup("raw staging release done")
-        except NotImplementedError:
+        except NotImplementedError as error:
             self._initialize_allocator_state()
+            if hybrid_state is not None:
+                raise RuntimeError(
+                    "ByteV2 hybrid raw fallback op became unavailable after "
+                    "runtime validation"
+                ) from error
             return False, False
         return True, flags_updated
 
@@ -789,14 +1293,61 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             head_dim=head_size,
             head_dim_v=head_size,
         )
+        self.fa2_hybrid_raw_fallback = byte_v2_hybrid_raw_fallback_enabled()
+        if self.fa2_hybrid_raw_fallback:
+            unsupported = []
+            if (self.num_heads, self.num_kv_heads, self.head_size) != (32, 8, 128):
+                unsupported.append("local Hq=32, Hkv=8, and D=128 are required")
+            if self.tile_policy != DEFAULT_BYTE_V2_TILE_POLICY:
+                unsupported.append("the default ByteV2 V5 tile policy is required")
+            if self.kv_sharing_target_layer_name is not None:
+                unsupported.append("cross-layer KV-cache sharing")
+            if self.alibi_slopes is not None:
+                unsupported.append("ALiBi")
+            if self.sliding_window is not None:
+                unsupported.append("sliding-window/local attention")
+            if self.logits_soft_cap is not None and self.logits_soft_cap > 0:
+                unsupported.append("logit softcap")
+            if self.attn_type != AttentionType.DECODER:
+                unsupported.append("non-decoder attention")
+            if unsupported:
+                raise RuntimeError(
+                    "ByteV2 hybrid raw fallback does not support this "
+                    f"configuration: {', '.join(unsupported)}"
+                )
+        self.raw_fallback_store: ByteV2RawFallbackStore | None = None
+        if self.fa2_hybrid_raw_fallback:
+            self.raw_fallback_store = ByteV2RawFallbackStore(
+                raw_layout=ByteV2RawStagingLayout(
+                    tile_policy=self.tile_policy,
+                    num_kv_heads=self.num_kv_heads,
+                )
+            )
         self.raw_staging_manager = ByteV2RawStagingManager(
             tile_policy=self.tile_policy,
             num_kv_heads=self.num_kv_heads,
+            raw_fallback_store=self.raw_fallback_store,
         )
         self.prefill_backend = _prefill_backend()
         self.decode_kernel_mode = _decode_kernel_mode()
         self.decode_fa2_available = False
-        if self.decode_kernel_mode != "legacy":
+        if self.fa2_hybrid_raw_fallback:
+            hybrid_reader_available = byte_v2_fa2_hybrid_decode_is_available()
+            hybrid_writer_available = byte_v2_hybrid_cache_update_is_available()
+            if not hybrid_reader_available or not hybrid_writer_available:
+                missing = []
+                if not hybrid_reader_available:
+                    missing.append("FA2 hybrid reader")
+                if not hybrid_writer_available:
+                    missing.append("hybrid cache writer/reset ops")
+                raise RuntimeError(
+                    "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1 requested the "
+                    "experimental compact/raw checkpoint, but the following "
+                    f"ops are unavailable: {', '.join(missing)}"
+                )
+            self.decode_fa2_available = True
+            logger.info_once("[ByteV2] experimental FA2 hybrid raw fallback is enabled")
+        elif self.decode_kernel_mode != "legacy":
             self.decode_fa2_available = byte_v2_fa2_decode_is_available()
             if self.decode_kernel_mode == "fa2" and not self.decode_fa2_available:
                 raise RuntimeError(
@@ -895,6 +1446,68 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         self._decode_cache_stats: torch.Tensor | None = None
         self._decode_page_unsafe_flags: torch.Tensor | None = None
         self._decode_page_unsafe_flags_cache_ptr: int | None = None
+
+    def raw_staging_workspace_spec(
+        self,
+        kv_cache: torch.Tensor,
+        num_staging_slots: int,
+    ) -> ByteV2RawStagingWorkspaceSpec | None:
+        """Return this layer's requirement for the shared staging bundle."""
+        if not self.fa2_hybrid_raw_fallback:
+            return None
+        return ByteV2RawStagingWorkspaceSpec(
+            num_blocks=int(kv_cache.shape[0]),
+            num_staging_slots=num_staging_slots,
+            slot_size_bytes=self.raw_staging_manager.raw_layout.slot_size_bytes,
+            device=kv_cache.device,
+        )
+
+    def bind_raw_staging_workspace(
+        self,
+        workspace: ByteV2RawStagingWorkspace,
+    ) -> None:
+        """Bind the runner-owned workspace used serially across layers."""
+        if not self.fa2_hybrid_raw_fallback:
+            raise RuntimeError(
+                "Cannot bind a ByteV2 raw staging workspace when hybrid "
+                "fallback is disabled"
+            )
+        self.raw_staging_manager.bind_shared_workspace(workspace)
+
+    def bind_raw_fallback_plan(
+        self,
+        *,
+        num_blocks: int,
+        num_raw_slots: int,
+    ) -> None:
+        """Bind persistent sidecar dimensions resolved by the planner."""
+        if self.raw_fallback_store is None:
+            raise RuntimeError(
+                "Cannot bind a raw fallback plan when hybrid fallback is disabled"
+            )
+        self.raw_fallback_store.bind_plan(
+            num_blocks=num_blocks,
+            num_raw_slots=num_raw_slots,
+        )
+
+    def initialize_raw_fallback_state(self, kv_cache: torch.Tensor) -> None:
+        """Allocate planned persistent state before warmup or graph capture."""
+        if self.raw_fallback_store is None:
+            raise RuntimeError(
+                "Cannot initialize raw fallback state when hybrid fallback is disabled"
+            )
+        self.raw_fallback_store.state(kv_cache)
+
+    def clear_raw_fallback_runtime_state(self) -> None:
+        """Release profiling-only workspace and sidecar tensor references."""
+        self.raw_staging_manager.clear_shared_workspace()
+        if self.raw_fallback_store is not None:
+            self.raw_fallback_store.clear_binding()
+
+    def reset_raw_fallback_pages(self, physical_block_ids: torch.Tensor) -> None:
+        """Release raw sidecar slots for scheduler-reset physical blocks."""
+        if self.raw_fallback_store is not None:
+            self.raw_fallback_store.reset(physical_block_ids)
 
     def _use_gqa_packed_decode(self, max_seq_len: int) -> bool:
         if not self.decode_gqa_packed:
@@ -2008,6 +2621,18 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
     ) -> torch.Tensor:
         if key is None or value is None:
             return output.fill_(0)
+        has_cached_context = self._prefill_has_cached_context(attn_metadata)
+        if self.raw_fallback_store is not None and has_cached_context:
+            # Hybrid FA2 is the only cache reader that understands both the
+            # compact page and the exact raw sidecar. Route mixed prefill,
+            # prefix-cache reuse, and speculative Q>1 through it before any of
+            # the legacy ByteV2 verification fast paths are considered.
+            return self._forward_prefill_from_cache(
+                query,
+                kv_cache,
+                output,
+                attn_metadata,
+            )
         speculative_query_len = self._speculative_gqa_query_len(
             query,
             kv_cache,
@@ -2032,7 +2657,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             ragged_num_requests,
         ):
             return output
-        if self._prefill_has_cached_context(attn_metadata):
+        if has_cached_context:
             return self._forward_prefill_from_cache(
                 query,
                 kv_cache,
@@ -2113,6 +2738,38 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         attn_metadata: ByteV2AttentionMetadata,
     ) -> torch.Tensor:
         common_prefix_len = int(getattr(attn_metadata, "common_prefix_len", 0))
+
+        if self.raw_fallback_store is not None:
+            if not attn_metadata.causal:
+                raise RuntimeError(
+                    "ByteV2 hybrid FA2 cache reads require causal attention"
+                )
+            num_actual_tokens = min(attn_metadata.num_actual_tokens, query.shape[0])
+            if num_actual_tokens <= 0:
+                return output
+            batch_size = min(
+                attn_metadata.query_start_loc.numel() - 1,
+                attn_metadata.block_table.shape[0],
+                attn_metadata.seq_lens.shape[0],
+            )
+            if batch_size <= 0:
+                return output
+            hybrid_state = self.raw_fallback_store.state(kv_cache)
+            byte_v2_fa2_hybrid_paged_decode_attention(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                kv_cache,
+                hybrid_state.raw_pages,
+                hybrid_state.page_to_raw_slot,
+                attn_metadata.query_start_loc[: batch_size + 1],
+                attn_metadata.block_table[:batch_size],
+                attn_metadata.seq_lens[:batch_size],
+                scale=self.scale,
+                max_query_len=attn_metadata.max_query_len,
+                max_seq_len=attn_metadata.max_seq_len,
+                causal=attn_metadata.causal,
+            )
+            return output
 
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
         if query_start_loc_cpu is None:
@@ -2268,7 +2925,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         output: torch.Tensor,
         attn_metadata: ByteV2AttentionMetadata,
     ) -> bool:
-        if self.decode_kernel_mode == "legacy":
+        if self.decode_kernel_mode == "legacy" and not self.fa2_hybrid_raw_fallback:
             return False
         incompatibility = self._fa2_decode_incompatibility(
             query,
@@ -2277,25 +2934,41 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             attn_metadata,
         )
         if incompatibility is not None:
-            if self.decode_kernel_mode == "fa2":
+            if self.decode_kernel_mode == "fa2" or self.fa2_hybrid_raw_fallback:
                 raise RuntimeError(
-                    "BYTE_V2_DECODE_KERNEL=fa2 cannot run this decode: "
-                    f"{incompatibility}"
+                    f"ByteV2 FA2 decode cannot run this decode: {incompatibility}"
                 )
             return False
 
         batch_size = output.shape[0]
-        byte_v2_fa2_paged_decode_attention(
-            output,
-            query,
-            kv_cache,
-            attn_metadata.query_start_loc,
-            attn_metadata.block_table[:batch_size],
-            attn_metadata.seq_lens[:batch_size],
-            scale=self.scale,
-            max_seq_len=attn_metadata.max_seq_len,
-            causal=attn_metadata.causal,
-        )
+        if self.raw_fallback_store is None:
+            byte_v2_fa2_paged_decode_attention(
+                output,
+                query,
+                kv_cache,
+                attn_metadata.query_start_loc,
+                attn_metadata.block_table[:batch_size],
+                attn_metadata.seq_lens[:batch_size],
+                scale=self.scale,
+                max_seq_len=attn_metadata.max_seq_len,
+                causal=attn_metadata.causal,
+            )
+        else:
+            hybrid_state = self.raw_fallback_store.state(kv_cache)
+            byte_v2_fa2_hybrid_paged_decode_attention(
+                output,
+                query,
+                kv_cache,
+                hybrid_state.raw_pages,
+                hybrid_state.page_to_raw_slot,
+                attn_metadata.query_start_loc,
+                attn_metadata.block_table[:batch_size],
+                attn_metadata.seq_lens[:batch_size],
+                scale=self.scale,
+                max_query_len=1,
+                max_seq_len=attn_metadata.max_seq_len,
+                causal=attn_metadata.causal,
+            )
         return True
 
     def forward(
@@ -2355,7 +3028,52 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        self._do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            None,
+        )
+
+    def do_kv_cache_update_with_metadata(
+        self,
+        layer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: object | None,
+    ) -> None:
+        self._do_kv_cache_update(
+            layer,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            attn_metadata,
+        )
+
+    def _do_kv_cache_update(
+        self,
+        layer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: object | None,
+    ) -> None:
         del layer
+        query_start_locs = _trusted_byte_v2_query_start_locs(
+            attn_metadata,
+            slot_mapping.shape[0],
+        )
+        if query_start_locs is not None:
+            num_actual_tokens = query_start_locs[-1]
+            key = key[:num_actual_tokens]
+            value = value[:num_actual_tokens]
+            slot_mapping = slot_mapping[:num_actual_tokens]
         _debug_warmup(
             "kv update start key=%s kv_cache=%s slot_mapping=%s",
             tuple(key.shape),
@@ -2378,6 +3096,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             page_unsafe_flags = self._get_decode_page_unsafe_flags(kv_cache)
         if (
             page_unsafe_flags is None
+            and not self.fa2_hybrid_raw_fallback
             and _fused_single_token_staging_enabled()
             and slot_mapping.shape[0] == 1
             and kv_cache.is_cuda
@@ -2390,12 +3109,17 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             kv_cache=kv_cache,
             slot_mapping=slot_mapping,
             page_unsafe_flags=page_unsafe_flags,
+            attn_metadata=attn_metadata,
         )
         if handled:
             if not flags_updated:
                 self._update_decode_page_unsafe_flags(kv_cache, slot_mapping)
             _debug_warmup("kv update done via cache update manager")
             return
+        if self.fa2_hybrid_raw_fallback:
+            raise RuntimeError(
+                "ByteV2 hybrid raw fallback cannot use the direct cache writer"
+            )
         byte_v2_reshape_and_cache(
             key,
             value,

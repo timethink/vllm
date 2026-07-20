@@ -1960,6 +1960,28 @@ def test_reset_prefix_cache():
     assert all([blk.block_hash is None for blk in manager.block_pool.blocks])
 
 
+@pytest.mark.parametrize("byte_v2_raw_fallback_slots", [0, 1])
+def test_reset_prefix_cache_reports_all_byte_v2_blocks(
+    byte_v2_raw_fallback_slots: int,
+):
+    """A global prefix reset must immediately reclaim raw sidecar slots."""
+    num_blocks = 11
+    config = make_kv_cache_config(block_size=16, num_blocks=num_blocks)
+    config.byte_v2_raw_fallback_slots = byte_v2_raw_fallback_slots
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+
+    assert manager.take_new_block_ids() == []
+    assert manager.reset_prefix_cache()
+    expected = list(range(num_blocks)) if byte_v2_raw_fallback_slots else []
+    assert manager.take_new_block_ids() == expected
+    assert manager.take_new_block_ids() == []
+
+
 def test_prefix_cache_stats_disabled():
     """Test that prefix_cache_stats is None when log_stats is False."""
     block_size = 16
