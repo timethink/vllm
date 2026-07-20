@@ -607,6 +607,21 @@ void byte_v2_update_cache_raw_staging(
     bool fuse_single_token_staging, bool fuse_single_token_commit_release,
     bool fuse_single_token_stage_metadata_clear);
 
+void byte_v2_update_hybrid_cache_raw_staging_q1(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow, torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    const std::vector<int64_t>& tile_policy,
+    std::optional<torch::stable::Tensor> page_unsafe_flags);
+
 void byte_v2_collect_cache_stats(torch::stable::Tensor& stats,
                                  torch::stable::Tensor& kv_cache,
                                  torch::stable::Tensor& block_tables,

@@ -62,6 +62,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_update_cache_raw_staging,
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
+    byte_v2_update_hybrid_cache_raw_staging_q1,
 )
 from vllm.v1.kv_cache_interface import byte_v2_hybrid_raw_fallback_enabled
 
@@ -1112,6 +1113,43 @@ class ByteV2RawStagingManager:
             :active_slot_capacity
         ]
         valid_rows = self.valid_rows[:active_slot_capacity]
+
+        if (
+            hybrid_state is not None
+            and slot_mapping.shape[0] == 1
+            and active_slot_capacity == 1
+            and slot_mapping.is_cuda
+        ):
+            try:
+                byte_v2_update_hybrid_cache_raw_staging_q1(
+                    key,
+                    value,
+                    raw_staging,
+                    kv_cache,
+                    hybrid_state.raw_pages,
+                    slot_mapping,
+                    self.block_to_staging_slot,
+                    staging_to_physical_block,
+                    valid_rows,
+                    self.next_staging_slot,
+                    self.overflow,
+                    hybrid_state.page_to_raw_slot,
+                    hybrid_state.free_slots,
+                    hybrid_state.free_count,
+                    hybrid_state.fatal,
+                    tile_policy=(
+                        self.tile_policy.codec_token_block,
+                        self.tile_policy.codec_dim_block,
+                        self.tile_policy.alloc_block_tokens,
+                        self.tile_policy.compute_block_n,
+                        self.tile_policy.head_dim,
+                        self.tile_policy.head_dim_v,
+                    ),
+                    page_unsafe_flags=page_unsafe_flags,
+                )
+                return True, page_unsafe_flags is not None
+            except NotImplementedError:
+                pass
 
         if (
             hybrid_state is None

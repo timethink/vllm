@@ -116,6 +116,7 @@ def byte_v2_hybrid_cache_update_is_available() -> bool:
         for op_name in (
             "byte_v2_hydrate_raw_staging_from_hybrid_cache",
             "byte_v2_commit_raw_staging_to_hybrid_cache",
+            "byte_v2_update_hybrid_cache_raw_staging_q1",
             "byte_v2_reset_raw_fallback_pages",
         )
     )
@@ -473,6 +474,48 @@ def byte_v2_update_cache_raw_staging(
         fuse_single_token_staging,
         fuse_single_token_commit_release,
         fuse_single_token_stage_metadata_clear,
+    )
+
+
+def byte_v2_update_hybrid_cache_raw_staging_q1(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    raw_staging: torch.Tensor,
+    kv_cache: torch.Tensor,
+    persistent_raw_staging: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_to_staging_slot: torch.Tensor,
+    staging_to_physical_block: torch.Tensor,
+    valid_rows: torch.Tensor,
+    next_staging_slot: torch.Tensor,
+    overflow: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    free_raw_slots: torch.Tensor,
+    free_raw_slot_count: torch.Tensor,
+    raw_pool_overflow: torch.Tensor,
+    *,
+    tile_policy: Sequence[int],
+    page_unsafe_flags: torch.Tensor | None = None,
+) -> None:
+    """Run the exact compact/raw hybrid Q1 update in three CUDA kernels."""
+    _require_op("_C_cache_ops", "byte_v2_update_hybrid_cache_raw_staging_q1")(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        persistent_raw_staging,
+        slot_mapping,
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+        page_to_raw_slot,
+        free_raw_slots,
+        free_raw_slot_count,
+        raw_pool_overflow,
+        list(tile_policy),
+        page_unsafe_flags,
     )
 
 

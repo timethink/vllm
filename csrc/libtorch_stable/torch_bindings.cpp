@@ -976,6 +976,24 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                           -> ()");
 
   ops.def(
+      "byte_v2_update_hybrid_cache_raw_staging_q1("
+      "                           Tensor key, Tensor value,"
+      "                           Tensor! raw_staging, Tensor! kv_cache,"
+      "                           Tensor! persistent_raw_staging,"
+      "                           Tensor slot_mapping,"
+      "                           Tensor! block_to_staging_slot,"
+      "                           Tensor! staging_to_physical_block,"
+      "                           Tensor! valid_rows,"
+      "                           Tensor! next_staging_slot,"
+      "                           Tensor! overflow,"
+      "                           Tensor! page_to_raw_slot,"
+      "                           Tensor! free_raw_slots,"
+      "                           Tensor! free_raw_slot_count,"
+      "                           Tensor! raw_pool_overflow,"
+      "                           int[] tile_policy,"
+      "                           Tensor!? page_unsafe_flags) -> ()");
+
+  ops.def(
       "byte_v2_collect_cache_stats("
       "                           Tensor! stats, Tensor kv_cache,"
       "                           Tensor block_tables, Tensor seq_lens,"
@@ -1120,6 +1138,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
            TORCH_BOX(&byte_v2_reset_raw_fallback_pages));
   ops.impl("byte_v2_update_cache_raw_staging",
            TORCH_BOX(&byte_v2_update_cache_raw_staging));
+  ops.impl("byte_v2_update_hybrid_cache_raw_staging_q1",
+           TORCH_BOX(&byte_v2_update_hybrid_cache_raw_staging_q1));
   ops.impl("byte_v2_collect_cache_stats",
            TORCH_BOX(&byte_v2_collect_cache_stats));
   ops.impl("byte_v2_update_cache_unsafe_flags",

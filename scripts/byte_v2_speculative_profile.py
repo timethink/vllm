@@ -38,6 +38,7 @@ _BYTE_V2_PROFILE_OP_NAMES = (
     "byte_v2_reshape_and_cache",
     "byte_v2_update_cache_single_token",
     "byte_v2_update_cache_raw_staging",
+    "byte_v2_update_hybrid_cache_raw_staging_q1",
     "byte_v2_update_cache_unsafe_flags",
     "byte_v2_paged_decode_attention",
     "byte_v2_paged_decode_attention_split_k",
