@@ -6342,6 +6342,245 @@ __global__ void byte_v2_hydrate_append_single_token_raw_staging_kernel(
   }
 }
 
+__global__ void byte_v2_hydrate_append_multi_token_hybrid_staging_kernel(
+    const uint16_t* __restrict__ key, const uint16_t* __restrict__ value,
+    uint8_t* __restrict__ raw_staging, uint8_t* __restrict__ kv_cache,
+    const uint8_t* __restrict__ persistent_raw_staging,
+    const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ block_to_staging_slot,
+    int32_t* __restrict__ staging_to_physical_block,
+    int32_t* __restrict__ valid_rows, int32_t* __restrict__ next_staging_slot,
+    int32_t* __restrict__ staging_overflow,
+    const int32_t* __restrict__ page_to_raw_slot,
+    int32_t* __restrict__ raw_pool_overflow, int64_t num_tokens,
+    int64_t key_stride_token, int64_t key_stride_head, int64_t key_stride_dim,
+    int64_t value_stride_token, int64_t value_stride_head,
+    int64_t value_stride_dim, int64_t num_physical_blocks,
+    int64_t num_staging_slots, int64_t raw_staging_stride_slot,
+    int64_t kv_cache_stride_block, int64_t persistent_raw_slots,
+    int64_t persistent_raw_stride_slot) {
+  constexpr int kBlockSize = ByteV2DefaultPolicy::AllocBlockTokens;
+  constexpr int kHeadDim = ByteV2DefaultPolicy::HeadDim;
+  constexpr int kHeadDimV = ByteV2DefaultPolicy::HeadDimV;
+  constexpr int kNumKvHeads = ByteV2DefaultLayout::NumKvHeadsValue;
+  constexpr int kTokensPerOwnerChunk = kBlockSize;
+  constexpr int32_t kClaimedStagingSlot = -2;
+
+  __shared__ int32_t candidate_physical_blocks[kTokensPerOwnerChunk];
+  __shared__ int32_t token_for_row[kBlockSize];
+  __shared__ int32_t candidate_count;
+  __shared__ int32_t is_page_owner;
+  __shared__ int32_t owned_staging_slot;
+  __shared__ int32_t owned_raw_slot;
+  __shared__ int32_t owned_valid_rows;
+  __shared__ int32_t invalid_state;
+
+  const int64_t chunk_start =
+      static_cast<int64_t>(blockIdx.x) * kTokensPerOwnerChunk;
+  const int64_t chunk_end = min(chunk_start + kTokensPerOwnerChunk, num_tokens);
+  if (chunk_start >= chunk_end) {
+    return;
+  }
+
+  if (threadIdx.x == 0) {
+    candidate_count = 0;
+    invalid_state = 0;
+    if (raw_pool_overflow[0] != 0 || staging_overflow[0] != 0) {
+      invalid_state = 1;
+    }
+    for (int64_t token_idx = chunk_start; token_idx < chunk_end; ++token_idx) {
+      const int64_t slot_idx = slot_mapping[token_idx];
+      if (slot_idx < 0) {
+        continue;
+      }
+      const int64_t physical_block = slot_idx / kBlockSize;
+      if (physical_block < 0 || physical_block >= num_physical_blocks) {
+        invalid_state = 1;
+        continue;
+      }
+      const int32_t physical_block32 = static_cast<int32_t>(physical_block);
+      bool already_listed = false;
+      for (int candidate_idx = 0; candidate_idx < candidate_count;
+           ++candidate_idx) {
+        already_listed |=
+            candidate_physical_blocks[candidate_idx] == physical_block32;
+      }
+      if (!already_listed) {
+        candidate_physical_blocks[candidate_count++] = physical_block32;
+      }
+    }
+    if (invalid_state != 0) {
+      atomicExch(staging_overflow, 1);
+      atomicExch(raw_pool_overflow, 1);
+    }
+  }
+  __syncthreads();
+  if (invalid_state != 0) {
+    __trap();
+    return;
+  }
+  // Ensure every thread has completed the initial status read before thread 0
+  // reuses the shared flag for the first candidate page.
+  __syncthreads();
+
+  for (int candidate_idx = 0; candidate_idx < candidate_count;
+       ++candidate_idx) {
+    const int32_t physical_block = candidate_physical_blocks[candidate_idx];
+    if (threadIdx.x == 0) {
+      invalid_state = 0;
+      owned_staging_slot = -1;
+      owned_raw_slot = -1;
+      owned_valid_rows = 0;
+      const int32_t prior = atomicCAS(block_to_staging_slot + physical_block,
+                                      -1, kClaimedStagingSlot);
+      is_page_owner = prior == -1;
+      if (prior < kClaimedStagingSlot || prior >= num_staging_slots) {
+        invalid_state = 1;
+      }
+      if (is_page_owner != 0) {
+        const int32_t staging_slot = atomicAdd(next_staging_slot, 1);
+        if (staging_slot < 0 || staging_slot >= num_staging_slots) {
+          invalid_state = 1;
+        } else {
+          owned_staging_slot = staging_slot;
+          staging_to_physical_block[staging_slot] = physical_block;
+          valid_rows[staging_slot] = 0;
+        }
+        const int32_t raw_slot = page_to_raw_slot[physical_block];
+        if (raw_slot < -1 || raw_slot >= persistent_raw_slots) {
+          invalid_state = 1;
+        } else {
+          owned_raw_slot = raw_slot;
+        }
+      }
+      if (invalid_state != 0) {
+        atomicExch(staging_overflow, 1);
+        atomicExch(raw_pool_overflow, 1);
+      }
+    }
+    __syncthreads();
+    if (invalid_state != 0) {
+      __trap();
+      return;
+    }
+    if (is_page_owner == 0) {
+      __syncthreads();
+      continue;
+    }
+
+    for (int row = threadIdx.x; row < kBlockSize; row += blockDim.x) {
+      token_for_row[row] = -1;
+    }
+    __syncthreads();
+
+    for (int64_t token_idx = threadIdx.x; token_idx < num_tokens;
+         token_idx += blockDim.x) {
+      const int64_t slot_idx = slot_mapping[token_idx];
+      if (slot_idx < 0 || slot_idx / kBlockSize != physical_block) {
+        continue;
+      }
+      const int row = static_cast<int>(slot_idx % kBlockSize);
+      const int32_t prior =
+          atomicCAS(token_for_row + row, -1, static_cast<int32_t>(token_idx));
+      if (prior != -1) {
+        atomicExch(&invalid_state, 1);
+        atomicExch(staging_overflow, 1);
+        atomicExch(raw_pool_overflow, 1);
+      }
+      atomicMax(&owned_valid_rows, row + 1);
+    }
+    __syncthreads();
+    if (invalid_state != 0 || owned_valid_rows <= 0 ||
+        owned_valid_rows > kBlockSize) {
+      if (threadIdx.x == 0) {
+        atomicExch(staging_overflow, 1);
+        atomicExch(raw_pool_overflow, 1);
+      }
+      __trap();
+      return;
+    }
+
+    uint8_t* __restrict__ staging =
+        raw_staging +
+        static_cast<int64_t>(owned_staging_slot) * raw_staging_stride_slot;
+    const uint8_t* __restrict__ compact_page =
+        kv_cache + static_cast<int64_t>(physical_block) * kv_cache_stride_block;
+    const uint8_t* __restrict__ raw_page =
+        owned_raw_slot >= 0
+            ? persistent_raw_staging + static_cast<int64_t>(owned_raw_slot) *
+                                           persistent_raw_stride_slot
+            : nullptr;
+    const int64_t work_items =
+        static_cast<int64_t>(2) * kNumKvHeads * owned_valid_rows * kHeadDim;
+    for (int64_t work_idx = threadIdx.x; work_idx < work_items;
+         work_idx += blockDim.x) {
+      int64_t tmp = work_idx;
+      const int dim = tmp % kHeadDim;
+      tmp /= kHeadDim;
+      const int row = tmp % owned_valid_rows;
+      tmp /= owned_valid_rows;
+      const int head_idx = tmp % kNumKvHeads;
+      tmp /= kNumKvHeads;
+      const int kv_side = tmp & 1;
+      if (kv_side != 0 && dim >= kHeadDimV) {
+        continue;
+      }
+
+      const int64_t staging_offset =
+          kv_side == 0
+              ? ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim)
+              : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim);
+      uint16_t bits;
+      const int32_t source_token = token_for_row[row];
+      if (source_token >= 0) {
+        const uint16_t* __restrict__ source = kv_side == 0 ? key : value;
+        const int64_t stride_token =
+            kv_side == 0 ? key_stride_token : value_stride_token;
+        const int64_t stride_head =
+            kv_side == 0 ? key_stride_head : value_stride_head;
+        const int64_t stride_dim =
+            kv_side == 0 ? key_stride_dim : value_stride_dim;
+        bits = source[static_cast<int64_t>(source_token) * stride_token +
+                      head_idx * stride_head + dim * stride_dim];
+      } else if (raw_page != nullptr) {
+        bits = byte_v2_load_u16_bytes(raw_page, staging_offset);
+      } else {
+        const float decoded =
+            kv_side == 0
+                ? byte_v2_load_payload_elem<ByteV2DefaultLayout, false>(
+                      compact_page,
+                      ByteV2DefaultLayout::KPayloadBaseBytes +
+                          head_idx * ByteV2DefaultLayout::
+                                         AlignedKPayloadBytesPerKvHead,
+                      head_idx, row, dim)
+                : byte_v2_load_payload_elem<ByteV2DefaultLayout, true>(
+                      compact_page,
+                      ByteV2DefaultLayout::VPayloadBaseBytes +
+                          head_idx * ByteV2DefaultLayout::
+                                         AlignedVPayloadBytesPerKvHead,
+                      head_idx, row, dim);
+        bits = byte_v2_float_to_bf16_bits(decoded);
+      }
+      byte_v2_store_u16_bytes(staging, staging_offset, bits);
+    }
+    __syncthreads();
+
+    uint8_t* __restrict__ compact_page_mutable =
+        kv_cache + static_cast<int64_t>(physical_block) * kv_cache_stride_block;
+    for (int metadata_byte = threadIdx.x;
+         metadata_byte < ByteV2DefaultLayout::AlignedMetadataBytes;
+         metadata_byte += blockDim.x) {
+      compact_page_mutable[metadata_byte] = 0;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      valid_rows[owned_staging_slot] = owned_valid_rows;
+      atomicExch(block_to_staging_slot + physical_block, owned_staging_slot);
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void byte_v2_release_raw_staging_kernel(
     int32_t* __restrict__ block_to_staging_slot,
     int32_t* __restrict__ staging_to_physical_block,
@@ -9797,6 +10036,238 @@ void byte_v2_update_hybrid_cache_raw_staging_q1(
   STD_TORCH_CHECK(
       err == cudaSuccess,
       "byte_v2 fused hybrid Q1 persist/release kernel launch failed: ",
+      cudaGetErrorString(err));
+}
+
+void byte_v2_update_hybrid_cache_raw_staging_multi_token(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow, torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    const std::vector<int64_t>& tile_policy,
+    std::optional<torch::stable::Tensor> page_unsafe_flags) {
+  using torch::headeronly::ScalarType;
+
+  check_byte_v2_tile_policy(tile_policy);
+  STD_TORCH_CHECK(
+      tile_policy[0] == ByteV2DefaultPolicy::CodecTokenBlock &&
+          tile_policy[1] == ByteV2DefaultPolicy::CodecDimBlock &&
+          tile_policy[2] == ByteV2DefaultPolicy::AllocBlockTokens &&
+          tile_policy[4] == ByteV2DefaultPolicy::HeadDim &&
+          tile_policy[5] == ByteV2DefaultPolicy::HeadDimV,
+      "ByteV2 fused hybrid multi-token update supports only the default V5 "
+      "layout");
+  STD_TORCH_CHECK(key.device().is_cuda(), "key must be a CUDA tensor");
+  const auto device = key.device();
+  STD_TORCH_CHECK(
+      value.device() == device && raw_staging.device() == device &&
+          kv_cache.device() == device &&
+          persistent_raw_staging.device() == device &&
+          slot_mapping.device() == device &&
+          block_to_staging_slot.device() == device &&
+          staging_to_physical_block.device() == device &&
+          valid_rows.device() == device &&
+          next_staging_slot.device() == device && overflow.device() == device &&
+          page_to_raw_slot.device() == device &&
+          free_raw_slots.device() == device &&
+          free_raw_slot_count.device() == device &&
+          raw_pool_overflow.device() == device &&
+          (!page_unsafe_flags.has_value() ||
+           page_unsafe_flags->device() == device),
+      "ByteV2 fused hybrid multi-token update tensors must be on the same "
+      "device");
+  STD_TORCH_CHECK(key.scalar_type() == ScalarType::BFloat16 &&
+                      value.scalar_type() == ScalarType::BFloat16,
+                  "ByteV2 fused hybrid multi-token update requires bf16 K/V");
+  STD_TORCH_CHECK(
+      raw_staging.scalar_type() == ScalarType::Byte &&
+          kv_cache.scalar_type() == ScalarType::Byte &&
+          persistent_raw_staging.scalar_type() == ScalarType::Byte,
+      "ByteV2 fused hybrid multi-token update requires uint8 cache storage");
+  STD_TORCH_CHECK(slot_mapping.scalar_type() == ScalarType::Long,
+                  "slot_mapping must be int64");
+  STD_TORCH_CHECK(
+      block_to_staging_slot.scalar_type() == ScalarType::Int &&
+          staging_to_physical_block.scalar_type() == ScalarType::Int &&
+          valid_rows.scalar_type() == ScalarType::Int &&
+          next_staging_slot.scalar_type() == ScalarType::Int &&
+          overflow.scalar_type() == ScalarType::Int &&
+          page_to_raw_slot.scalar_type() == ScalarType::Int &&
+          free_raw_slots.scalar_type() == ScalarType::Int &&
+          free_raw_slot_count.scalar_type() == ScalarType::Int &&
+          raw_pool_overflow.scalar_type() == ScalarType::Int &&
+          (!page_unsafe_flags.has_value() ||
+           page_unsafe_flags->scalar_type() == ScalarType::Int),
+      "ByteV2 fused hybrid multi-token maps and allocator state must be "
+      "int32");
+
+  STD_TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+                  "key and value must be [tokens, heads, head_dim]");
+  STD_TORCH_CHECK(
+      key.size(0) > 1 && value.size(0) == key.size(0) &&
+          key.size(0) <= std::numeric_limits<int32_t>::max() &&
+          key.size(1) == ByteV2DefaultLayout::NumKvHeadsValue &&
+          value.size(1) == key.size(1) &&
+          key.size(2) == ByteV2DefaultPolicy::HeadDim &&
+          value.size(2) == ByteV2DefaultPolicy::HeadDimV,
+      "ByteV2 fused hybrid multi-token update requires Q>1 8-head D128 "
+      "K/V");
+  STD_TORCH_CHECK(
+      slot_mapping.dim() == 1 && slot_mapping.size(0) == key.size(0) &&
+          slot_mapping.stride(0) == 1,
+      "slot_mapping must contain one contiguous entry per input token");
+  STD_TORCH_CHECK(
+      raw_staging.dim() == 2 && raw_staging.size(0) > 0 &&
+          raw_staging.size(0) <= std::numeric_limits<int32_t>::max() &&
+          raw_staging.size(1) >= ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          raw_staging.stride(0) >=
+              ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          raw_staging.stride(1) == 1,
+      "raw_staging must contain contiguous ByteV2 raw pages");
+  STD_TORCH_CHECK(
+      kv_cache.dim() == 2 && kv_cache.size(0) > 0 &&
+          kv_cache.size(0) <= std::numeric_limits<int32_t>::max() &&
+          kv_cache.size(1) >= ByteV2DefaultLayout::PageSizeBytes &&
+          kv_cache.stride(0) >= ByteV2DefaultLayout::PageSizeBytes &&
+          kv_cache.stride(1) == 1,
+      "kv_cache must use the contiguous ByteV2 V5 layout");
+  STD_TORCH_CHECK(
+      persistent_raw_staging.dim() == 2 && persistent_raw_staging.size(0) > 0 &&
+          persistent_raw_staging.size(0) <=
+              std::numeric_limits<int32_t>::max() &&
+          persistent_raw_staging.size(1) >=
+              ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          persistent_raw_staging.stride(0) >=
+              ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          persistent_raw_staging.stride(1) == 1,
+      "persistent_raw_staging must contain complete contiguous raw pages");
+  STD_TORCH_CHECK(
+      block_to_staging_slot.dim() == 1 &&
+          block_to_staging_slot.size(0) == kv_cache.size(0) &&
+          block_to_staging_slot.stride(0) == 1 &&
+          staging_to_physical_block.dim() == 1 &&
+          staging_to_physical_block.size(0) == raw_staging.size(0) &&
+          staging_to_physical_block.stride(0) == 1 && valid_rows.dim() == 1 &&
+          valid_rows.size(0) == raw_staging.size(0) &&
+          valid_rows.stride(0) == 1 && next_staging_slot.dim() == 1 &&
+          next_staging_slot.size(0) == 1 && next_staging_slot.stride(0) == 1 &&
+          overflow.dim() == 1 && overflow.size(0) == 1 &&
+          overflow.stride(0) == 1,
+      "ByteV2 fused hybrid multi-token transient allocator shapes are "
+      "invalid");
+  STD_TORCH_CHECK(
+      page_to_raw_slot.dim() == 1 &&
+          page_to_raw_slot.size(0) == kv_cache.size(0) &&
+          page_to_raw_slot.stride(0) == 1 && free_raw_slots.dim() == 1 &&
+          free_raw_slots.size(0) == persistent_raw_staging.size(0) &&
+          free_raw_slots.stride(0) == 1 && free_raw_slot_count.dim() == 1 &&
+          free_raw_slot_count.size(0) == 1 &&
+          free_raw_slot_count.stride(0) == 1 && raw_pool_overflow.dim() == 1 &&
+          raw_pool_overflow.size(0) == 1 && raw_pool_overflow.stride(0) == 1,
+      "ByteV2 fused hybrid multi-token persistent allocator shapes are "
+      "invalid");
+  if (page_unsafe_flags.has_value()) {
+    STD_TORCH_CHECK(page_unsafe_flags->dim() == 1 &&
+                        page_unsafe_flags->size(0) >= kv_cache.size(0) &&
+                        page_unsafe_flags->stride(0) == 1,
+                    "page_unsafe_flags must contain every KV page");
+  }
+  STD_TORCH_CHECK(
+      raw_staging.stride(0) % alignof(uint4) == 0 &&
+          persistent_raw_staging.stride(0) % alignof(uint4) == 0 &&
+          reinterpret_cast<uintptr_t>(raw_staging.const_data_ptr()) %
+                  alignof(uint4) ==
+              0 &&
+          reinterpret_cast<uintptr_t>(persistent_raw_staging.const_data_ptr()) %
+                  alignof(uint4) ==
+              0,
+      "transient and persistent raw pages must be 16-byte aligned");
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      key.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(key.get_device_index());
+  constexpr int kStageThreads = 256;
+  constexpr int kTokensPerStageBlock = ByteV2DefaultPolicy::AllocBlockTokens;
+  const int stage_blocks = static_cast<int>(
+      (key.size(0) + kTokensPerStageBlock - 1) / kTokensPerStageBlock);
+  byte_v2_hydrate_append_multi_token_hybrid_staging_kernel<<<
+      stage_blocks, kStageThreads, 0, stream>>>(
+      reinterpret_cast<const uint16_t*>(key.const_data_ptr()),
+      reinterpret_cast<const uint16_t*>(value.const_data_ptr()),
+      reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()),
+      reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+      reinterpret_cast<const uint8_t*>(persistent_raw_staging.const_data_ptr()),
+      slot_mapping.const_data_ptr<int64_t>(),
+      block_to_staging_slot.mutable_data_ptr<int32_t>(),
+      staging_to_physical_block.mutable_data_ptr<int32_t>(),
+      valid_rows.mutable_data_ptr<int32_t>(),
+      next_staging_slot.mutable_data_ptr<int32_t>(),
+      overflow.mutable_data_ptr<int32_t>(),
+      page_to_raw_slot.const_data_ptr<int32_t>(),
+      raw_pool_overflow.mutable_data_ptr<int32_t>(), key.size(0), key.stride(0),
+      key.stride(1), key.stride(2), value.stride(0), value.stride(1),
+      value.stride(2), kv_cache.size(0), raw_staging.size(0),
+      raw_staging.stride(0), kv_cache.stride(0), persistent_raw_staging.size(0),
+      persistent_raw_staging.stride(0));
+  cudaError_t err = cudaGetLastError();
+  STD_TORCH_CHECK(
+      err == cudaSuccess,
+      "byte_v2 fused hybrid multi-token staging kernel launch failed: ",
+      cudaGetErrorString(err));
+
+  constexpr int kCommitThreads = ByteV2DefaultPolicy::CodecPackedElems;
+  constexpr int kHistogramBytes = 128 * sizeof(int);
+  const dim3 commit_grid(
+      static_cast<unsigned int>(raw_staging.size(0)),
+      2 * ByteV2DefaultLayout::NumKvHeadsValue * ByteV2DefaultPolicy::KDimTiles,
+      1);
+  byte_v2_commit_raw_staging_to_cache_kernel<true, false, true, false>
+      <<<commit_grid, kCommitThreads, kHistogramBytes, stream>>>(
+          reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
+          reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+          staging_to_physical_block.mutable_data_ptr<int32_t>(),
+          valid_rows.mutable_data_ptr<int32_t>(), raw_staging.size(0),
+          raw_staging.stride(0), kv_cache.stride(0), nullptr, nullptr, nullptr,
+          nullptr, 0);
+  err = cudaGetLastError();
+  STD_TORCH_CHECK(
+      err == cudaSuccess,
+      "byte_v2 fused hybrid multi-token commit kernel launch failed: ",
+      cudaGetErrorString(err));
+
+  constexpr int kPersistThreads = 256;
+  int32_t* unsafe_flags_ptr =
+      page_unsafe_flags.has_value()
+          ? page_unsafe_flags->mutable_data_ptr<int32_t>()
+          : nullptr;
+  byte_v2_persist_raw_fallback_pages_kernel<true>
+      <<<static_cast<unsigned int>(raw_staging.size(0)), kPersistThreads, 0,
+         stream>>>(
+          reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
+          reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+          staging_to_physical_block.mutable_data_ptr<int32_t>(),
+          valid_rows.mutable_data_ptr<int32_t>(), raw_staging.size(0),
+          raw_staging.stride(0), kv_cache.stride(0),
+          reinterpret_cast<uint8_t*>(persistent_raw_staging.mutable_data_ptr()),
+          persistent_raw_staging.size(0), persistent_raw_staging.stride(0),
+          page_to_raw_slot.mutable_data_ptr<int32_t>(),
+          free_raw_slots.const_data_ptr<int32_t>(),
+          free_raw_slot_count.mutable_data_ptr<int32_t>(),
+          raw_pool_overflow.mutable_data_ptr<int32_t>(), kv_cache.size(0),
+          block_to_staging_slot.mutable_data_ptr<int32_t>(),
+          next_staging_slot.mutable_data_ptr<int32_t>(),
+          overflow.mutable_data_ptr<int32_t>(), unsafe_flags_ptr);
+  err = cudaGetLastError();
+  STD_TORCH_CHECK(
+      err == cudaSuccess,
+      "byte_v2 fused hybrid multi-token persist/release kernel launch failed: ",
       cudaGetErrorString(err));
 }
 

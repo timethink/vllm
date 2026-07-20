@@ -50,6 +50,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_update_cache_raw_staging,
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
+    byte_v2_update_hybrid_cache_raw_staging_multi_token,
     byte_v2_update_hybrid_cache_raw_staging_q1,
     missing_byte_v2_custom_ops,
 )
@@ -1566,6 +1567,35 @@ def test_byte_v2_hybrid_q1_update_wrapper_forwards_optional_flags(monkeypatch):
     assert captured["args"][16] is flags
 
 
+def test_byte_v2_hybrid_multi_token_update_wrapper_forwards_optional_flags(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_require_op(namespace, op_name):
+        assert namespace == "_C_cache_ops"
+        assert op_name == "byte_v2_update_hybrid_cache_raw_staging_multi_token"
+
+        def fake_op(*args):
+            captured["args"] = args
+
+        return fake_op
+
+    monkeypatch.setattr(byte_v2_ops_module, "_require_op", fake_require_op)
+    tensors = [torch.empty(1) for _ in range(15)]
+    flags = torch.empty(1)
+
+    byte_v2_ops_module.byte_v2_update_hybrid_cache_raw_staging_multi_token(
+        *tensors,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+        page_unsafe_flags=flags,
+    )
+
+    assert captured["args"][:15] == tuple(tensors)
+    assert captured["args"][15] == [16, 16, 16, 64, 128, 128]
+    assert captured["args"][16] is flags
+
+
 def test_byte_v2_test_forced_raw_wrapper_forwards_diagnostic(monkeypatch):
     captured = {}
 
@@ -2848,7 +2878,76 @@ def test_byte_v2_raw_staging_manager_routes_test_forced_raw_only_after_q1(
     assert calls == ["fused_q1", "forced_raw"]
 
 
-def test_byte_v2_raw_staging_manager_keeps_hybrid_q2_on_generic_path(monkeypatch):
+def test_byte_v2_raw_staging_manager_uses_fused_hybrid_multi_token_update(
+    monkeypatch,
+):
+    layout = ByteV2RawStagingLayout()
+    workspace = byte_v2_attn_module.ByteV2RawStagingWorkspaceSpec(
+        num_blocks=2,
+        num_staging_slots=2,
+        slot_size_bytes=layout.slot_size_bytes,
+        device=torch.device("cpu"),
+    ).allocate()
+    hybrid_state = SimpleNamespace(
+        raw_pages=torch.empty((1, layout.slot_size_bytes), dtype=torch.uint8),
+        page_to_raw_slot=torch.full((2,), -1, dtype=torch.int32),
+        free_slots=torch.zeros((1,), dtype=torch.int32),
+        free_count=torch.ones((1,), dtype=torch.int32),
+        fatal=torch.zeros((1,), dtype=torch.int32),
+        forced_raw_diagnostic=None,
+    )
+    manager = byte_v2_attn_module.ByteV2RawStagingManager(
+        tile_policy=DEFAULT_BYTE_V2_TILE_POLICY,
+        num_kv_heads=8,
+        raw_fallback_store=SimpleNamespace(state=lambda _: hybrid_state),
+    )
+    manager.bind_shared_workspace(workspace)
+    calls = []
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_update_hybrid_cache_raw_staging_q1",
+        lambda *args, **kwargs: pytest.fail("Q2 used the fused hybrid Q1 op"),
+    )
+
+    def fused_update(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_update_hybrid_cache_raw_staging_multi_token",
+        fused_update,
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_test_force_promote_raw_staging_q1",
+        lambda *args, **kwargs: pytest.fail("Q2 used forced raw promotion"),
+    )
+    slot_mapping = SimpleNamespace(shape=(2,), is_cuda=True)
+    page_flags = torch.zeros((2,), dtype=torch.int32)
+
+    result = manager._update_one_wave(
+        key=torch.empty((2, 8, 128), dtype=torch.bfloat16),
+        value=torch.empty((2, 8, 128), dtype=torch.bfloat16),
+        kv_cache=torch.empty(
+            (2, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8
+        ),
+        slot_mapping=slot_mapping,
+        page_unsafe_flags=page_flags,
+        hybrid_state=hybrid_state,
+        active_slot_capacity=2,
+    )
+
+    assert result == (True, True)
+    assert len(calls) == 1
+    assert calls[0][0][4] is hybrid_state.raw_pages
+    assert calls[0][0][5] is slot_mapping
+    assert calls[0][1]["page_unsafe_flags"] is page_flags
+
+
+def test_byte_v2_raw_staging_manager_falls_back_to_generic_multi_token(
+    monkeypatch,
+):
     layout = ByteV2RawStagingLayout()
     workspace = byte_v2_attn_module.ByteV2RawStagingWorkspaceSpec(
         num_blocks=2,
@@ -2883,6 +2982,16 @@ def test_byte_v2_raw_staging_manager_keeps_hybrid_q2_on_generic_path(monkeypatch
         byte_v2_attn_module,
         "byte_v2_update_hybrid_cache_raw_staging_q1",
         lambda *args, **kwargs: pytest.fail("Q2 used the fused hybrid Q1 op"),
+    )
+
+    def missing_multi_token(*args, **kwargs):
+        del args, kwargs
+        raise NotImplementedError
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_update_hybrid_cache_raw_staging_multi_token",
+        missing_multi_token,
     )
     monkeypatch.setattr(
         byte_v2_attn_module,
@@ -3860,6 +3969,12 @@ def _byte_v2_fused_hybrid_writer_q1_op_is_available() -> bool:
     )
 
 
+def _byte_v2_fused_hybrid_writer_multi_token_op_is_available() -> bool:
+    return _byte_v2_hybrid_writer_ops_are_available() and _has_torch_op(
+        "_C_cache_ops", "byte_v2_update_hybrid_cache_raw_staging_multi_token"
+    )
+
+
 def _byte_v2_test_forced_raw_promotion_op_is_available() -> bool:
     return _byte_v2_fused_hybrid_writer_q1_op_is_available() and _has_torch_op(
         "_C_cache_ops", "byte_v2_test_force_promote_raw_staging_q1"
@@ -3961,6 +4076,8 @@ def _byte_v2_hybrid_writer_update(
     slot_mapping: torch.Tensor,
     *,
     before_commit=None,
+    active_capacity: int | None = None,
+    page_unsafe_flags: torch.Tensor | None = None,
 ) -> None:
     raw_key = tensors["key"]
     raw_value = tensors["value"]
@@ -3973,25 +4090,34 @@ def _byte_v2_hybrid_writer_update(
     assert isinstance(persistent_raw_staging, torch.Tensor)
     assert isinstance(page_to_raw_slot, torch.Tensor)
 
-    key = raw_key.view(-1, 8, 128).index_select(0, slot_mapping)
-    value = raw_value.view(-1, 8, 128).index_select(0, slot_mapping)
+    flat_key = raw_key.view(-1, 8, 128)
+    flat_value = raw_value.view(-1, 8, 128)
+    safe_slots = slot_mapping.clamp(min=0, max=flat_key.size(0) - 1)
+    key = flat_key.index_select(0, safe_slots)
+    value = flat_value.index_select(0, safe_slots)
+    if active_capacity is None:
+        active_capacity = state.transient_raw_staging.size(0)
+    assert 0 < active_capacity <= state.transient_raw_staging.size(0)
+    raw_staging = state.transient_raw_staging[:active_capacity]
+    staging_to_physical_block = state.staging_to_physical_block[:active_capacity]
+    valid_rows = state.valid_rows[:active_capacity]
     ops = torch.ops._C_cache_ops
     ops.byte_v2_prepare_raw_staging(
         slot_mapping,
         state.block_to_staging_slot,
-        state.staging_to_physical_block,
-        state.valid_rows,
+        staging_to_physical_block,
+        valid_rows,
         state.next_staging_slot,
         state.staging_overflow,
         16,
     )
     ops.byte_v2_hydrate_raw_staging_from_hybrid_cache(
-        state.transient_raw_staging,
+        raw_staging,
         byte_cache,
         persistent_raw_staging,
         page_to_raw_slot,
-        state.staging_to_physical_block,
-        state.valid_rows,
+        staging_to_physical_block,
+        valid_rows,
         16,
         16,
         16,
@@ -3999,7 +4125,7 @@ def _byte_v2_hybrid_writer_update(
     ops.byte_v2_append_raw_staging(
         key,
         value,
-        state.transient_raw_staging,
+        raw_staging,
         slot_mapping,
         state.block_to_staging_slot,
         16,
@@ -4009,26 +4135,101 @@ def _byte_v2_hybrid_writer_update(
     if before_commit is not None:
         before_commit()
     ops.byte_v2_commit_raw_staging_to_hybrid_cache(
-        state.transient_raw_staging,
+        raw_staging,
         byte_cache,
         persistent_raw_staging,
         page_to_raw_slot,
         state.free_raw_slots,
         state.free_raw_slot_count,
         state.raw_pool_overflow,
-        state.staging_to_physical_block,
-        state.valid_rows,
+        staging_to_physical_block,
+        valid_rows,
         16,
         16,
         16,
     )
-    ops.byte_v2_release_raw_staging(
+    if page_unsafe_flags is None:
+        ops.byte_v2_release_raw_staging(
+            state.block_to_staging_slot,
+            staging_to_physical_block,
+            valid_rows,
+            state.next_staging_slot,
+            state.staging_overflow,
+        )
+    else:
+        byte_v2_release_raw_staging_and_update_flags(
+            state.block_to_staging_slot,
+            staging_to_physical_block,
+            valid_rows,
+            state.next_staging_slot,
+            state.staging_overflow,
+            page_unsafe_flags,
+            byte_cache,
+            tile_policy=(16, 16, 16, 64, 128, 128),
+        )
+
+
+def _byte_v2_fused_hybrid_writer_multi_token_update(
+    tensors,
+    state,
+    slot_mapping: torch.Tensor,
+    *,
+    active_capacity: int | None = None,
+    page_unsafe_flags: torch.Tensor | None = None,
+) -> None:
+    assert slot_mapping.numel() > 1
+    raw_key = tensors["key"]
+    raw_value = tensors["value"]
+    byte_cache = tensors["byte_cache"]
+    persistent_raw_staging = tensors["raw_staging"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(raw_key, torch.Tensor)
+    assert isinstance(raw_value, torch.Tensor)
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(persistent_raw_staging, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+
+    flat_key = raw_key.view(-1, 8, 128)
+    flat_value = raw_value.view(-1, 8, 128)
+    safe_slots = slot_mapping.clamp(min=0, max=flat_key.size(0) - 1)
+    key = flat_key.index_select(0, safe_slots)
+    value = flat_value.index_select(0, safe_slots)
+    if active_capacity is None:
+        active_capacity = state.transient_raw_staging.size(0)
+    assert 0 < active_capacity <= state.transient_raw_staging.size(0)
+    byte_v2_update_hybrid_cache_raw_staging_multi_token(
+        key,
+        value,
+        state.transient_raw_staging[:active_capacity],
+        byte_cache,
+        persistent_raw_staging,
+        slot_mapping,
         state.block_to_staging_slot,
-        state.staging_to_physical_block,
-        state.valid_rows,
+        state.staging_to_physical_block[:active_capacity],
+        state.valid_rows[:active_capacity],
         state.next_staging_slot,
         state.staging_overflow,
+        page_to_raw_slot,
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        state.raw_pool_overflow,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+        page_unsafe_flags=page_unsafe_flags,
     )
+
+
+def _clone_byte_v2_hybrid_writer_case(tensors, state):
+    cloned_tensors = {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in tensors.items()
+    }
+    cloned_state = SimpleNamespace(
+        **{
+            name: value.clone() if isinstance(value, torch.Tensor) else value
+            for name, value in vars(state).items()
+        }
+    )
+    return cloned_tensors, cloned_state
 
 
 def _byte_v2_fused_hybrid_writer_q1_update(
@@ -4124,6 +4325,89 @@ def _assert_byte_v2_hybrid_writer_matches_raw(tensors) -> None:
     assert result["lse_max_abs"] == 0.0, result
 
 
+def _assert_byte_v2_hybrid_writer_transient_state_is_clean(state) -> None:
+    torch.testing.assert_close(
+        state.block_to_staging_slot,
+        torch.full_like(state.block_to_staging_slot, -1),
+    )
+    torch.testing.assert_close(
+        state.staging_to_physical_block,
+        torch.full_like(state.staging_to_physical_block, -1),
+    )
+    torch.testing.assert_close(state.valid_rows, torch.zeros_like(state.valid_rows))
+    assert int(state.next_staging_slot.item()) == 0
+    assert int(state.staging_overflow.item()) == 0
+    assert int(state.raw_pool_overflow.item()) == 0
+
+
+def _byte_v2_hybrid_writer_allocator_partition(tensors, state):
+    page_to_raw_slot = tensors["page_to_raw_slot"].cpu().tolist()
+    raw_pool_slots = tensors["raw_staging"].size(0)
+    free_count = int(state.free_raw_slot_count.item())
+    assert 0 <= free_count <= raw_pool_slots
+    free_slots = state.free_raw_slots[:free_count].cpu().tolist()
+    mapped_slots = [raw_slot for raw_slot in page_to_raw_slot if raw_slot >= 0]
+    assert sorted(free_slots + mapped_slots) == list(range(raw_pool_slots))
+    return page_to_raw_slot, free_slots
+
+
+def _assert_byte_v2_hybrid_writers_are_canonically_equal(
+    reference_tensors,
+    reference_state,
+    candidate_tensors,
+    candidate_state,
+    reference_flags: torch.Tensor,
+    candidate_flags: torch.Tensor,
+) -> None:
+    reference_map, reference_free = _byte_v2_hybrid_writer_allocator_partition(
+        reference_tensors, reference_state
+    )
+    candidate_map, candidate_free = _byte_v2_hybrid_writer_allocator_partition(
+        candidate_tensors, candidate_state
+    )
+    assert [raw_slot >= 0 for raw_slot in reference_map] == [
+        raw_slot >= 0 for raw_slot in candidate_map
+    ]
+    assert len(reference_free) == len(candidate_free)
+    assert int(reference_state.free_raw_slot_count.item()) == int(
+        candidate_state.free_raw_slot_count.item()
+    )
+    reference_raw = reference_tensors["raw_staging"]
+    candidate_raw = candidate_tensors["raw_staging"]
+    for physical_block, reference_raw_slot in enumerate(reference_map):
+        if reference_raw_slot < 0:
+            continue
+        candidate_raw_slot = candidate_map[physical_block]
+        torch.testing.assert_close(
+            reference_raw[reference_raw_slot],
+            candidate_raw[candidate_raw_slot],
+            atol=0,
+            rtol=0,
+        )
+    torch.testing.assert_close(reference_flags, candidate_flags, atol=0, rtol=0)
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(reference_state)
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(candidate_state)
+
+
+def _byte_v2_q34_partial_two_page_mapping(device: torch.device) -> torch.Tensor:
+    slot_mapping = torch.full((34,), -1, dtype=torch.int64, device=device)
+    # The two physical pages recur in separate 16-token owner chunks, and each
+    # page receives non-contiguous rows in a deliberately permuted order.
+    slot_mapping[0] = 31
+    slot_mapping[7] = 3
+    slot_mapping[18] = 16
+    slot_mapping[33] = 15
+    return slot_mapping
+
+
+def _byte_v2_q34_full_two_page_mapping(device: torch.device) -> torch.Tensor:
+    page_rows = torch.arange(16, dtype=torch.int64, device=device)
+    interleaved = torch.stack((page_rows + 16, page_rows), dim=1).flatten()
+    return torch.cat(
+        (interleaved[:9], interleaved.new_tensor([-1, -1]), interleaved[9:])
+    )
+
+
 def _require_byte_v2_hybrid_writer_reader_ops() -> None:
     if not _byte_v2_hybrid_writer_ops_are_available():
         pytest.skip("ByteV2 hybrid writer custom ops are not registered")
@@ -4138,6 +4422,210 @@ def _require_byte_v2_fused_hybrid_writer_reader_ops() -> None:
     if not _byte_v2_fused_hybrid_writer_q1_op_is_available():
         pytest.skip("ByteV2 fused hybrid Q1 writer op is not registered")
     _require_byte_v2_hybrid_writer_reader_ops()
+
+
+def _require_byte_v2_fused_multi_token_hybrid_writer_reader_ops() -> None:
+    if not _byte_v2_fused_hybrid_writer_multi_token_op_is_available():
+        pytest.skip("ByteV2 fused hybrid multi-token writer op is not registered")
+    _require_byte_v2_hybrid_writer_reader_ops()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("source", ["compact", "existing-raw"])
+def test_byte_v2_fused_hybrid_multi_token_q34_matches_generic_bitwise(source):
+    _require_byte_v2_fused_multi_token_hybrid_writer_reader_ops()
+    tensors, state, full_slots = _make_byte_v2_hybrid_writer_case(
+        seq_len=32,
+        force_outliers=source == "compact",
+        force_pool_overflow=source == "existing-raw",
+        raw_pool_slots=2,
+    )
+    _byte_v2_hybrid_writer_update(
+        tensors,
+        state,
+        full_slots,
+        active_capacity=2,
+    )
+    torch.accelerator.synchronize()
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    if source == "compact":
+        assert bool((page_to_raw_slot == -1).all())
+    else:
+        assert bool((page_to_raw_slot >= 0).all())
+        # Only the persistent raw pages remain authoritative for hydration.
+        tensors["byte_cache"].zero_()
+
+    slot_mapping = _byte_v2_q34_partial_two_page_mapping(tensors["byte_cache"].device)
+    updated_slots = slot_mapping[slot_mapping >= 0]
+    for tensor_name in ("key", "value"):
+        flat = tensors[tensor_name].view(-1, 8, 128)
+        flat.index_copy_(0, updated_slots, -flat.index_select(0, updated_slots))
+
+    reference_tensors, reference_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    candidate_tensors, candidate_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    reference_flags = torch.zeros(
+        (tensors["byte_cache"].size(0),),
+        dtype=torch.int32,
+        device=tensors["byte_cache"].device,
+    )
+    candidate_flags = torch.zeros_like(reference_flags)
+
+    _byte_v2_hybrid_writer_update(
+        reference_tensors,
+        reference_state,
+        slot_mapping,
+        active_capacity=2,
+        page_unsafe_flags=reference_flags,
+    )
+    _byte_v2_fused_hybrid_writer_multi_token_update(
+        candidate_tensors,
+        candidate_state,
+        slot_mapping,
+        active_capacity=2,
+        page_unsafe_flags=candidate_flags,
+    )
+    torch.accelerator.synchronize()
+
+    _assert_byte_v2_hybrid_writer_matches_raw(reference_tensors)
+    _assert_byte_v2_hybrid_writer_matches_raw(candidate_tensors)
+    _assert_byte_v2_hybrid_writers_are_canonically_equal(
+        reference_tensors,
+        reference_state,
+        candidate_tensors,
+        candidate_state,
+        reference_flags,
+        candidate_flags,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_fused_hybrid_multi_token_all_dummy_q34_is_noop():
+    _require_byte_v2_fused_multi_token_hybrid_writer_reader_ops()
+    tensors, state, _ = _make_byte_v2_hybrid_writer_case(seq_len=32, raw_pool_slots=2)
+    slot_mapping = torch.full(
+        (34,), -1, dtype=torch.int64, device=tensors["byte_cache"].device
+    )
+    page_flags = torch.full(
+        (tensors["byte_cache"].size(0),),
+        7,
+        dtype=torch.int32,
+        device=tensors["byte_cache"].device,
+    )
+    watched = (
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        tensors["page_to_raw_slot"],
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        page_flags,
+    )
+    snapshots = [tensor.clone() for tensor in watched]
+
+    _byte_v2_fused_hybrid_writer_multi_token_update(
+        tensors,
+        state,
+        slot_mapping,
+        active_capacity=2,
+        page_unsafe_flags=page_flags,
+    )
+    torch.accelerator.synchronize()
+
+    for tensor, snapshot in zip(watched, snapshots):
+        torch.testing.assert_close(tensor, snapshot, atol=0, rtol=0)
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_fused_hybrid_multi_token_q34_cuda_graph_reuses_workspace():
+    _require_byte_v2_fused_multi_token_hybrid_writer_reader_ops()
+    tensors, state, _ = _make_byte_v2_hybrid_writer_case(
+        seq_len=32,
+        force_pool_overflow=True,
+        raw_pool_slots=2,
+    )
+    flat_key = tensors["key"].view(-1, 8, 128)
+    flat_value = tensors["value"].view(-1, 8, 128)
+    graph_key = torch.zeros((34, 8, 128), dtype=torch.bfloat16, device=flat_key.device)
+    graph_value = torch.zeros_like(graph_key)
+    graph_slot = torch.full((34,), -1, dtype=torch.int64, device=flat_key.device)
+    page_flags = torch.zeros(
+        (tensors["byte_cache"].size(0),),
+        dtype=torch.int32,
+        device=flat_key.device,
+    )
+
+    def update() -> None:
+        byte_v2_update_hybrid_cache_raw_staging_multi_token(
+            graph_key,
+            graph_value,
+            state.transient_raw_staging[:2],
+            tensors["byte_cache"],
+            tensors["raw_staging"],
+            graph_slot,
+            state.block_to_staging_slot,
+            state.staging_to_physical_block[:2],
+            state.valid_rows[:2],
+            state.next_staging_slot,
+            state.staging_overflow,
+            tensors["page_to_raw_slot"],
+            state.free_raw_slots,
+            state.free_raw_slot_count,
+            state.raw_pool_overflow,
+            tile_policy=(16, 16, 16, 64, 128, 128),
+            page_unsafe_flags=page_flags,
+        )
+
+    update()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        update()
+
+    actual_slots = _byte_v2_q34_full_two_page_mapping(flat_key.device)
+    safe_slots = actual_slots.clamp_min(0)
+    graph_key.copy_(flat_key.index_select(0, safe_slots))
+    graph_value.copy_(flat_value.index_select(0, safe_slots))
+    graph_slot.copy_(actual_slots)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert bool((tensors["page_to_raw_slot"] >= 0).all())
+    _assert_byte_v2_hybrid_writer_matches_raw(tensors)
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+    _byte_v2_hybrid_writer_reset(
+        tensors,
+        state,
+        torch.tensor([0, 1], dtype=torch.int32, device=flat_key.device),
+    )
+    tensors["byte_cache"].zero_()
+    page_flags.zero_()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert bool((tensors["page_to_raw_slot"] >= 0).all())
+    _assert_byte_v2_hybrid_writer_matches_raw(tensors)
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+    watched = (
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        tensors["page_to_raw_slot"],
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        page_flags,
+    )
+    snapshots = [tensor.clone() for tensor in watched]
+    graph_key.zero_()
+    graph_value.zero_()
+    graph_slot.fill_(-1)
+    graph.replay()
+    torch.accelerator.synchronize()
+    for tensor, snapshot in zip(watched, snapshots):
+        torch.testing.assert_close(tensor, snapshot, atol=0, rtol=0)
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -4827,6 +5315,98 @@ namespace["_byte_v2_fused_hybrid_q1_fatal_probe"](sys.argv[2])
     assert completed.returncode != 0, combined_output
     assert "fused_hybrid_q1_fatal_probe" in combined_output
     assert "fused_hybrid_q1_unexpected_success" not in combined_output
+
+
+def _byte_v2_fused_hybrid_multi_token_fatal_probe(probe: str) -> None:
+    assert _byte_v2_fused_hybrid_writer_multi_token_op_is_available()
+    if probe == "invalid-map":
+        tensors, state, _ = _make_byte_v2_hybrid_writer_case(seq_len=2)
+        tensors["page_to_raw_slot"][0] = -2
+        slot_mapping = torch.tensor(
+            [0, 1], dtype=torch.int64, device=tensors["byte_cache"].device
+        )
+        active_capacity = 1
+    elif probe == "duplicate-slot":
+        tensors, state, _ = _make_byte_v2_hybrid_writer_case(seq_len=2)
+        slot_mapping = torch.tensor(
+            [0, 0], dtype=torch.int64, device=tensors["byte_cache"].device
+        )
+        active_capacity = 1
+    elif probe == "capacity-overflow":
+        tensors, state, _ = _make_byte_v2_hybrid_writer_case(
+            seq_len=32, raw_pool_slots=2
+        )
+        slot_mapping = torch.tensor(
+            [0, 16], dtype=torch.int64, device=tensors["byte_cache"].device
+        )
+        active_capacity = 1
+    elif probe == "pool-exhaustion":
+        tensors, state, full_slots = _make_byte_v2_hybrid_writer_case(
+            seq_len=32,
+            force_pool_overflow=True,
+            raw_pool_slots=1,
+        )
+        _byte_v2_fused_hybrid_writer_multi_token_update(
+            tensors,
+            state,
+            full_slots[:16],
+            active_capacity=1,
+        )
+        torch.accelerator.synchronize()
+        assert int(tensors["page_to_raw_slot"][0].item()) == 0
+        assert int(state.free_raw_slot_count.item()) == 0
+        slot_mapping = full_slots[16:]
+        active_capacity = 1
+    else:
+        raise ValueError(f"unknown probe: {probe}")
+
+    torch.accelerator.synchronize()
+    print({"fused_hybrid_multi_token_fatal_probe": probe}, flush=True)
+    _byte_v2_fused_hybrid_writer_multi_token_update(
+        tensors,
+        state,
+        slot_mapping,
+        active_capacity=active_capacity,
+    )
+    torch.accelerator.synchronize()
+    print({"fused_hybrid_multi_token_unexpected_success": probe}, flush=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "probe", ["invalid-map", "duplicate-slot", "capacity-overflow", "pool-exhaustion"]
+)
+def test_byte_v2_fused_hybrid_multi_token_fatal_state_fails_closed_subprocess(
+    probe,
+):
+    if not _byte_v2_fused_hybrid_writer_multi_token_op_is_available():
+        pytest.skip("ByteV2 fused hybrid multi-token writer op is not registered")
+
+    probe_source = r"""
+import runpy
+import sys
+
+namespace = runpy.run_path(sys.argv[1])
+namespace["_byte_v2_fused_hybrid_multi_token_fatal_probe"](sys.argv[2])
+"""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            probe_source,
+            str(Path(__file__).resolve()),
+            probe,
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, combined_output
+    assert "fused_hybrid_multi_token_fatal_probe" in combined_output
+    assert "fused_hybrid_multi_token_unexpected_success" not in combined_output
 
 
 def _byte_v2_test_forced_raw_pool_exhaustion_probe() -> None:

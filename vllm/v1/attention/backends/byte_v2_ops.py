@@ -530,6 +530,51 @@ def byte_v2_update_hybrid_cache_raw_staging_q1(
     )
 
 
+def byte_v2_update_hybrid_cache_raw_staging_multi_token(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    raw_staging: torch.Tensor,
+    kv_cache: torch.Tensor,
+    persistent_raw_staging: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_to_staging_slot: torch.Tensor,
+    staging_to_physical_block: torch.Tensor,
+    valid_rows: torch.Tensor,
+    next_staging_slot: torch.Tensor,
+    overflow: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    free_raw_slots: torch.Tensor,
+    free_raw_slot_count: torch.Tensor,
+    raw_pool_overflow: torch.Tensor,
+    *,
+    tile_policy: Sequence[int],
+    page_unsafe_flags: torch.Tensor | None = None,
+) -> None:
+    """Run an exact compact/raw hybrid multi-token update in three kernels."""
+    _require_op(
+        "_C_cache_ops",
+        "byte_v2_update_hybrid_cache_raw_staging_multi_token",
+    )(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        persistent_raw_staging,
+        slot_mapping,
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+        page_to_raw_slot,
+        free_raw_slots,
+        free_raw_slot_count,
+        raw_pool_overflow,
+        list(tile_policy),
+        page_unsafe_flags,
+    )
+
+
 def byte_v2_test_force_promote_raw_staging_q1(
     raw_staging: torch.Tensor,
     persistent_raw_staging: torch.Tensor,
