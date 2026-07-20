@@ -146,6 +146,19 @@ def test_analyze_run_rejects_failed_profile_replay(tmp_path: Path):
         analysis.analyze_run(tmp_path, 2)
 
 
+def test_analyze_run_rejects_diagnostic_tps(tmp_path: Path):
+    _write_reports(tmp_path)
+    _rewrite_row(
+        tmp_path,
+        1,
+        "hybrid",
+        lambda row: row.__setitem__("performance_valid_for_tps", False),
+    )
+
+    with pytest.raises(ValueError, match="not valid for TPS comparison"):
+        analysis.analyze_run(tmp_path, 2)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [("fatal", 1, "fatal=1"), ("free_count", 63, "does not equal slot_count")],

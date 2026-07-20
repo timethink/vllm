@@ -110,6 +110,10 @@ def _load_rows(path: Path) -> dict[int, dict[str, Any]]:
             field="output_tokens_per_second",
             source=source,
         )
+        if row.get("performance_valid_for_tps", True) is not True:
+            raise ValueError(
+                f"{source}: diagnostic result is not valid for TPS comparison"
+            )
         if row.get("profile_token_ids_match") is not True:
             raise ValueError(f"{source}: profiler replay token IDs are not exact")
         rows[context_len] = row
