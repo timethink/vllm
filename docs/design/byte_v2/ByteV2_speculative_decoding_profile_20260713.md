@@ -2321,3 +2321,242 @@ Artifacts:
 - `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/forced_raw_eager_ctx1024.jsonl`
 - `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/forced_raw_compiled_ctx1024.jsonl`
 - `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/forced_raw_reference_fa2_ctx1024.jsonl`
+
+### Generic/Prefill Three-Kernel Writer
+
+Checkpoint `58dc9ff3f` (`Fuse exact ByteV2 hybrid multi-token updates`)
+removes the remaining Q>1 writer chain. For every page-aware wave, the hybrid
+path now launches exactly three kernels:
+
+1. a page-owner kernel claims transient slots, hydrates each valid prefix from
+   either compact V5 or its authoritative raw sidecar, overlays incoming BF16
+   K/V, and clears compact metadata after all reads of that page complete;
+2. the unchanged warp-histogram compact commit kernel;
+3. the existing raw persist/map-last protocol, page-flag update, and transient
+   release in one launch.
+
+Q1 continues to use its specialized three-kernel implementation. If the new
+multi-token op is absent from an older extension, Python falls back to the
+previous generic chain; normal hybrid availability does not depend on the new
+symbol. The implementation retains the existing append-prefix contract:
+`valid_rows` is the largest row touched by the current wave plus one. Normal
+vLLM KV append satisfies this contract; rewriting only low rows of a previously
+complete page is outside both the old and new writer interfaces.
+
+Direct differential tests use a 34-entry mapping that interleaves two pages
+across three owner chunks, permutes non-contiguous rows, and includes dummy
+slots. They cover compact and existing-raw hydration, all-dummy input, CUDA
+Graph capture/reset/reuse, and subprocess fail-closed behavior for an invalid
+raw map, a duplicated physical slot, insufficient transient capacity, and raw
+pool exhaustion. Persistent sidecars are compared canonically by physical
+page because concurrent allocation need not assign the same raw-slot number.
+
+An initial Compute Sanitizer racecheck found that thread 0 could reuse a
+shared status word for the first candidate page while slower threads were
+still reading its initialization value. A CTA barrier before the candidate
+loop removes that race. On the final binary, compact/existing-raw Q34 and CUDA
+Graph replay report zero memcheck and synccheck errors and zero racecheck
+hazards. The combined layout and strict-analysis regression reports 295 passed
+and one skipped test before this barrier-only correction; the affected
+targeted functional and sanitizer tests were rerun after rebuilding.
+
+The direct A40 writer comparison below uses complete compact pages, no raw
+promotions, six alternating-order samples, and the median CUDA-event time. It
+times only the writer operations, excluding common input gathering:
+
+| Tokens/pages per wave | Generic eager | Fused eager | Speedup | Generic graph | Fused graph | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 / 8 | 0.13233 ms | 0.06263 ms | 2.11x | 0.12665 ms | 0.06121 ms | 2.07x |
+| 512 / 32 | 0.40174 ms | 0.08267 ms | 4.86x | 0.39422 ms | 0.08118 ms | 4.86x |
+| 2,048 / 128 | 1.43977 ms | 0.14351 ms | 10.03x | 1.43123 ms | 0.14052 ms | 10.19x |
+
+The increasing gain is expected: the old chain repeatedly launches serial
+prepare/hydrate/append work over the active-page prefix, while the owner
+kernel scans the wave once per claimed page and performs one cooperative page
+hydrate. The 2,048-token case matches the full waves that dominated the prior
+8K and 16K E2E attribution.
+
+### Final Three-Round Compiled E2E
+
+The final comparison uses the post-race-fix binary from checkpoint
+`58dc9ff3f`. All runs use one otherwise idle A40
+(GPU 0), batch 1, 256 output tokens, prefix caching disabled, compiled CUDA
+Graphs with size specialization, and contexts 64 through 16K. Each engine is
+an independent process. The cyclic order is:
+
+```text
+round 1: compact -> hybrid -> raw
+round 2: hybrid  -> raw    -> compact
+round 3: raw     -> compact -> hybrid
+```
+
+The table reports the median TPS for each variant. Ratio columns are medians
+of the three within-round paired ratios, so they need not equal ratios of the
+displayed median TPS values.
+
+| Context | Compact tok/s | Hybrid tok/s | Raw tok/s | Hybrid/compact | Hybrid/raw |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 37.3429 | 37.3158 | 38.2106 | -0.2424% | -2.3013% |
+| 128 | 37.1058 | 37.0536 | 38.0485 | -0.0699% | -2.6409% |
+| 512 | 36.6589 | 36.6042 | 37.6528 | +0.0853% | -2.6790% |
+| 1,024 | 36.1423 | 36.0988 | 37.0975 | +0.0813% | -2.6647% |
+| 2,048 | 35.1754 | 34.9763 | 36.0787 | -0.4870% | -2.9496% |
+| 4,096 | 33.2925 | 33.2010 | 33.9645 | -0.2884% | -2.2479% |
+| 8,192 | 29.6486 | 29.6782 | 30.2860 | +0.0930% | -2.0215% |
+| 16,384 | 23.6997 | 23.7174 | 24.0324 | +0.0748% | -1.3107% |
+
+Across the eight contexts, the median of the paired hybrid/compact gaps is
++0.0024%, with a range from -0.4870% to +0.0930%. The corresponding
+hybrid/raw median is -2.4711%, ranging from -2.9496% to -1.3107%. Compact V5
+itself has a -2.3344% median gap to raw FA2, so the persistent raw-fallback
+machinery adds no measurable median throughput cost over compact serving in
+this protocol. The remaining raw gap is predominantly the compact ByteV2
+load/decode cost inside the otherwise unchanged FA2 template.
+
+Correctness and state validation pass before aggregation:
+
+- all 72 measured rows return exactly 256 tokens;
+- compact, hybrid, and raw token IDs are elementwise identical at every
+  context in every round and remain identical across rounds;
+- all 72 instrumented profiler replays reproduce their measured token IDs;
+- all 24 hybrid observations report `fatal=0`, zero mapped raw pages, and
+  `free_count=slot_count=1472` across the 32 layers.
+
+The three rounds reproduce the same complete memory plan. Hybrid provides
+12,001 blocks versus 9,591 for raw BF16 under the fixed approximately 20.11 GB
+KV budget, a 25.1277% capacity increase. At the same 12,001-block capacity,
+the complete hybrid allocation, including 98,011,264 bytes of persistent raw
+sidecars and the 8,437,644-byte shared workspace, saves 20.0849% versus raw
+BF16.
+
+These results support a configuration-specific claim of exact generated
+tokens, about 20.1% complete KV-memory reduction at equal capacity, and at
+most 3.0% paired TPS regression to raw FA2 over the tested context sweep. They
+do not by themselves establish task-level accuracy on an evaluation suite,
+model-family generality, multi-request serving scalability, or a universal
+mathematical losslessness claim. The forced-raw lifecycle result above is
+correctness evidence and remains excluded from TPS aggregation.
+
+Artifacts:
+
+- `profile/byte-v2-hybrid-final-e2e-a40-20260720/round{1,2,3}_{compact,hybrid,raw}.jsonl`
+- `profile/byte-v2-hybrid-final-e2e-a40-20260720/analysis/summary.json`
+- `profile/byte-v2-hybrid-final-e2e-a40-20260720/analysis/comparison.csv`
+
+### Batch-8 Cooperative Decode Writer
+
+The exact initial-prefill path exposed a different bottleneck under continuous
+batching. With eight requests, decode supplies eight Q1 cache updates per
+layer. The multi-token writer originally launched one page-owner CTA for the
+entire 16-token owner chunk, so that CTA hydrated as many as eight independent
+pages serially. In a CUDA Graph microbenchmark its median time was 198.656 us,
+versus 13.312 us for raw `reshape_and_cache_flash`.
+
+A first page-parallel version launched one owner candidate per token and
+reduced the batch-8 median to 70.656 us. The retained implementation uses a
+more cooperative four-kernel protocol for `2 <= N <= 16` when the active
+staging capacity is also at most 16 pages:
+
+1. one thread validates the complete wave before allocator mutation, assigns
+   dense staging slots to unique physical pages, rejects duplicate
+   `(page,row)` slots, and packs an eight-CTA completion count above
+   `valid_rows`;
+2. eight CTAs per active page partition compact/raw hydration and BF16 overlay;
+3. the unchanged warp-histogram commit re-encodes the compact page;
+4. the existing persist/map-last/release kernel handles real overflow pages and
+   clears transient state.
+
+Each hydrate CTA writes a disjoint `work_idx` partition and decrements the
+packed completion count once. The last CTA clears compact metadata and
+publishes `block_to_staging_slot`. There is no spin loop or grid-wide barrier;
+the following commit runs on the same stream after a kernel boundary. Larger
+waves retain the generic owner kernel. A legal native call with more than 16
+staging pages also retains the generic path rather than trapping in the small
+path.
+
+The final CUDA Graph microbenchmark used complete compact pages, distinct
+physical pages, 100 warmups, 500 alternating-order samples, and direct hybrid
+FA2-versus-raw output/LSE checks:
+
+| Batch/pages | Hybrid writer | Raw writer | Extra / layer |
+| ---: | ---: | ---: | ---: |
+| 1 | 13.312 us | 13.312 us | 0.000 us |
+| 2 | 16.384 us | 13.312 us | 3.072 us |
+| 4 | 24.576 us | 13.312 us | 11.264 us |
+| 8 | 30.720 us | 13.312 us | 17.408 us |
+
+At batch 8 this is 6.47x faster than the original generic writer and 2.30x
+faster than the first page-parallel version. It removes 90.61% of the original
+writer excess over raw. The remaining writer upper bound for 32 layers and 61
+decode steps is about 34.0 ms/request.
+
+The full-model E2E comparison uses the same eight ShareGPT prompts with actual
+lengths `[512, 768, 1024, 1279, 1506, 2072, 2925, 3796]`, 64 output tokens per
+request, prefix caching disabled, a 1,042-page exact-prefill staging workspace,
+compiled CUDA Graphs, and separate engines. Round 2 reverses raw/hybrid order.
+
+| Round | Hybrid tok/s | Raw tok/s | Hybrid/raw | Wall-time excess |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 117.0285 | 121.4614 | -3.6496% | 150.3 ms |
+| 2 | 116.0896 | 121.9079 | -4.7728% | 198.2 ms |
+| 3 | 116.1214 | 120.7801 | -3.8572% | 160.1 ms |
+
+The paired median is -3.8572%, versus -19.9269% for the original generic
+batch-8 writer. Median hybrid TPS improves by 20.08%; the raw-relative gap is
+16.07 percentage points smaller. All hybrid observations finish with
+`fatal=0`, zero mapped raw pages, and `free_count=slot_count=1472`.
+
+This configuration plans 11,979 hybrid blocks versus 9,601 raw blocks, a
+24.7683% capacity increase under the approximately fixed KV budget. At the
+same 11,979-block capacity, the complete hybrid allocation is 4,985,575,100
+bytes smaller than raw BF16, a 19.8456% saving. This includes the 98,008,448
+byte persistent sidecar and 68,344,772 byte shared workspace.
+
+The compiled token result needs a stricter qualification than the earlier
+single-backend profiler field implied. Hybrid is internally repeatable across
+all three rounds and raw is internally repeatable across all three rounds, but
+only seven of eight requests match across backends. Request 5 first diverges at
+generated-token index 28:
+
+- hybrid reports tokens 1687 and 2181 tied at logprob `-0.770114` and greedy
+  selection returns 1687;
+- raw reports token 2181 at `-0.705454` and token 1687 at `-0.830454`, a 0.125
+  margin.
+
+The trajectories differ for two tokens and then rejoin. A diagnostic eager
+run on the identical prompts produces elementwise-identical token IDs and
+elementwise-identical serialized top-5 logprobs at every generation step.
+Direct cache round trips and hybrid/raw FA2 comparisons also remain bitwise.
+The discrepancy is therefore specific to the separately compiled backend
+graphs, which already produce slightly different logits at the first
+generation step; it is not evidence of a race in the cooperative writer.
+Conversely, these results cannot support a compiled E2E bitwise-exact claim.
+
+The profile script now records both `same_backend_nonspec_match` and the
+independent `raw_fa2_reference_match`, plus mismatching request indices. The
+old `reference_match` column compared a backend's spec-0 row to itself and was
+not a cross-backend correctness check.
+
+Correctness coverage includes compact and existing-raw sources, shared and
+permuted pages, dummy entries, exact duplicate rejection, the N=16/N=17
+dispatch boundary, N=16 CUDA Graph capture/reset/replay, compact-to-raw
+promotion, raw-pool exhaustion, and transient allocator cleanup. Compute
+Sanitizer reports zero memcheck errors, zero racecheck hazards, and zero
+synccheck errors on the new small path.
+
+Nsight Systems capture-time samples attribute as much as 10.336 us to the
+serial prepare kernel and 14.880 us to cooperative hydrate at batch 8; commit
+and persist remain about 3 us and 2 us. Eliminating the separate prepare launch
+is the next writer-specific opportunity. At full E2E scope, however, the
+remaining paired median wall gap is 160.1 ms, so Q1 compact loading, prefill
+lifecycle/reset work, and CUDA Graph/host overhead must be measured alongside
+any further writer change. The current data support neither "unchanged TPS"
+nor a universal lossless-serving claim; broader task accuracy, model-family,
+concurrency, and natural-overflow studies are still required.
+
+Additional artifacts:
+
+- `profile/byte-v2-retained-prefill-a40-20260720/sharegpt_batch8_cooperative_writer_compiled.jsonl`
+- `profile/byte-v2-retained-prefill-a40-20260720/sharegpt_batch8_cooperative_writer_round2_{hybrid,raw}.jsonl`
+- `profile/byte-v2-retained-prefill-a40-20260720/sharegpt_batch8_cooperative_writer_round3.jsonl`
+- `profile/byte-v2-sharegpt-exactness-a40-20260720/batch8_cooperative_writer_{compiled,eager}_logprobs.jsonl`

@@ -14,8 +14,11 @@ HYBRID_PROFILE_OPS = {
     "byte_v2_hydrate_raw_staging_from_hybrid_cache",
     "byte_v2_commit_raw_staging_to_hybrid_cache",
     "byte_v2_fa2_hybrid_paged_decode_attention",
+    "byte_v2_fa2_raw_staging_prefill_attention",
     "byte_v2_reset_raw_fallback_pages",
     "byte_v2_test_force_promote_raw_staging_q1",
+    "byte_v2_update_hybrid_cache_raw_staging_multi_token",
+    "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained",
 }
 
 
@@ -309,3 +312,77 @@ def test_speculative_forced_raw_cli_is_explicit_and_diagnostic_only(monkeypatch)
     assert args.diagnose_forced_raw_lifecycle is True
     assert args.disable_prefix_caching is True
     assert args.collect_hybrid_state is True
+
+
+def test_speculative_prompt_hash_is_stable_and_order_sensitive():
+    first = byte_v2_speculative_profile._prompt_token_ids_sha256([1, 2, 3])
+    repeated = byte_v2_speculative_profile._prompt_token_ids_sha256([1, 2, 3])
+    reordered = byte_v2_speculative_profile._prompt_token_ids_sha256([3, 2, 1])
+
+    assert first == repeated
+    assert first != reordered
+    assert len(first) == 64
+
+
+def test_speculative_summary_distinguishes_raw_fa2_token_match(capsys):
+    def row(backend, spec_tokens, token_ids):
+        return {
+            "backend": backend,
+            "spec_tokens": spec_tokens,
+            "context_len": 1024,
+            "batch_size": 2,
+            "measured_seconds": 1.0,
+            "output_tokens_per_second": 2.0,
+            "performance_valid_for_tps": True,
+            "spec_metrics": {
+                "acceptance_rate": None,
+                "mean_acceptance_length": 1.0,
+            },
+            "token_ids": token_ids,
+        }
+
+    results = [
+        row("byte_v2", 0, [[1], [2]]),
+        row("byte_v2", 4, [[1], [2]]),
+        row("flash_attn", 0, [[1], [3]]),
+        row("flash_attn", 4, [[1], [4]]),
+    ]
+
+    byte_v2_speculative_profile._annotate_reference_matches(results)
+    byte_v2_speculative_profile._print_summary(results)
+
+    assert results[0]["same_backend_nonspec_match"] is True
+    assert results[0]["raw_fa2_reference_match"] is False
+    assert results[0]["raw_fa2_mismatch_request_indices"] == [1]
+    assert results[1]["same_backend_nonspec_match"] is True
+    assert results[1]["raw_fa2_reference_match"] is False
+    assert results[2]["same_backend_nonspec_match"] is True
+    assert results[2]["raw_fa2_reference_match"] is True
+    assert results[3]["same_backend_nonspec_match"] is False
+    assert results[3]["raw_fa2_reference_match"] is False
+    output = capsys.readouterr().out
+    assert "same_backend_nonspec_match,raw_fa2_reference_match" in output
+    assert "byte_v2,0,1024,2,1.000000,2.000,True,None,1.0,True,False,[1]" in output
+
+
+def test_speculative_sample_logprobs_are_sorted_and_serializable():
+    positions = [
+        {
+            9: SimpleNamespace(logprob=-0.25, rank=2),
+            4: SimpleNamespace(logprob=-0.10, rank=1),
+        },
+        None,
+    ]
+    outputs = [SimpleNamespace(outputs=[SimpleNamespace(logprobs=positions)])]
+
+    result = byte_v2_speculative_profile._serialize_sample_logprobs(outputs)
+
+    assert result == [
+        [
+            [
+                {"token_id": 4, "logprob": -0.10, "rank": 1},
+                {"token_id": 9, "logprob": -0.25, "rank": 2},
+            ],
+            [],
+        ]
+    ]

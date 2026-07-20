@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import random
@@ -39,12 +40,15 @@ _BYTE_V2_PROFILE_OP_NAMES = (
     "byte_v2_update_cache_single_token",
     "byte_v2_update_cache_raw_staging",
     "byte_v2_update_hybrid_cache_raw_staging_q1",
+    "byte_v2_update_hybrid_cache_raw_staging_multi_token",
+    "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained",
     "byte_v2_test_force_promote_raw_staging_q1",
     "byte_v2_update_cache_unsafe_flags",
     "byte_v2_paged_decode_attention",
     "byte_v2_paged_decode_attention_split_k",
     "byte_v2_paged_decode_attention_split_k_guarded",
     "byte_v2_fa2_hybrid_paged_decode_attention",
+    "byte_v2_fa2_raw_staging_prefill_attention",
     "byte_v2_reset_raw_fallback_pages",
     "byte_v2_speculative_verify_q4",
     "byte_v2_speculative_verify_ragged_q4",
@@ -87,6 +91,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument(
+        "--capture-logprobs",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Record the top N generation logprobs and full prompt token IDs. "
+            "This is a correctness diagnostic and invalidates TPS results."
+        ),
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     parser.add_argument(
         "--sharegpt-rows-dir",
@@ -170,6 +184,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.compile_size_specialization and args.enforce_eager:
         parser.error("--compile-size-specialization requires --no-enforce-eager")
+    if not 0 <= args.capture_logprobs <= 20:
+        parser.error("--capture-logprobs must be between 0 and 20")
     if args.diagnose_forced_raw_lifecycle:
         diagnostic_spec_tokens = (
             [args.worker_spec_tokens] if args.worker else args.spec_tokens
@@ -1148,7 +1164,45 @@ def _metric_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any
     return result
 
 
-def _run_generate(llm, prompts, sampling_params) -> tuple[float, list[list[int]]]:
+def _prompt_token_ids_sha256(prompt_token_ids: list[int]) -> str:
+    payload = json.dumps(prompt_token_ids, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _serialize_sample_logprobs(outputs) -> list[list[list[dict[str, Any]]]] | None:
+    if not outputs or outputs[0].outputs[0].logprobs is None:
+        return None
+    serialized = []
+    for request_output in outputs:
+        request_positions = []
+        for position in request_output.outputs[0].logprobs:
+            entries = []
+            if position is not None:
+                for token_id, logprob in sorted(
+                    position.items(),
+                    key=lambda item: (-item[1].logprob, item[0]),
+                ):
+                    entries.append(
+                        {
+                            "token_id": int(token_id),
+                            "logprob": float(logprob.logprob),
+                            "rank": logprob.rank,
+                        }
+                    )
+            request_positions.append(entries)
+        serialized.append(request_positions)
+    return serialized
+
+
+def _run_generate(
+    llm,
+    prompts,
+    sampling_params,
+) -> tuple[
+    float,
+    list[list[int]],
+    list[list[list[dict[str, Any]]]] | None,
+]:
     import torch
 
     torch.accelerator.synchronize()
@@ -1157,7 +1211,7 @@ def _run_generate(llm, prompts, sampling_params) -> tuple[float, list[list[int]]
     torch.accelerator.synchronize()
     elapsed = time.perf_counter() - start
     token_ids = [list(output.outputs[0].token_ids) for output in outputs]
-    return elapsed, token_ids
+    return elapsed, token_ids, _serialize_sample_logprobs(outputs)
 
 
 def _run_generate_step_profile(
@@ -1275,7 +1329,11 @@ def _run_worker(args: argparse.Namespace) -> None:
     llm = _build_llm(args, args.backend, spec_tokens)
     torch.accelerator.synchronize()
     init_seconds = time.perf_counter() - init_start
-    sampling_params = SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
+    sampling_params = SamplingParams(
+        max_tokens=args.max_tokens,
+        temperature=0.0,
+        logprobs=args.capture_logprobs or None,
+    )
     cache_fill_params = SamplingParams(max_tokens=1, temperature=0.0)
 
     try:
@@ -1304,7 +1362,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             ]
 
             if args.disable_prefix_caching:
-                warmup_seconds, _ = _run_generate(
+                warmup_seconds, _, _ = _run_generate(
                     llm,
                     prompts,
                     cache_fill_params,
@@ -1312,7 +1370,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             else:
                 warmup_seconds = 0.0
                 for prompt in prompts:
-                    prompt_seconds, _ = _run_generate(
+                    prompt_seconds, _, _ = _run_generate(
                         llm,
                         [prompt],
                         cache_fill_params,
@@ -1327,7 +1385,11 @@ def _run_worker(args: argparse.Namespace) -> None:
                     arm=True,
                 )
             before = _metric_snapshot(llm)
-            measured_seconds, token_ids = _run_generate(llm, prompts, sampling_params)
+            measured_seconds, token_ids, sample_logprobs = _run_generate(
+                llm,
+                prompts,
+                sampling_params,
+            )
             measured_metrics = _metric_diff(before, _metric_snapshot(llm))
             forced_raw_measured_reset = (
                 _reset_forced_raw_pages_through_runner(llm)
@@ -1428,11 +1490,20 @@ def _run_worker(args: argparse.Namespace) -> None:
                     "sharegpt" if args.sharegpt_rows_dir else "synthetic_repeat"
                 ),
                 "prompt_lens": [len(ids) for ids in prompt_token_ids],
+                "prompt_token_ids_sha256": [
+                    _prompt_token_ids_sha256(ids) for ids in prompt_token_ids
+                ],
+                "prompt_token_ids": (
+                    prompt_token_ids if args.capture_logprobs else None
+                ),
                 "batch_size": args.batch_size,
                 "max_tokens": args.max_tokens,
                 "enforce_eager": args.enforce_eager,
                 "compile_size_specialization": (args.compile_size_specialization),
-                "performance_valid_for_tps": (not args.diagnose_forced_raw_lifecycle),
+                "performance_valid_for_tps": (
+                    not args.diagnose_forced_raw_lifecycle
+                    and args.capture_logprobs == 0
+                ),
                 "init_seconds": init_seconds,
                 "warmup_seconds": warmup_seconds,
                 "measured_seconds": measured_seconds,
@@ -1442,6 +1513,7 @@ def _run_worker(args: argparse.Namespace) -> None:
                     sum(len(tokens) for tokens in token_ids) / measured_seconds
                 ),
                 "token_ids": token_ids,
+                "sample_logprobs": sample_logprobs,
                 "profile_token_ids_match": token_ids == profile_token_ids,
                 "spec_metrics": measured_metrics,
                 "profile_ops": collector.result(),
@@ -1518,6 +1590,8 @@ def _run_child(
         "--prompt-lookup-max",
         str(args.prompt_lookup_max),
     ]
+    if args.capture_logprobs:
+        cmd.extend(["--capture-logprobs", str(args.capture_logprobs)])
     if args.sharegpt_rows_dir:
         cmd.extend(["--sharegpt-rows-dir", args.sharegpt_rows_dir])
         cmd.extend(["--sharegpt-seed", str(args.sharegpt_seed)])
@@ -1571,16 +1645,54 @@ def _run_child(
     return results
 
 
-def _print_summary(results: list[dict[str, Any]]) -> None:
-    print(
-        "backend,spec_tokens,context_len,batch_size,seconds,tokens_per_second,"
-        "performance_valid,acceptance_rate,mean_acceptance_length,reference_match"
-    )
-    references = {
+def _annotate_reference_matches(results: list[dict[str, Any]]) -> None:
+    same_backend_references = {
         (row["backend"], row["context_len"], row["batch_size"]): row
         for row in results
         if row["spec_tokens"] == 0
     }
+    raw_fa2_references = {
+        (row["context_len"], row["batch_size"]): row
+        for row in results
+        if row["backend"] == "flash_attn" and row["spec_tokens"] == 0
+    }
+    for row in results:
+        same_backend_reference = same_backend_references.get(
+            (row["backend"], row["context_len"], row["batch_size"])
+        )
+        row["same_backend_nonspec_match"] = (
+            same_backend_reference is not None
+            and same_backend_reference["token_ids"] == row["token_ids"]
+        )
+
+        raw_fa2_reference = raw_fa2_references.get(
+            (row["context_len"], row["batch_size"])
+        )
+        if raw_fa2_reference is None:
+            row["raw_fa2_reference_match"] = None
+            row["raw_fa2_mismatch_request_indices"] = None
+            continue
+        reference_tokens = raw_fa2_reference["token_ids"]
+        candidate_tokens = row["token_ids"]
+        request_count = max(len(reference_tokens), len(candidate_tokens))
+        mismatch_indices = [
+            request_idx
+            for request_idx in range(request_count)
+            if request_idx >= len(reference_tokens)
+            or request_idx >= len(candidate_tokens)
+            or reference_tokens[request_idx] != candidate_tokens[request_idx]
+        ]
+        row["raw_fa2_reference_match"] = not mismatch_indices
+        row["raw_fa2_mismatch_request_indices"] = mismatch_indices
+
+
+def _print_summary(results: list[dict[str, Any]]) -> None:
+    print(
+        "backend,spec_tokens,context_len,batch_size,seconds,tokens_per_second,"
+        "performance_valid,acceptance_rate,mean_acceptance_length,"
+        "same_backend_nonspec_match,raw_fa2_reference_match,"
+        "raw_fa2_mismatch_request_indices"
+    )
     for row in sorted(
         results,
         key=lambda value: (
@@ -1589,12 +1701,6 @@ def _print_summary(results: list[dict[str, Any]]) -> None:
             value["spec_tokens"],
         ),
     ):
-        reference = references.get(
-            (row["backend"], row["context_len"], row["batch_size"])
-        )
-        reference_match = (
-            reference is not None and reference["token_ids"] == row["token_ids"]
-        )
         metrics = row["spec_metrics"]
         print(
             f"{row['backend']},{row['spec_tokens']},{row['context_len']},"
@@ -1602,7 +1708,9 @@ def _print_summary(results: list[dict[str, Any]]) -> None:
             f"{row['output_tokens_per_second']:.3f},"
             f"{row['performance_valid_for_tps']},"
             f"{metrics['acceptance_rate']},{metrics['mean_acceptance_length']},"
-            f"{reference_match}"
+            f"{row['same_backend_nonspec_match']},"
+            f"{row['raw_fa2_reference_match']},"
+            f"{row['raw_fa2_mismatch_request_indices']}"
         )
 
 
@@ -1620,6 +1728,7 @@ def main() -> None:
     for backend in _worker_backends(args.backend):
         for spec_tokens in args.spec_tokens:
             results.extend(_run_child(args, backend, spec_tokens))
+    _annotate_reference_matches(results)
 
     output_path = Path(args.output_jsonl)
     output_path.parent.mkdir(parents=True, exist_ok=True)

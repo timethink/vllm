@@ -45,6 +45,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_fa2_hybrid_decode_is_available,
     byte_v2_fa2_hybrid_paged_decode_attention,
     byte_v2_fa2_paged_decode_attention,
+    byte_v2_fa2_raw_staging_prefill_attention,
     byte_v2_hybrid_cache_update_is_available,
     byte_v2_hydrate_raw_staging_from_cache,
     byte_v2_hydrate_raw_staging_from_hybrid_cache,
@@ -65,6 +66,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
     byte_v2_update_hybrid_cache_raw_staging_multi_token,
+    byte_v2_update_hybrid_cache_raw_staging_multi_token_retained,
     byte_v2_update_hybrid_cache_raw_staging_q1,
 )
 from vllm.v1.kv_cache_interface import (
@@ -724,6 +726,19 @@ class ByteV2RawStagingWorkspace:
 
 
 @dataclass(frozen=True)
+class ByteV2InitialPrefillStagingLease:
+    """Transient exact pages retained between cache update and attention."""
+
+    kv_cache_ptr: int
+    num_tokens: int
+    active_slot_capacity: int
+    raw_staging: torch.Tensor
+    block_to_staging_slot: torch.Tensor
+    staging_to_physical_block: torch.Tensor
+    valid_rows: torch.Tensor
+
+
+@dataclass(frozen=True)
 class ByteV2RawStagingWave:
     """A contiguous cache update whose unique-page upper bound fits staging."""
 
@@ -851,6 +866,7 @@ class ByteV2RawStagingManager:
         self.valid_rows: torch.Tensor | None = None
         self.next_staging_slot: torch.Tensor | None = None
         self.overflow: torch.Tensor | None = None
+        self._initial_prefill_lease: ByteV2InitialPrefillStagingLease | None = None
 
     def bind_shared_workspace(
         self,
@@ -877,6 +893,10 @@ class ByteV2RawStagingManager:
 
     def clear_shared_workspace(self) -> None:
         """Drop all references to a profiling-only shared workspace."""
+        if self._initial_prefill_lease is not None:
+            raise RuntimeError(
+                "Cannot clear ByteV2 raw staging with an active initial-prefill lease"
+            )
         self.shared_workspace = None
         self.raw_staging = None
         self.block_to_staging_slot = None
@@ -884,6 +904,107 @@ class ByteV2RawStagingManager:
         self.valid_rows = None
         self.next_staging_slot = None
         self.overflow = None
+
+    def stage_initial_prefill(
+        self,
+        *,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        attn_metadata: object,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Stage one complete initial prefill as exact raw BF16 pages.
+
+        The returned physical-page map can be passed directly to the hybrid
+        FA2 loader. If the shared workspace cannot hold every active page at
+        once, return ``None`` so the caller can use the compact-cache reader.
+        """
+        lease = self._initial_prefill_lease
+        if lease is not None:
+            self._initial_prefill_lease = None
+            if (
+                lease.kv_cache_ptr != kv_cache.data_ptr()
+                or lease.num_tokens != slot_mapping.shape[0]
+            ):
+                self._release_allocator_state(
+                    active_slot_capacity=lease.active_slot_capacity
+                )
+                raise RuntimeError(
+                    "ByteV2 retained initial-prefill staging does not match "
+                    "the following attention call"
+                )
+            return (
+                lease.raw_staging,
+                lease.block_to_staging_slot,
+                lease.staging_to_physical_block,
+                lease.valid_rows,
+            )
+
+        workspace = self.shared_workspace
+        if workspace is None or slot_mapping.numel() == 0:
+            return None
+        waves = plan_byte_v2_raw_staging_waves(
+            slot_mapping.shape[0],
+            workspace.spec.num_staging_slots,
+            attn_metadata,
+            alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+        )
+        if (
+            len(waves) != 1
+            or waves[0].start != 0
+            or waves[0].end != slot_mapping.shape[0]
+        ):
+            return None
+
+        active_capacity = waves[0].max_unique_pages
+        raw_staging = workspace.raw_staging[:active_capacity]
+        staging_to_physical_block = workspace.staging_to_physical_block[
+            :active_capacity
+        ]
+        valid_rows = workspace.valid_rows[:active_capacity]
+        byte_v2_prepare_raw_staging(
+            slot_mapping,
+            workspace.block_to_staging_slot,
+            staging_to_physical_block,
+            valid_rows,
+            workspace.next_staging_slot,
+            workspace.overflow,
+            alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+        )
+        byte_v2_append_raw_staging(
+            key,
+            value,
+            raw_staging,
+            slot_mapping,
+            workspace.block_to_staging_slot,
+            codec_token_block=self.tile_policy.codec_token_block,
+            codec_dim_block=self.tile_policy.codec_dim_block,
+            alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+        )
+        return (
+            raw_staging,
+            workspace.block_to_staging_slot,
+            staging_to_physical_block,
+            valid_rows,
+        )
+
+    def release_initial_prefill(
+        self,
+        staging_to_physical_block: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> None:
+        """Release page mappings created by :meth:`stage_initial_prefill`."""
+        workspace = self.shared_workspace
+        if workspace is None:
+            raise RuntimeError("ByteV2 initial prefill staging is not bound")
+        byte_v2_release_raw_staging(
+            workspace.block_to_staging_slot,
+            staging_to_physical_block,
+            valid_rows,
+            workspace.next_staging_slot,
+            workspace.overflow,
+        )
 
     def _should_stage(self, slot_mapping: torch.Tensor) -> bool:
         num_tokens = slot_mapping.shape[0]
@@ -1052,7 +1173,13 @@ class ByteV2RawStagingManager:
         slot_mapping: torch.Tensor,
         page_unsafe_flags: torch.Tensor | None = None,
         attn_metadata: object | None = None,
+        retain_initial_prefill: bool = False,
     ) -> tuple[bool, bool]:
+        if self._initial_prefill_lease is not None:
+            raise RuntimeError(
+                "ByteV2 raw staging was reused before the retained "
+                "initial-prefill lease was consumed"
+            )
         num_tokens = slot_mapping.shape[0]
         if num_tokens == 0:
             return True, False
@@ -1070,6 +1197,13 @@ class ByteV2RawStagingManager:
                 attn_metadata,
                 alloc_block_tokens=self.tile_policy.alloc_block_tokens,
             )
+            retain_single_wave = (
+                retain_initial_prefill
+                and page_unsafe_flags is None
+                and len(waves) == 1
+                and waves[0].start == 0
+                and waves[0].end == num_tokens
+            )
             flags_updated = page_unsafe_flags is not None and bool(waves)
             for wave in waves:
                 handled, wave_flags_updated = self._update_one_wave(
@@ -1080,6 +1214,7 @@ class ByteV2RawStagingManager:
                     page_unsafe_flags=page_unsafe_flags,
                     hybrid_state=hybrid_state,
                     active_slot_capacity=wave.max_unique_pages,
+                    retain_initial_prefill=retain_single_wave,
                 )
                 if not handled:
                     raise RuntimeError(
@@ -1109,6 +1244,7 @@ class ByteV2RawStagingManager:
         page_unsafe_flags: torch.Tensor | None,
         hybrid_state: ByteV2RawFallbackState | None,
         active_slot_capacity: int,
+        retain_initial_prefill: bool = False,
     ) -> tuple[bool, bool]:
         if (
             hybrid_state is None
@@ -1210,6 +1346,47 @@ class ByteV2RawStagingManager:
             and slot_mapping.shape[0] > 1
             and slot_mapping.is_cuda
         ):
+            if retain_initial_prefill:
+                try:
+                    byte_v2_update_hybrid_cache_raw_staging_multi_token_retained(
+                        key,
+                        value,
+                        raw_staging,
+                        kv_cache,
+                        hybrid_state.raw_pages,
+                        slot_mapping,
+                        self.block_to_staging_slot,
+                        staging_to_physical_block,
+                        valid_rows,
+                        self.next_staging_slot,
+                        self.overflow,
+                        hybrid_state.page_to_raw_slot,
+                        hybrid_state.free_slots,
+                        hybrid_state.free_count,
+                        hybrid_state.fatal,
+                        tile_policy=(
+                            self.tile_policy.codec_token_block,
+                            self.tile_policy.codec_dim_block,
+                            self.tile_policy.alloc_block_tokens,
+                            self.tile_policy.compute_block_n,
+                            self.tile_policy.head_dim,
+                            self.tile_policy.head_dim_v,
+                        ),
+                        page_unsafe_flags=None,
+                    )
+                except NotImplementedError:
+                    pass
+                else:
+                    self._initial_prefill_lease = ByteV2InitialPrefillStagingLease(
+                        kv_cache_ptr=kv_cache.data_ptr(),
+                        num_tokens=slot_mapping.shape[0],
+                        active_slot_capacity=active_slot_capacity,
+                        raw_staging=raw_staging,
+                        block_to_staging_slot=self.block_to_staging_slot,
+                        staging_to_physical_block=(staging_to_physical_block),
+                        valid_rows=valid_rows,
+                    )
+                    return True, False
             try:
                 byte_v2_update_hybrid_cache_raw_staging_multi_token(
                     key,
@@ -2766,11 +2943,22 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         if key is None or value is None:
             return output.fill_(0)
         has_cached_context = self._prefill_has_cached_context(attn_metadata)
-        if self.raw_fallback_store is not None and has_cached_context:
-            # Hybrid FA2 is the only cache reader that understands both the
-            # compact page and the exact raw sidecar. Route mixed prefill,
-            # prefix-cache reuse, and speculative Q>1 through it before any of
-            # the legacy ByteV2 verification fast paths are considered.
+        if self.raw_fallback_store is not None:
+            # Keep initial and cache-backed prefill on the same FA2 template as
+            # raw serving. The hybrid loader is the only cache reader that
+            # understands both compact pages and authoritative raw sidecars.
+            # Routing before the legacy direct-QKV paths also prevents SDPA
+            # reduction differences from changing an otherwise exact greedy
+            # trajectory.
+            if not has_cached_context and self._forward_initial_prefill_from_staging(
+                query,
+                key,
+                value,
+                kv_cache,
+                output,
+                attn_metadata,
+            ):
+                return output
             return self._forward_prefill_from_cache(
                 query,
                 kv_cache,
@@ -2850,6 +3038,60 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 output,
                 attn_metadata,
             )
+
+    def _forward_initial_prefill_from_staging(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> bool:
+        """Run an initial prefill from exact transient BF16 pages when they fit."""
+        if not attn_metadata.causal:
+            return False
+        num_actual_tokens = min(attn_metadata.num_actual_tokens, query.shape[0])
+        if num_actual_tokens <= 0:
+            return True
+        staged = self.raw_staging_manager.stage_initial_prefill(
+            key=key[:num_actual_tokens],
+            value=value[:num_actual_tokens],
+            kv_cache=kv_cache,
+            slot_mapping=attn_metadata.slot_mapping[:num_actual_tokens],
+            attn_metadata=attn_metadata,
+        )
+        if staged is None:
+            return False
+        raw_staging, page_to_raw_slot, staging_to_physical_block, valid_rows = staged
+        batch_size = min(
+            attn_metadata.query_start_loc.numel() - 1,
+            attn_metadata.block_table.shape[0],
+            attn_metadata.seq_lens.shape[0],
+        )
+        try:
+            byte_v2_fa2_raw_staging_prefill_attention(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                raw_staging,
+                page_to_raw_slot,
+                attn_metadata.query_start_loc[: batch_size + 1],
+                attn_metadata.block_table[:batch_size],
+                attn_metadata.seq_lens[:batch_size],
+                scale=self.scale,
+                num_kv_heads=self.num_kv_heads,
+                block_size=self.tile_policy.alloc_block_tokens,
+                head_dim=self.head_size,
+                max_query_len=attn_metadata.max_query_len,
+                max_seq_len=attn_metadata.max_seq_len,
+                causal=True,
+            )
+        finally:
+            self.raw_staging_manager.release_initial_prefill(
+                staging_to_physical_block,
+                valid_rows,
+            )
+        return True
 
     @staticmethod
     def _prefill_has_cached_context(
@@ -3247,6 +3489,11 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             and slot_mapping.is_cuda
         ):
             page_unsafe_flags = self._get_decode_page_unsafe_flags(kv_cache)
+        byte_v2_attn_metadata = (
+            attn_metadata
+            if isinstance(attn_metadata, ByteV2AttentionMetadata)
+            else None
+        )
         handled, flags_updated = self.raw_staging_manager.update(
             key=key,
             value=value,
@@ -3254,6 +3501,14 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             slot_mapping=slot_mapping,
             page_unsafe_flags=page_unsafe_flags,
             attn_metadata=attn_metadata,
+            retain_initial_prefill=(
+                self.raw_fallback_store is not None
+                and byte_v2_attn_metadata is not None
+                and slot_mapping.shape[0] > 1
+                and byte_v2_attn_metadata.causal
+                and byte_v2_attn_metadata.max_query_len > 1
+                and not self._prefill_has_cached_context(byte_v2_attn_metadata)
+            ),
         )
         if handled:
             if not flags_updated:

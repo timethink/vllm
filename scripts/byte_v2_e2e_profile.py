@@ -22,6 +22,8 @@ _BYTE_V2_PROFILE_OP_NAMES = (
     "byte_v2_commit_raw_staging_to_cache",
     "byte_v2_commit_raw_staging_to_hybrid_cache",
     "byte_v2_update_hybrid_cache_raw_staging_q1",
+    "byte_v2_update_hybrid_cache_raw_staging_multi_token",
+    "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained",
     "byte_v2_test_force_promote_raw_staging_q1",
     "byte_v2_release_raw_staging",
     "byte_v2_reshape_and_cache",
@@ -34,6 +36,7 @@ _BYTE_V2_PROFILE_OP_NAMES = (
     "byte_v2_paged_decode_attention_split_k",
     "byte_v2_paged_decode_attention_split_k_guarded",
     "byte_v2_fa2_hybrid_paged_decode_attention",
+    "byte_v2_fa2_raw_staging_prefill_attention",
     "byte_v2_reset_raw_fallback_pages",
 )
 

@@ -6342,6 +6342,303 @@ __global__ void byte_v2_hydrate_append_single_token_raw_staging_kernel(
   }
 }
 
+__global__ void byte_v2_prepare_small_multi_token_hybrid_staging_kernel(
+    const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ block_to_staging_slot,
+    int32_t* __restrict__ staging_to_physical_block,
+    int32_t* __restrict__ valid_rows, int32_t* __restrict__ next_staging_slot,
+    int32_t* __restrict__ staging_overflow,
+    const int32_t* __restrict__ page_to_raw_slot,
+    int32_t* __restrict__ raw_pool_overflow, int64_t num_tokens,
+    int64_t num_physical_blocks, int64_t num_staging_slots,
+    int64_t persistent_raw_slots, int32_t stage_ctas_per_page) {
+  constexpr int kBlockSize = ByteV2DefaultPolicy::AllocBlockTokens;
+  constexpr int kMaxTokens = kBlockSize;
+  constexpr int kCompletionShift = 5;
+
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+
+  __shared__ int32_t candidate_pages[kMaxTokens];
+  __shared__ uint32_t candidate_row_masks[kMaxTokens];
+  __shared__ int32_t candidate_valid_rows[kMaxTokens];
+
+  int32_t invalid_state =
+      atomicAdd(staging_overflow, 0) != 0 ||
+              atomicAdd(raw_pool_overflow, 0) != 0 || num_tokens <= 1 ||
+              num_tokens > kMaxTokens || num_staging_slots <= 0 ||
+              num_staging_slots > kMaxTokens || persistent_raw_slots <= 0 ||
+              stage_ctas_per_page <= 0
+          ? 1
+          : 0;
+  if (next_staging_slot[0] != 0) {
+    invalid_state = 1;
+  }
+  for (int64_t staging_slot = 0; staging_slot < num_staging_slots;
+       ++staging_slot) {
+    if (staging_to_physical_block[staging_slot] != -1 ||
+        valid_rows[staging_slot] != 0) {
+      invalid_state = 1;
+    }
+  }
+
+  // Validate and collect every unique page before mutating allocator state.
+  // This makes malformed inputs fail closed without partially publishing a
+  // staging map.
+  int32_t candidate_count = 0;
+  for (int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if (slot_idx < 0) {
+      continue;
+    }
+    const int64_t physical_block64 = slot_idx / kBlockSize;
+    if (physical_block64 < 0 || physical_block64 >= num_physical_blocks) {
+      invalid_state = 1;
+      continue;
+    }
+    const int32_t physical_block = static_cast<int32_t>(physical_block64);
+    const int32_t row = static_cast<int32_t>(slot_idx % kBlockSize);
+    int32_t candidate_idx = -1;
+    for (int32_t idx = 0; idx < candidate_count; ++idx) {
+      if (candidate_pages[idx] == physical_block) {
+        candidate_idx = idx;
+        break;
+      }
+    }
+    if (candidate_idx < 0) {
+      if (candidate_count >= num_staging_slots ||
+          block_to_staging_slot[physical_block] != -1) {
+        invalid_state = 1;
+        continue;
+      }
+      const int32_t raw_slot = page_to_raw_slot[physical_block];
+      if (raw_slot < -1 || raw_slot >= persistent_raw_slots) {
+        invalid_state = 1;
+        continue;
+      }
+      candidate_idx = candidate_count++;
+      candidate_pages[candidate_idx] = physical_block;
+      candidate_row_masks[candidate_idx] = 0;
+      candidate_valid_rows[candidate_idx] = 0;
+    }
+    const uint32_t row_bit = uint32_t{1} << row;
+    if ((candidate_row_masks[candidate_idx] & row_bit) != 0) {
+      invalid_state = 1;
+      continue;
+    }
+    candidate_row_masks[candidate_idx] |= row_bit;
+    candidate_valid_rows[candidate_idx] =
+        max(candidate_valid_rows[candidate_idx], row + 1);
+  }
+  if (invalid_state != 0) {
+    atomicExch(staging_overflow, 1);
+    atomicExch(raw_pool_overflow, 1);
+    __trap();
+    return;
+  }
+
+  for (int32_t staging_slot = 0; staging_slot < candidate_count;
+       ++staging_slot) {
+    const int32_t physical_block = candidate_pages[staging_slot];
+    const int32_t prior =
+        atomicCAS(block_to_staging_slot + physical_block, -1, -2);
+    if (prior != -1) {
+      atomicExch(staging_overflow, 1);
+      atomicExch(raw_pool_overflow, 1);
+      __trap();
+      return;
+    }
+    staging_to_physical_block[staging_slot] = physical_block;
+    valid_rows[staging_slot] = candidate_valid_rows[staging_slot] |
+                               (stage_ctas_per_page << kCompletionShift);
+  }
+  next_staging_slot[0] = candidate_count;
+}
+
+__global__ void byte_v2_hydrate_append_small_multi_token_hybrid_staging_kernel(
+    const uint16_t* __restrict__ key, const uint16_t* __restrict__ value,
+    uint8_t* __restrict__ raw_staging, uint8_t* __restrict__ kv_cache,
+    const uint8_t* __restrict__ persistent_raw_staging,
+    const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ block_to_staging_slot,
+    int32_t* __restrict__ staging_to_physical_block,
+    int32_t* __restrict__ valid_rows, int32_t* __restrict__ next_staging_slot,
+    int32_t* __restrict__ staging_overflow,
+    const int32_t* __restrict__ page_to_raw_slot,
+    int32_t* __restrict__ raw_pool_overflow, int64_t num_tokens,
+    int64_t key_stride_token, int64_t key_stride_head, int64_t key_stride_dim,
+    int64_t value_stride_token, int64_t value_stride_head,
+    int64_t value_stride_dim, int64_t num_physical_blocks,
+    int64_t num_staging_slots, int64_t raw_staging_stride_slot,
+    int64_t kv_cache_stride_block, int64_t persistent_raw_slots,
+    int64_t persistent_raw_stride_slot) {
+  constexpr int kBlockSize = ByteV2DefaultPolicy::AllocBlockTokens;
+  constexpr int kHeadDim = ByteV2DefaultPolicy::HeadDim;
+  constexpr int kHeadDimV = ByteV2DefaultPolicy::HeadDimV;
+  constexpr int kNumKvHeads = ByteV2DefaultLayout::NumKvHeadsValue;
+  constexpr int kCompletionShift = 5;
+  constexpr int32_t kCompletionUnit = 1 << kCompletionShift;
+  constexpr int32_t kRowsMask = kCompletionUnit - 1;
+
+  __shared__ int32_t token_for_row[kBlockSize];
+  __shared__ int32_t shared_raw_slot;
+  __shared__ int32_t shared_row_state;
+  __shared__ int32_t shared_invalid_state;
+  __shared__ int32_t shared_is_last;
+
+  const int32_t staging_slot = static_cast<int32_t>(blockIdx.y);
+  if (staging_slot < 0 || staging_slot >= num_staging_slots) {
+    return;
+  }
+  const int32_t physical_block = staging_to_physical_block[staging_slot];
+  if (physical_block < 0) {
+    return;
+  }
+
+  if (threadIdx.x == 0) {
+    shared_row_state = atomicAdd(valid_rows + staging_slot, 0);
+    const int32_t rows = shared_row_state & kRowsMask;
+    shared_invalid_state =
+        physical_block >= num_physical_blocks || rows <= 0 ||
+                rows > kBlockSize ||
+                (shared_row_state >> kCompletionShift) <= 0 ||
+                (shared_row_state >> kCompletionShift) >
+                    static_cast<int32_t>(gridDim.x) ||
+                atomicAdd(staging_overflow, 0) != 0 ||
+                atomicAdd(raw_pool_overflow, 0) != 0 ||
+                block_to_staging_slot[physical_block] != -2
+            ? 1
+            : 0;
+    shared_raw_slot =
+        shared_invalid_state == 0 ? page_to_raw_slot[physical_block] : -2;
+    if (shared_raw_slot < -1 || shared_raw_slot >= persistent_raw_slots) {
+      shared_invalid_state = 1;
+    }
+    if (shared_invalid_state != 0) {
+      atomicExch(staging_overflow, 1);
+      atomicExch(raw_pool_overflow, 1);
+    }
+  }
+  __syncthreads();
+  if (shared_invalid_state != 0) {
+    __trap();
+    return;
+  }
+  const int32_t rows = shared_row_state & kRowsMask;
+
+  for (int row = threadIdx.x; row < kBlockSize; row += blockDim.x) {
+    token_for_row[row] = -1;
+  }
+  __syncthreads();
+  for (int64_t token_idx = threadIdx.x; token_idx < num_tokens;
+       token_idx += blockDim.x) {
+    const int64_t slot_idx = slot_mapping[token_idx];
+    if (slot_idx >= 0 && slot_idx / kBlockSize == physical_block) {
+      token_for_row[slot_idx % kBlockSize] = static_cast<int32_t>(token_idx);
+    }
+  }
+  __syncthreads();
+
+  uint8_t* __restrict__ staging =
+      raw_staging +
+      static_cast<int64_t>(staging_slot) * raw_staging_stride_slot;
+  const uint8_t* __restrict__ compact_page =
+      kv_cache + static_cast<int64_t>(physical_block) * kv_cache_stride_block;
+  const uint8_t* __restrict__ raw_page =
+      shared_raw_slot >= 0
+          ? persistent_raw_staging + static_cast<int64_t>(shared_raw_slot) *
+                                         persistent_raw_stride_slot
+          : nullptr;
+  const int64_t work_items =
+      static_cast<int64_t>(2) * kNumKvHeads * rows * kHeadDim;
+  for (int64_t work_idx =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       work_idx < work_items;
+       work_idx += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    int64_t tmp = work_idx;
+    const int dim = tmp % kHeadDim;
+    tmp /= kHeadDim;
+    const int row = tmp % rows;
+    tmp /= rows;
+    const int head_idx = tmp % kNumKvHeads;
+    tmp /= kNumKvHeads;
+    const int kv_side = tmp & 1;
+    if (kv_side != 0 && dim >= kHeadDimV) {
+      continue;
+    }
+
+    const int64_t staging_offset =
+        kv_side == 0
+            ? ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim)
+            : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim);
+    uint16_t bits;
+    const int32_t source_token = token_for_row[row];
+    if (source_token >= 0) {
+      const uint16_t* __restrict__ source = kv_side == 0 ? key : value;
+      const int64_t stride_token =
+          kv_side == 0 ? key_stride_token : value_stride_token;
+      const int64_t stride_head =
+          kv_side == 0 ? key_stride_head : value_stride_head;
+      const int64_t stride_dim =
+          kv_side == 0 ? key_stride_dim : value_stride_dim;
+      bits = source[static_cast<int64_t>(source_token) * stride_token +
+                    head_idx * stride_head + dim * stride_dim];
+    } else if (raw_page != nullptr) {
+      bits = byte_v2_load_u16_bytes(raw_page, staging_offset);
+    } else {
+      const float decoded =
+          kv_side == 0
+              ? byte_v2_load_payload_elem<ByteV2DefaultLayout, false>(
+                    compact_page,
+                    ByteV2DefaultLayout::KPayloadBaseBytes +
+                        head_idx *
+                            ByteV2DefaultLayout::AlignedKPayloadBytesPerKvHead,
+                    head_idx, row, dim)
+              : byte_v2_load_payload_elem<ByteV2DefaultLayout, true>(
+                    compact_page,
+                    ByteV2DefaultLayout::VPayloadBaseBytes +
+                        head_idx *
+                            ByteV2DefaultLayout::AlignedVPayloadBytesPerKvHead,
+                    head_idx, row, dim);
+      bits = byte_v2_float_to_bf16_bits(decoded);
+    }
+    byte_v2_store_u16_bytes(staging, staging_offset, bits);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    const int32_t prior = atomicSub(valid_rows + staging_slot, kCompletionUnit);
+    const int32_t remaining = prior >> kCompletionShift;
+    if ((prior & kRowsMask) != rows || remaining <= 0 ||
+        remaining > static_cast<int32_t>(gridDim.x)) {
+      atomicExch(staging_overflow, 1);
+      atomicExch(raw_pool_overflow, 1);
+      __trap();
+    }
+    shared_is_last = remaining == 1;
+  }
+  __syncthreads();
+  if (shared_is_last != 0) {
+    for (int metadata_byte = threadIdx.x;
+         metadata_byte < ByteV2DefaultLayout::AlignedMetadataBytes;
+         metadata_byte += blockDim.x) {
+      kv_cache[static_cast<int64_t>(physical_block) * kv_cache_stride_block +
+               metadata_byte] = 0;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const int32_t prior =
+          atomicCAS(block_to_staging_slot + physical_block, -2, staging_slot);
+      if (prior != -2) {
+        atomicExch(staging_overflow, 1);
+        atomicExch(raw_pool_overflow, 1);
+        __trap();
+      }
+    }
+  }
+}
+
 __global__ void byte_v2_hydrate_append_multi_token_hybrid_staging_kernel(
     const uint16_t* __restrict__ key, const uint16_t* __restrict__ value,
     uint8_t* __restrict__ raw_staging, uint8_t* __restrict__ kv_cache,
@@ -6385,7 +6682,8 @@ __global__ void byte_v2_hydrate_append_multi_token_hybrid_staging_kernel(
   if (threadIdx.x == 0) {
     candidate_count = 0;
     invalid_state = 0;
-    if (raw_pool_overflow[0] != 0 || staging_overflow[0] != 0) {
+    if (atomicAdd(raw_pool_overflow, 0) != 0 ||
+        atomicAdd(staging_overflow, 0) != 0) {
       invalid_state = 1;
     }
     for (int64_t token_idx = chunk_start; token_idx < chunk_end; ++token_idx) {
@@ -10039,7 +10337,7 @@ void byte_v2_update_hybrid_cache_raw_staging_q1(
       cudaGetErrorString(err));
 }
 
-void byte_v2_update_hybrid_cache_raw_staging_multi_token(
+static void byte_v2_update_hybrid_cache_raw_staging_multi_token_impl(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
     torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
     torch::stable::Tensor& persistent_raw_staging,
@@ -10052,10 +10350,15 @@ void byte_v2_update_hybrid_cache_raw_staging_multi_token(
     torch::stable::Tensor& free_raw_slot_count,
     torch::stable::Tensor& raw_pool_overflow,
     const std::vector<int64_t>& tile_policy,
-    std::optional<torch::stable::Tensor> page_unsafe_flags) {
+    std::optional<torch::stable::Tensor> page_unsafe_flags,
+    bool retain_transient_staging) {
   using torch::headeronly::ScalarType;
 
   check_byte_v2_tile_policy(tile_policy);
+  STD_TORCH_CHECK(
+      !retain_transient_staging || !page_unsafe_flags.has_value(),
+      "byte_v2 retained hybrid multi-token update requires deferred page "
+      "flag refresh after attention");
   STD_TORCH_CHECK(
       tile_policy[0] == ByteV2DefaultPolicy::CodecTokenBlock &&
           tile_policy[1] == ByteV2DefaultPolicy::CodecDimBlock &&
@@ -10195,27 +10498,69 @@ void byte_v2_update_hybrid_cache_raw_staging_multi_token(
   const cudaStream_t stream = get_current_cuda_stream(key.get_device_index());
   constexpr int kStageThreads = 256;
   constexpr int kTokensPerStageBlock = ByteV2DefaultPolicy::AllocBlockTokens;
-  const int stage_blocks = static_cast<int>(
-      (key.size(0) + kTokensPerStageBlock - 1) / kTokensPerStageBlock);
-  byte_v2_hydrate_append_multi_token_hybrid_staging_kernel<<<
-      stage_blocks, kStageThreads, 0, stream>>>(
-      reinterpret_cast<const uint16_t*>(key.const_data_ptr()),
-      reinterpret_cast<const uint16_t*>(value.const_data_ptr()),
-      reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()),
-      reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
-      reinterpret_cast<const uint8_t*>(persistent_raw_staging.const_data_ptr()),
-      slot_mapping.const_data_ptr<int64_t>(),
-      block_to_staging_slot.mutable_data_ptr<int32_t>(),
-      staging_to_physical_block.mutable_data_ptr<int32_t>(),
-      valid_rows.mutable_data_ptr<int32_t>(),
-      next_staging_slot.mutable_data_ptr<int32_t>(),
-      overflow.mutable_data_ptr<int32_t>(),
-      page_to_raw_slot.const_data_ptr<int32_t>(),
-      raw_pool_overflow.mutable_data_ptr<int32_t>(), key.size(0), key.stride(0),
-      key.stride(1), key.stride(2), value.stride(0), value.stride(1),
-      value.stride(2), kv_cache.size(0), raw_staging.size(0),
-      raw_staging.stride(0), kv_cache.stride(0), persistent_raw_staging.size(0),
-      persistent_raw_staging.stride(0));
+  constexpr int kSmallStageCtasPerPage = 8;
+  if (key.size(0) <= kTokensPerStageBlock &&
+      raw_staging.size(0) <= kTokensPerStageBlock) {
+    byte_v2_prepare_small_multi_token_hybrid_staging_kernel<<<1, 1, 0,
+                                                              stream>>>(
+        slot_mapping.const_data_ptr<int64_t>(),
+        block_to_staging_slot.mutable_data_ptr<int32_t>(),
+        staging_to_physical_block.mutable_data_ptr<int32_t>(),
+        valid_rows.mutable_data_ptr<int32_t>(),
+        next_staging_slot.mutable_data_ptr<int32_t>(),
+        overflow.mutable_data_ptr<int32_t>(),
+        page_to_raw_slot.const_data_ptr<int32_t>(),
+        raw_pool_overflow.mutable_data_ptr<int32_t>(), key.size(0),
+        kv_cache.size(0), raw_staging.size(0), persistent_raw_staging.size(0),
+        kSmallStageCtasPerPage);
+    const dim3 stage_grid(
+        kSmallStageCtasPerPage,
+        static_cast<unsigned int>(std::min(key.size(0), raw_staging.size(0))),
+        1);
+    byte_v2_hydrate_append_small_multi_token_hybrid_staging_kernel<<<
+        stage_grid, kStageThreads, 0, stream>>>(
+        reinterpret_cast<const uint16_t*>(key.const_data_ptr()),
+        reinterpret_cast<const uint16_t*>(value.const_data_ptr()),
+        reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        reinterpret_cast<const uint8_t*>(
+            persistent_raw_staging.const_data_ptr()),
+        slot_mapping.const_data_ptr<int64_t>(),
+        block_to_staging_slot.mutable_data_ptr<int32_t>(),
+        staging_to_physical_block.mutable_data_ptr<int32_t>(),
+        valid_rows.mutable_data_ptr<int32_t>(),
+        next_staging_slot.mutable_data_ptr<int32_t>(),
+        overflow.mutable_data_ptr<int32_t>(),
+        page_to_raw_slot.const_data_ptr<int32_t>(),
+        raw_pool_overflow.mutable_data_ptr<int32_t>(), key.size(0),
+        key.stride(0), key.stride(1), key.stride(2), value.stride(0),
+        value.stride(1), value.stride(2), kv_cache.size(0), raw_staging.size(0),
+        raw_staging.stride(0), kv_cache.stride(0),
+        persistent_raw_staging.size(0), persistent_raw_staging.stride(0));
+  } else {
+    const int stage_blocks = static_cast<int>(
+        (key.size(0) + kTokensPerStageBlock - 1) / kTokensPerStageBlock);
+    byte_v2_hydrate_append_multi_token_hybrid_staging_kernel<<<
+        stage_blocks, kStageThreads, 0, stream>>>(
+        reinterpret_cast<const uint16_t*>(key.const_data_ptr()),
+        reinterpret_cast<const uint16_t*>(value.const_data_ptr()),
+        reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()),
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        reinterpret_cast<const uint8_t*>(
+            persistent_raw_staging.const_data_ptr()),
+        slot_mapping.const_data_ptr<int64_t>(),
+        block_to_staging_slot.mutable_data_ptr<int32_t>(),
+        staging_to_physical_block.mutable_data_ptr<int32_t>(),
+        valid_rows.mutable_data_ptr<int32_t>(),
+        next_staging_slot.mutable_data_ptr<int32_t>(),
+        overflow.mutable_data_ptr<int32_t>(),
+        page_to_raw_slot.const_data_ptr<int32_t>(),
+        raw_pool_overflow.mutable_data_ptr<int32_t>(), key.size(0),
+        key.stride(0), key.stride(1), key.stride(2), value.stride(0),
+        value.stride(1), value.stride(2), kv_cache.size(0), raw_staging.size(0),
+        raw_staging.stride(0), kv_cache.stride(0),
+        persistent_raw_staging.size(0), persistent_raw_staging.stride(0));
+  }
   cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(
       err == cudaSuccess,
@@ -10243,32 +10588,107 @@ void byte_v2_update_hybrid_cache_raw_staging_multi_token(
       cudaGetErrorString(err));
 
   constexpr int kPersistThreads = 256;
-  int32_t* unsafe_flags_ptr =
-      page_unsafe_flags.has_value()
-          ? page_unsafe_flags->mutable_data_ptr<int32_t>()
-          : nullptr;
-  byte_v2_persist_raw_fallback_pages_kernel<true>
-      <<<static_cast<unsigned int>(raw_staging.size(0)), kPersistThreads, 0,
-         stream>>>(
-          reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
-          reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
-          staging_to_physical_block.mutable_data_ptr<int32_t>(),
-          valid_rows.mutable_data_ptr<int32_t>(), raw_staging.size(0),
-          raw_staging.stride(0), kv_cache.stride(0),
-          reinterpret_cast<uint8_t*>(persistent_raw_staging.mutable_data_ptr()),
-          persistent_raw_staging.size(0), persistent_raw_staging.stride(0),
-          page_to_raw_slot.mutable_data_ptr<int32_t>(),
-          free_raw_slots.const_data_ptr<int32_t>(),
-          free_raw_slot_count.mutable_data_ptr<int32_t>(),
-          raw_pool_overflow.mutable_data_ptr<int32_t>(), kv_cache.size(0),
-          block_to_staging_slot.mutable_data_ptr<int32_t>(),
-          next_staging_slot.mutable_data_ptr<int32_t>(),
-          overflow.mutable_data_ptr<int32_t>(), unsafe_flags_ptr);
+  const unsigned int persist_blocks =
+      static_cast<unsigned int>(raw_staging.size(0));
+  if (retain_transient_staging) {
+    // Publish persistent raw fallbacks, but leave the transient page map and
+    // allocator state intact for the immediately following hybrid FA2 reader.
+    // Its stream-ordered release is responsible for any deferred page flags.
+    byte_v2_persist_raw_fallback_pages_kernel<false>
+        <<<persist_blocks, kPersistThreads, 0, stream>>>(
+            reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
+            reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+            staging_to_physical_block.mutable_data_ptr<int32_t>(),
+            valid_rows.mutable_data_ptr<int32_t>(), raw_staging.size(0),
+            raw_staging.stride(0), kv_cache.stride(0),
+            reinterpret_cast<uint8_t*>(
+                persistent_raw_staging.mutable_data_ptr()),
+            persistent_raw_staging.size(0), persistent_raw_staging.stride(0),
+            page_to_raw_slot.mutable_data_ptr<int32_t>(),
+            free_raw_slots.const_data_ptr<int32_t>(),
+            free_raw_slot_count.mutable_data_ptr<int32_t>(),
+            raw_pool_overflow.mutable_data_ptr<int32_t>(), kv_cache.size(0));
+  } else {
+    int32_t* unsafe_flags_ptr =
+        page_unsafe_flags.has_value()
+            ? page_unsafe_flags->mutable_data_ptr<int32_t>()
+            : nullptr;
+    byte_v2_persist_raw_fallback_pages_kernel<true>
+        <<<persist_blocks, kPersistThreads, 0, stream>>>(
+            reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
+            reinterpret_cast<const uint8_t*>(kv_cache.const_data_ptr()),
+            staging_to_physical_block.mutable_data_ptr<int32_t>(),
+            valid_rows.mutable_data_ptr<int32_t>(), raw_staging.size(0),
+            raw_staging.stride(0), kv_cache.stride(0),
+            reinterpret_cast<uint8_t*>(
+                persistent_raw_staging.mutable_data_ptr()),
+            persistent_raw_staging.size(0), persistent_raw_staging.stride(0),
+            page_to_raw_slot.mutable_data_ptr<int32_t>(),
+            free_raw_slots.const_data_ptr<int32_t>(),
+            free_raw_slot_count.mutable_data_ptr<int32_t>(),
+            raw_pool_overflow.mutable_data_ptr<int32_t>(), kv_cache.size(0),
+            block_to_staging_slot.mutable_data_ptr<int32_t>(),
+            next_staging_slot.mutable_data_ptr<int32_t>(),
+            overflow.mutable_data_ptr<int32_t>(), unsafe_flags_ptr);
+  }
   err = cudaGetLastError();
-  STD_TORCH_CHECK(
-      err == cudaSuccess,
-      "byte_v2 fused hybrid multi-token persist/release kernel launch failed: ",
-      cudaGetErrorString(err));
+  if (retain_transient_staging) {
+    STD_TORCH_CHECK(
+        err == cudaSuccess,
+        "byte_v2 fused hybrid multi-token retained persist kernel launch "
+        "failed: ",
+        cudaGetErrorString(err));
+  } else {
+    STD_TORCH_CHECK(
+        err == cudaSuccess,
+        "byte_v2 fused hybrid multi-token persist/release kernel launch "
+        "failed: ",
+        cudaGetErrorString(err));
+  }
+}
+
+void byte_v2_update_hybrid_cache_raw_staging_multi_token(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow, torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    const std::vector<int64_t>& tile_policy,
+    std::optional<torch::stable::Tensor> page_unsafe_flags) {
+  byte_v2_update_hybrid_cache_raw_staging_multi_token_impl(
+      key, value, raw_staging, kv_cache, persistent_raw_staging, slot_mapping,
+      block_to_staging_slot, staging_to_physical_block, valid_rows,
+      next_staging_slot, overflow, page_to_raw_slot, free_raw_slots,
+      free_raw_slot_count, raw_pool_overflow, tile_policy, page_unsafe_flags,
+      /*retain_transient_staging=*/false);
+}
+
+void byte_v2_update_hybrid_cache_raw_staging_multi_token_retained(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& overflow, torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    const std::vector<int64_t>& tile_policy,
+    std::optional<torch::stable::Tensor> page_unsafe_flags) {
+  byte_v2_update_hybrid_cache_raw_staging_multi_token_impl(
+      key, value, raw_staging, kv_cache, persistent_raw_staging, slot_mapping,
+      block_to_staging_slot, staging_to_physical_block, valid_rows,
+      next_staging_slot, overflow, page_to_raw_slot, free_raw_slots,
+      free_raw_slot_count, raw_pool_overflow, tile_policy, page_unsafe_flags,
+      /*retain_transient_staging=*/true);
 }
 
 void byte_v2_test_force_promote_raw_staging_q1(

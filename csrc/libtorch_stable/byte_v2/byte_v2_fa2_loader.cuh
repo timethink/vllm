@@ -155,7 +155,7 @@ __device__ __forceinline__ bool stage_raw_page_to_fa2_smem(
   const uint8_t* raw_slot_base =
       raw_side_base + static_cast<int64_t>(raw_slot) * RawLayout::SlotSizeBytes;
 
-#pragma unroll 1
+#pragma unroll
   for (int k = 0; k < kDimVectorsPerThread; ++k) {
     const int dim_tile = 4 * k + ((tidx & 7) >> 1);
     const int dim0 = dim_tile * Policy::CodecDimBlock + dim_in_tile0;

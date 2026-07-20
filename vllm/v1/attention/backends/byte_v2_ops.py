@@ -575,6 +575,51 @@ def byte_v2_update_hybrid_cache_raw_staging_multi_token(
     )
 
 
+def byte_v2_update_hybrid_cache_raw_staging_multi_token_retained(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    raw_staging: torch.Tensor,
+    kv_cache: torch.Tensor,
+    persistent_raw_staging: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_to_staging_slot: torch.Tensor,
+    staging_to_physical_block: torch.Tensor,
+    valid_rows: torch.Tensor,
+    next_staging_slot: torch.Tensor,
+    overflow: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    free_raw_slots: torch.Tensor,
+    free_raw_slot_count: torch.Tensor,
+    raw_pool_overflow: torch.Tensor,
+    *,
+    tile_policy: Sequence[int],
+    page_unsafe_flags: torch.Tensor | None = None,
+) -> None:
+    """Retain transient pages after the hybrid multi-token cache commit."""
+    _require_op(
+        "_C_cache_ops",
+        "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained",
+    )(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        persistent_raw_staging,
+        slot_mapping,
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+        page_to_raw_slot,
+        free_raw_slots,
+        free_raw_slot_count,
+        raw_pool_overflow,
+        list(tile_policy),
+        page_unsafe_flags,
+    )
+
+
 def byte_v2_test_force_promote_raw_staging_q1(
     raw_staging: torch.Tensor,
     persistent_raw_staging: torch.Tensor,
@@ -694,6 +739,71 @@ def byte_v2_fa2_paged_decode_attention(
         block_tables,
         None,
         1,
+        max_seq_len,
+        0.0,
+        scale,
+        False,
+        causal,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+
+
+def byte_v2_fa2_raw_staging_prefill_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    raw_staging: torch.Tensor,
+    block_to_staging_slot: torch.Tensor,
+    query_start_locs: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    scale: float,
+    num_kv_heads: int,
+    block_size: int,
+    head_dim: int,
+    max_query_len: int,
+    max_seq_len: int,
+    causal: bool,
+) -> None:
+    """Run original raw paged FA2 directly over exact staging pages."""
+    expected_slot_bytes = 2 * 2 * num_kv_heads * block_size * head_dim
+    if (
+        raw_staging.dtype != torch.uint8
+        or raw_staging.ndim != 2
+        or raw_staging.shape[1] != expected_slot_bytes
+        or raw_staging.stride(1) != 1
+    ):
+        raise ValueError(
+            "ByteV2 raw staging must be a contiguous uint8 page matrix with "
+            f"{expected_slot_bytes} bytes per slot"
+        )
+    raw_kv = raw_staging.view(torch.bfloat16).view(
+        raw_staging.shape[0],
+        2,
+        num_kv_heads,
+        block_size,
+        head_dim,
+    )
+    key_cache = raw_kv[:, 0].permute(0, 2, 1, 3)
+    value_cache = raw_kv[:, 1].permute(0, 2, 1, 3)
+    staging_block_tables = block_to_staging_slot[block_tables]
+    _require_fa2_op("varlen_fwd")(
+        query,
+        key_cache,
+        value_cache,
+        output,
+        query_start_locs,
+        query_start_locs,
+        seq_lens,
+        None,
+        staging_block_tables,
+        None,
+        max_query_len,
         max_seq_len,
         0.0,
         scale,
