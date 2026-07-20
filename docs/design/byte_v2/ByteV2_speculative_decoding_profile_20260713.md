@@ -1990,3 +1990,334 @@ Artifacts:
 - `profile/byte-v2-short-context-two-kernel-e2e-a40-20260720/analysis/e2e_ab_summary.json`
 - `profile/byte-v2-short-context-two-kernel-e2e-a40-20260720/analysis/e2e_ab_summary.csv`
 - `profile/byte-v2-short-context-two-kernel-e2e-a40-20260720/reports/run{1,2,3}_{four_kernel,two_kernel,raw}.jsonl`
+
+## Exact Hybrid Raw-Fallback Checkpoint (2026-07-20)
+
+Checkpoint `7489f5f17` (`Add exact ByteV2 FA2 raw fallback`) is the current
+reproducible baseline for the compact/raw hybrid design. The feature is
+experimental and defaults to off. It is enabled with:
+
+```text
+BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1
+```
+
+The checkpoint preserves the existing FA2 template and changes only the KV
+load/store boundary:
+
+- `page_to_raw_slot[page] == -1` selects the 52,096-byte compact V5 page;
+  a non-negative entry selects an authoritative 65,536-byte raw BF16 sidecar
+  page.
+- The FA2 loader decodes compact pages or copies raw BF16 pages into the
+  original shared-memory tile. QK, online softmax, PV, split selection, output
+  layout, and the original FA2 combine kernel remain unchanged.
+- The writer keeps ordinary representable outliers in V5. It allocates a raw
+  sidecar only for an already-raw page, a true compact-pool overflow, or an
+  explicit fallback result. Raw data is copied and fenced before the page map
+  is published.
+- Raw-slot allocation is race-safe and fail-closed. Invalid maps, missing
+  extension operations, and raw-pool exhaustion do not silently read or write
+  a compact page.
+- Q1 decode and generic causal cached-context Q greater than one both use the
+  hybrid FA2 reader. Prefix-cache block death/reuse and global prefix reset
+  reclaim raw slots. One fixed-address staging workspace is shared across all
+  ByteV2 layers and is allocated before CUDA Graph capture.
+
+Direct CUDA coverage at this checkpoint includes compact-only, raw-only,
+mixed, ragged, permuted, shared-prefix, split, real compact overflow, update
+of an existing raw page, reset/reuse, and allocator exhaustion. Compact and
+raw hybrid reads preserve the original FA2 output/LSE bit pattern in the
+covered cases. The serving sweep below adds full-model token-exact evidence
+for the common path, but it did not naturally allocate a raw page.
+
+### Current Support Boundary
+
+The hybrid mode deliberately rejects configurations whose sidecar lifetime or
+FA2 arithmetic has not been made exact:
+
+- BF16 causal decoder self-attention, compact V5 pages, 16 tokens per page,
+  local `(Hq, Hkv, D) = (32, 8, 128)`, and the default V5 tile policy are
+  required.
+- ALiBi, sliding-window/local attention, positive logit softcap, non-decoder
+  attention, and cross-layer KV-cache sharing are rejected.
+- KV connectors, KV-cache offload, sleep mode, DCP/PCP, ubatching, and DBO are
+  rejected because they do not yet transfer, restore, or isolate the raw
+  sidecar and its single-lane staging workspace.
+- The tested serving scope is one A40, batch 1, one model process, compiled
+  CUDA Graph execution, and no speculation. Prefix caching and CUDA Graphs
+  have lifecycle integration, but distributed and offloaded serving are not
+  implied by this checkpoint.
+- Large writes are divided into page-aware waves bounded by the shared staging
+  capacity. The default is 128 staging pages. This bounds memory and keeps
+  captured addresses stable, at the cost of additional writer launches for
+  long prompts.
+
+These checks are fail-closed at configuration or dispatch time. They should
+not be relaxed until the corresponding sidecar ownership and bitwise tests
+exist.
+
+### Complete Memory Budget
+
+Let:
+
+- \(L\) be the number of ByteV2 layers;
+- \(P\) be the number of physical cache blocks;
+- \(R\) be persistent raw fallback slots per layer, defaulting to
+  \(\max(1, \lfloor P / 256 \rfloor)\);
+- \(S\) be runner-owned shared staging slots, defaulting to 128.
+
+For the tested 32/8/128 layout, one compact page is 52,096 bytes and one raw
+BF16 page is 65,536 bytes. Persistent state per ByteV2 layer is:
+
+```text
+page map                 = 4 * P
+raw pages + free stack   = (65,536 + 4) * R
+free/fatal counters      = 8
+```
+
+The single cross-layer staging workspace is:
+
+```text
+raw staging pages        = 65,536 * S
+block-to-slot map        = 4 * P
+slot maps/valid rows     = 8 * S
+allocator counters       = 8
+```
+
+The full planned hybrid allocation is therefore:
+
+```text
+M_hybrid(P) =
+    52,096 * L * P
+  + L * (4 * P + 65,540 * R + 8)
+  + (65,536 * S + 4 * P + 8 * S + 8)
+
+M_raw(P) = 65,536 * L * P
+```
+
+This accounting includes the persistent raw sidecars and the transient
+fixed-address workspace; neither is hidden outside the KV-cache budget. The
+planner uses a monotonic search for the largest \(P\) that fits the profiled
+budget.
+
+For round 1, \(L=32\), \(S=128\), and the paired approximately 20.11 GB
+planner budget produced:
+
+| Plan | Blocks | Compact tensor | Sidecar | Workspace | Total planned |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Compact V5 | 12,065 | 20,113,223,680 B | 0 | 0 | 20,113,223,680 B |
+| Hybrid V5/raw | 12,001 | 20,006,531,072 B | 98,011,264 B | 8,437,644 B | 20,112,979,980 B |
+| Raw BF16 | 9,591 | 20,113,784,832 B | 0 | 0 | 20,113,784,832 B |
+
+The hybrid plan has \(R=46\) slots per layer. At the same 12,001-block
+capacity, raw BF16 would require 25,167,921,152 bytes, so the complete hybrid
+allocation saves 20.08486%, after sidecars and workspace. Under the fixed
+planner budget, hybrid provides 12,001 versus 9,591 raw blocks, a 25.12772%
+capacity increase. The sidecar/workspace cost reduces capacity by only 64
+blocks, or about 0.53%, relative to compact-only V5 in this configuration.
+
+### Round-1 Compiled E2E Baseline
+
+The first sweep leg uses batch 1, no speculation, 256 output tokens, compiled
+CUDA Graph execution, and contexts 64 through 16K. The order is compact,
+hybrid, then raw. All three variants use independent engine processes. The
+hybrid run collects its allocator state after timed generation and profiler
+replay.
+
+This is one round, not a statistically complete comparison:
+
+| Context | Compact tok/s | Hybrid tok/s | Raw tok/s | Hybrid/compact | Hybrid/raw |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 37.5357 | 35.3362 | 38.3386 | -5.8596% | -7.8312% |
+| 128 | 37.4488 | 36.1792 | 38.2672 | -3.3902% | -5.4563% |
+| 512 | 36.9426 | 35.9428 | 37.8799 | -2.7063% | -5.1138% |
+| 1,024 | 36.3695 | 35.3709 | 37.2673 | -2.7456% | -5.0886% |
+| 2,048 | 35.2776 | 34.1900 | 36.1002 | -3.0829% | -5.2916% |
+| 4,096 | 33.3708 | 32.2708 | 33.9679 | -3.2963% | -4.9962% |
+| 8,192 | 29.7428 | 28.6129 | 30.2574 | -3.7990% | -5.4354% |
+| 16,384 | 23.7262 | 22.7219 | 24.0206 | -4.2327% | -5.4065% |
+
+Correctness is stronger than the single-round timing:
+
+- All 24 measured compact/hybrid/raw requests produced 256 tokens.
+- At every context, the three token lists are elementwise identical.
+- Every instrumented replay reproduced its corresponding measured token list.
+- All eight hybrid state observations report `fatal=0`,
+  `free_count=slot_count`, and zero raw pages.
+
+The zero raw-page count means this sweep validates common compact-page
+serving, planner accounting, and sidecar lifecycle. Exact overflow-to-raw
+behavior is covered by direct CUDA tests, not yet by a forced-fallback
+full-model E2E run.
+
+### Round-1 Bottleneck and Next Measurement
+
+The incremental hybrid gap is concentrated in the unfused writer and its
+page-aware waves, not in changed QK/softmax/PV arithmetic. At context 4,096,
+the profiled hybrid prepare/hydrate/append/commit/release chain executes 96
+operations of each type, or three waves per layer, and totals about 102.0 ms.
+Compact direct `reshape_and_cache` totals 14.79 ms. At context 16,384, hybrid
+executes nine waves per layer and the chain totals about 417.2 ms, versus
+59.63 ms for compact direct write. Raw-slot reset contributes another roughly
+9 ms per profiled request. This launch and full-page hydrate/re-encode work
+tracks the growing 4K--16K wall-time gap.
+
+The 64-token result is a single-order anomaly: its wall gap is larger even
+though the attributed CUDA operations do not explain that magnitude. It must
+not be treated as a stable short-context regression without the remaining
+Latin-square rounds.
+
+Most importantly, round 1 was captured at checkpoint `7489f5f17`, before the
+new fused hybrid Q1 writer currently under evaluation. It is the pre-fusion
+baseline and cannot establish the fused path's retained E2E performance.
+Formal publication evidence still requires the full three-round cyclic
+compact/hybrid/raw sweep on the post-fusion binary, cross-round token
+exactness, the same allocator-state checks, and renewed CUDA attribution. The
+retention decision should use the three-round paired medians, not the numbers
+above.
+
+Artifacts:
+
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/round1_compact.jsonl`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/round1_hybrid.jsonl`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/round1_raw.jsonl`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/analysis/summary.json`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/analysis/comparison.csv`
+
+### Post-Q1-Fusion Preliminary Result
+
+Checkpoint `56e155936` (`Fuse exact ByteV2 hybrid Q1 updates`) replaces the
+decode-time hybrid prepare/hydrate/append/commit/persist/release chain with one
+host op that launches three ordered CUDA kernels:
+
+1. compact/raw hydrate, append, and compact-metadata clear;
+2. the existing warp-histogram compact commit;
+3. raw persistence, map-last publication, page-flag update, and transient-slot
+   release.
+
+The original FA2 reader and combine kernels are unchanged. Invalid raw maps,
+raw-pool exhaustion, and an externally corrupted free-count fail closed. A
+CUDA Graph reset/reuse test covers two raw pages, selective reset, raw-slot
+reuse, and dummy replay. On GPU 6, the combined layout and analysis regression
+run completed with 276 passed and one skipped test. Compute Sanitizer reported
+zero errors for `memcheck` and `synccheck`, and zero hazards for `racecheck`,
+on the real compact-overflow and CUDA Graph reset/reuse cases.
+
+At context 1,024 in eager mode with 64 output tokens, the visible Q1 writer
+cost changed from the five-op hybrid chain's 57.246 us/layer to 20.299
+us/layer for the fused three-kernel op. The compact-only fused writer measured
+21.204 us/layer in the same profiler setup. E2E throughput changed from 31.035
+to 31.770 token/s, versus 31.754 token/s for compact-only V5. The hybrid FA2
+reader itself remained effectively unchanged; the measured gain came from the
+writer path.
+
+A post-fusion compiled pre-sweep then reran the same eight contexts and 256
+output tokens. The compact and raw columns below are retained round-1 runs;
+only the hybrid column was rerun, so these paired ratios are directional and
+must not be substituted for the final cyclic three-round result.
+
+| Context | Fused hybrid tok/s | Versus round-1 compact | Versus round-1 raw |
+| ---: | ---: | ---: | ---: |
+| 64 | 37.530 | -0.015% | -2.109% |
+| 128 | 37.407 | -0.112% | -2.248% |
+| 512 | 36.923 | -0.052% | -2.525% |
+| 1,024 | 36.319 | -0.140% | -2.546% |
+| 2,048 | 34.963 | -0.892% | -3.151% |
+| 4,096 | 32.991 | -1.139% | -2.877% |
+| 8,192 | 29.146 | -2.008% | -3.675% |
+| 16,384 | 23.030 | -2.932% | -4.122% |
+
+All token lists match the corresponding compact and raw round-1 lists, every
+profiler replay is exact, and all hybrid observations report zero raw pages,
+`fatal=0`, and complete slot return. Across contexts, the directional median
+hybrid/compact TPS gap is -0.516%; before Q1 fusion it was -3.343%. The
+directional median hybrid/raw gap is -2.711%.
+
+The remaining long-context gap is now attributable to the generic prefill
+writer rather than Q1 decode. At 8K and 16K it executes five and nine waves per
+layer. Its prepare/hydrate/append/commit/release CUDA totals are 205.988 and
+416.515 ms/request, while compact `byte_v2_reshape_and_cache` totals 29.530 and
+59.628 ms. The excesses, 176.458 and 356.888 ms, closely track the observed
+wall-time gaps. Therefore the next performance target is a page-centric
+three-kernel generic/prefill writer; further Q1 or FA2-reader tuning is not the
+largest E2E opportunity at these lengths.
+
+The pre-sweep preceded a defensive check that is taken only when an allocator
+free-count is externally corrupted; the normal measured path allocated no raw
+page. Formal publication numbers still require all variants to run on the
+final binary in three cyclic orders, followed by strict automated analysis.
+
+Additional artifacts:
+
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/eager_hybrid_q1_fused_ctx1024.jsonl`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/cg_hybrid_q1_fused_ctx1024.jsonl`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/prefinal_hybrid_q1_fused.jsonl`
+
+### Forced-Raw Serving Lifecycle Diagnostic
+
+The normal E2E sweeps did not naturally exhaust the compact outlier pool, so
+zero raw pages at request completion could not prove that a full model request
+had traversed the raw reader, existing-raw writer, and scheduler reset paths.
+An additive test-only diagnostic closes this evidence gap. It is enabled only
+by the explicit profile flag:
+
+```text
+--diagnose-forced-raw-lifecycle
+```
+
+The worker then sets `BYTE_V2_TEST_FORCE_RAW_PROMOTION=1`. Default serving does
+not allocate diagnostic state, require the diagnostic op, or launch it. In
+diagnostic mode each layer adds three int32 values, or 12 bytes, and the
+planner includes those bytes in the sidecar budget.
+
+After ordinary warmup and CUDA Graph capture, the profile harness clears and
+arms a device one-shot latch. Immediately after the next valid fused Q1
+update, one 256-thread diagnostic CTA copies the transient 65,536-byte raw
+page to a persistent raw slot. Each copy thread fences its own stores, a CTA
+barrier follows, and thread 0 publishes `page_to_raw_slot` last. For a partial
+page, only the prefix through the appended row is semantically valid; unused
+tail rows remain unspecified and are masked by sequence length. Later Q1
+updates hydrate only that valid prefix and overwrite the new target row.
+
+The diagnostic keeps two witnesses after request teardown:
+
+- `promotion_count` proves that the latch was consumed and a raw map was
+  published;
+- `mapped_page_visit_count` proves that a later Q1 completed while the page
+  was already raw.
+
+After each measured and profiler-replay request, the harness explicitly calls
+the model runner's real `_zero_block_ids` path for the mapped physical block.
+That path invokes raw-sidecar reset before compact zero. The JSON records this
+as `runner_zero_block_ids_after_request`; this is an explicit block-reuse
+lifecycle event rather than an assertion that request completion immediately
+zeros all physical blocks.
+
+On A40, context 1,024 and three output tokens passed in both eager and compiled
+CUDA Graph modes. In each mode, all 32 layers reported the following for both
+the measured request and its independent profiler replay:
+
+```text
+promotion_count          = 32
+mapped_page_visit_count  = 32
+request_reset_observed   = true
+```
+
+The final state had zero mapped raw pages, `free_count == slot_count`, and
+`fatal == 0`. Unforced hybrid, forced-raw hybrid, and independent raw FA2 all
+produced the same three tokens, `[13, 2579, 6307]`; both replay token lists
+were also exact. The diagnostic JSON sets `performance_valid_for_tps=false`
+because it deliberately adds one 64 KiB copy and one CUDA launch per layer.
+
+Low-level eager and CUDA Graph tests additionally cover row-0 partial-page
+promotion, same-step hybrid/raw FA2 bitwise equality, the next existing-raw
+update, reset and slot reuse, dummy replay, and pool-exhaustion fail-closed
+behavior. Compute Sanitizer reported zero memcheck/synccheck errors and zero
+racecheck hazards for the eager and graph lifecycle cases. This diagnostic is
+fault injection: natural compact overflow remains covered by separate direct
+CUDA tests and must not be inferred from the forced E2E run.
+
+Artifacts:
+
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/forced_raw_eager_ctx1024.jsonl`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/forced_raw_compiled_ctx1024.jsonl`
+- `profile/byte-v2-hybrid-workspace-e2e-a40-20260720/forced_raw_reference_fa2_ctx1024.jsonl`
