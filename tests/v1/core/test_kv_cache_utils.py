@@ -1948,6 +1948,19 @@ def test_byte_v2_raw_fallback_budget_with_explicit_slots(monkeypatch):
     )
 
 
+def test_byte_v2_test_forced_raw_diagnostic_is_budgeted_only_when_enabled(
+    monkeypatch,
+):
+    env_name = "BYTE_V2_TEST_FORCE_RAW_PROMOTION"
+    monkeypatch.delenv(env_name, raising=False)
+    default_bytes = kv_cache_utils.get_byte_v2_raw_fallback_sidecar_bytes(17, 2, 3)
+
+    monkeypatch.setenv(env_name, "1")
+    diagnostic_bytes = kv_cache_utils.get_byte_v2_raw_fallback_sidecar_bytes(17, 2, 3)
+
+    assert diagnostic_bytes == default_bytes + 2 * 3 * 4
+
+
 def test_byte_v2_raw_staging_slot_override_is_budgeted(monkeypatch):
     monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
     monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "3")

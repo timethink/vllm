@@ -59,12 +59,17 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_reshape_and_cache,
     byte_v2_speculative_verify_gqa,
     byte_v2_speculative_verify_ragged_q4,
+    byte_v2_test_force_promote_raw_staging_q1,
+    byte_v2_test_forced_raw_promotion_is_available,
     byte_v2_update_cache_raw_staging,
     byte_v2_update_cache_single_token,
     byte_v2_update_cache_unsafe_flags,
     byte_v2_update_hybrid_cache_raw_staging_q1,
 )
-from vllm.v1.kv_cache_interface import byte_v2_hybrid_raw_fallback_enabled
+from vllm.v1.kv_cache_interface import (
+    byte_v2_hybrid_raw_fallback_enabled,
+    byte_v2_test_forced_raw_promotion_enabled,
+)
 
 _BYTE_V2_KERNELS_NOT_READY = "ByteV2 native CUDA kernels are not registered yet"
 _BYTE_V2_MAX_RAW_STAGING_TOKENS = 1024
@@ -457,6 +462,7 @@ class ByteV2RawFallbackState:
     free_slots: torch.Tensor
     free_count: torch.Tensor
     fatal: torch.Tensor
+    forced_raw_diagnostic: torch.Tensor | None = None
 
 
 class ByteV2RawFallbackStore:
@@ -471,8 +477,14 @@ class ByteV2RawFallbackStore:
     page state cannot be transferred safely to a new binding.
     """
 
-    def __init__(self, *, raw_layout: ByteV2RawStagingLayout) -> None:
+    def __init__(
+        self,
+        *,
+        raw_layout: ByteV2RawStagingLayout,
+        forced_raw_diagnostic: bool = False,
+    ) -> None:
         self.raw_layout = raw_layout
+        self.forced_raw_diagnostic = forced_raw_diagnostic
         self._binding: tuple[int, torch.device, tuple[int, ...]] | None = None
         self._state: ByteV2RawFallbackState | None = None
         self._planned_num_blocks: int | None = None
@@ -539,6 +551,11 @@ class ByteV2RawFallbackStore:
                 device=device,
             ),
             fatal=torch.zeros((1,), dtype=torch.int32, device=device),
+            forced_raw_diagnostic=(
+                torch.zeros((3,), dtype=torch.int32, device=device)
+                if self.forced_raw_diagnostic
+                else None
+            ),
         )
 
     def bind_plan(self, *, num_blocks: int, num_raw_slots: int) -> None:
@@ -579,6 +596,20 @@ class ByteV2RawFallbackStore:
         self._state = self._allocate_state(kv_cache)
         return self._state
 
+    def clear_forced_raw_diagnostic(self) -> None:
+        """Clear test-only lifecycle evidence after warmup or capture."""
+        state = self._state
+        if state is None or state.forced_raw_diagnostic is None:
+            raise RuntimeError("ByteV2 forced raw diagnostic state is unavailable")
+        state.forced_raw_diagnostic.zero_()
+
+    def arm_forced_raw_promotion(self) -> None:
+        """Arm the next valid fused Q1 update after graph capture."""
+        state = self._state
+        if state is None or state.forced_raw_diagnostic is None:
+            raise RuntimeError("ByteV2 forced raw diagnostic state is unavailable")
+        state.forced_raw_diagnostic[0].fill_(1)
+
     def reset(self, physical_block_ids: torch.Tensor | None = None) -> None:
         """Reset all state, or release selected physical block IDs.
 
@@ -608,6 +639,8 @@ class ByteV2RawFallbackStore:
         )
         state.free_count.fill_(state.free_slots.shape[0])
         state.fatal.zero_()
+        if state.forced_raw_diagnostic is not None:
+            state.forced_raw_diagnostic.zero_()
 
 
 @dataclass(frozen=True)
@@ -1147,9 +1180,29 @@ class ByteV2RawStagingManager:
                     ),
                     page_unsafe_flags=page_unsafe_flags,
                 )
-                return True, page_unsafe_flags is not None
             except NotImplementedError:
                 pass
+            else:
+                forced_raw_diagnostic = getattr(
+                    hybrid_state,
+                    "forced_raw_diagnostic",
+                    None,
+                )
+                if forced_raw_diagnostic is not None:
+                    # This diagnostic launch must remain immediately after
+                    # fused Q1 on the same stream: persist/release leaves the
+                    # current valid raw-page prefix in raw_staging[0].
+                    byte_v2_test_force_promote_raw_staging_q1(
+                        raw_staging,
+                        hybrid_state.raw_pages,
+                        slot_mapping,
+                        hybrid_state.page_to_raw_slot,
+                        hybrid_state.free_slots,
+                        hybrid_state.free_count,
+                        hybrid_state.fatal,
+                        forced_raw_diagnostic,
+                    )
+                return True, page_unsafe_flags is not None
 
         if (
             hybrid_state is None
@@ -1332,6 +1385,12 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             head_dim_v=head_size,
         )
         self.fa2_hybrid_raw_fallback = byte_v2_hybrid_raw_fallback_enabled()
+        self.test_forced_raw_promotion = byte_v2_test_forced_raw_promotion_enabled()
+        if self.test_forced_raw_promotion and not self.fa2_hybrid_raw_fallback:
+            raise RuntimeError(
+                "BYTE_V2_TEST_FORCE_RAW_PROMOTION=1 requires "
+                "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
+            )
         if self.fa2_hybrid_raw_fallback:
             unsupported = []
             if (self.num_heads, self.num_kv_heads, self.head_size) != (32, 8, 128):
@@ -1359,7 +1418,8 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 raw_layout=ByteV2RawStagingLayout(
                     tile_policy=self.tile_policy,
                     num_kv_heads=self.num_kv_heads,
-                )
+                ),
+                forced_raw_diagnostic=self.test_forced_raw_promotion,
             )
         self.raw_staging_manager = ByteV2RawStagingManager(
             tile_policy=self.tile_policy,
@@ -1382,6 +1442,15 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                     "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1 requested the "
                     "experimental compact/raw checkpoint, but the following "
                     f"ops are unavailable: {', '.join(missing)}"
+                )
+            if (
+                self.test_forced_raw_promotion
+                and not byte_v2_test_forced_raw_promotion_is_available()
+            ):
+                raise RuntimeError(
+                    "BYTE_V2_TEST_FORCE_RAW_PROMOTION=1 requested the "
+                    "test-only forced raw lifecycle hook, but its CUDA op is "
+                    "unavailable"
                 )
             self.decode_fa2_available = True
             logger.info_once("[ByteV2] experimental FA2 hybrid raw fallback is enabled")

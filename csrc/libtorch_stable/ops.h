@@ -622,6 +622,16 @@ void byte_v2_update_hybrid_cache_raw_staging_q1(
     const std::vector<int64_t>& tile_policy,
     std::optional<torch::stable::Tensor> page_unsafe_flags);
 
+void byte_v2_test_force_promote_raw_staging_q1(
+    torch::stable::Tensor& raw_staging,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    torch::stable::Tensor& diagnostic);
+
 void byte_v2_collect_cache_stats(torch::stable::Tensor& stats,
                                  torch::stable::Tensor& kv_cache,
                                  torch::stable::Tensor& block_tables,

@@ -122,6 +122,17 @@ def byte_v2_hybrid_cache_update_is_available() -> bool:
     )
 
 
+def byte_v2_test_forced_raw_promotion_is_available() -> bool:
+    """Return whether the test-only forced raw-promotion op is registered."""
+    return (
+        _find_op(
+            "_C_cache_ops",
+            "byte_v2_test_force_promote_raw_staging_q1",
+        )
+        is not None
+    )
+
+
 def missing_byte_v2_custom_ops() -> tuple[str, ...]:
     """Return the missing ByteV2 custom op qualified names."""
     return tuple(
@@ -516,6 +527,32 @@ def byte_v2_update_hybrid_cache_raw_staging_q1(
         raw_pool_overflow,
         list(tile_policy),
         page_unsafe_flags,
+    )
+
+
+def byte_v2_test_force_promote_raw_staging_q1(
+    raw_staging: torch.Tensor,
+    persistent_raw_staging: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    free_raw_slots: torch.Tensor,
+    free_raw_slot_count: torch.Tensor,
+    raw_pool_overflow: torch.Tensor,
+    diagnostic: torch.Tensor,
+) -> None:
+    """Force one diagnostic Q1 page into the persistent raw sidecar."""
+    _require_op(
+        "_C_cache_ops",
+        "byte_v2_test_force_promote_raw_staging_q1",
+    )(
+        raw_staging,
+        persistent_raw_staging,
+        slot_mapping,
+        page_to_raw_slot,
+        free_raw_slots,
+        free_raw_slot_count,
+        raw_pool_overflow,
+        diagnostic,
     )
 
 

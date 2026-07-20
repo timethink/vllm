@@ -36,6 +36,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     byte_v2_hybrid_raw_fallback_enabled,
     byte_v2_raw_staging_slots,
+    byte_v2_test_forced_raw_promotion_enabled,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -91,6 +92,7 @@ _BYTE_V2_RAW_FALLBACK_SLOTS_ENV = "BYTE_V2_FA2_RAW_FALLBACK_SLOTS"
 _BYTE_V2_RAW_PAGE_BYTES = 65_536
 _BYTE_V2_INT32_BYTES = 4
 _BYTE_V2_RAW_SIDECAR_FIXED_BYTES = 8
+_BYTE_V2_FORCED_RAW_DIAGNOSTIC_BYTES = 3 * _BYTE_V2_INT32_BYTES
 _BYTE_V2_RAW_STAGING_FIXED_BYTES = 8
 
 
@@ -133,6 +135,7 @@ def get_byte_v2_raw_fallback_sidecar_bytes(
 
     Per actual ByteV2 layer, the runtime allocates an int32 page-to-slot map,
     65,536-byte raw pages, an int32 free-slot stack, and two int32 counters.
+    The test-only forced lifecycle mode adds three diagnostic int32 values.
     This helper covers only persistent per-layer state. The total ByteV2
     planner separately adds one runner-owned cross-layer staging workspace.
     """
@@ -146,6 +149,8 @@ def get_byte_v2_raw_fallback_sidecar_bytes(
         + (_BYTE_V2_RAW_PAGE_BYTES + _BYTE_V2_INT32_BYTES) * raw_slots
         + _BYTE_V2_RAW_SIDECAR_FIXED_BYTES
     )
+    if byte_v2_test_forced_raw_promotion_enabled():
+        bytes_per_layer += _BYTE_V2_FORCED_RAW_DIAGNOSTIC_BYTES
     return num_byte_v2_layers * bytes_per_layer
 
 

@@ -39,6 +39,7 @@ _BYTE_V2_PROFILE_OP_NAMES = (
     "byte_v2_update_cache_single_token",
     "byte_v2_update_cache_raw_staging",
     "byte_v2_update_hybrid_cache_raw_staging_q1",
+    "byte_v2_test_force_promote_raw_staging_q1",
     "byte_v2_update_cache_unsafe_flags",
     "byte_v2_paged_decode_attention",
     "byte_v2_paged_decode_attention_split_k",
@@ -128,6 +129,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--diagnose-forced-raw-lifecycle",
+        action="store_true",
+        help=(
+            "After warmup, arm a test-only device latch before measured and "
+            "profile Q1 runs so each ByteV2 layer promotes one page to the "
+            "persistent raw sidecar. This adds a CUDA launch and raw-page "
+            "copy, disables prefix caching, and is never valid for TPS "
+            "conclusions."
+        ),
+    )
+    parser.add_argument(
         "--prompt-lookup-min",
         type=int,
         default=2,
@@ -158,6 +170,27 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.compile_size_specialization and args.enforce_eager:
         parser.error("--compile-size-specialization requires --no-enforce-eager")
+    if args.diagnose_forced_raw_lifecycle:
+        diagnostic_spec_tokens = (
+            [args.worker_spec_tokens] if args.worker else args.spec_tokens
+        )
+        if args.backend != "byte_v2":
+            parser.error("--diagnose-forced-raw-lifecycle requires --backend byte_v2")
+        if diagnostic_spec_tokens != [0]:
+            parser.error(
+                "--diagnose-forced-raw-lifecycle requires exactly --spec-tokens 0"
+            )
+        if args.batch_size != 1:
+            parser.error("--diagnose-forced-raw-lifecycle requires --batch-size 1")
+        if args.max_tokens < 3:
+            parser.error("--diagnose-forced-raw-lifecycle requires --max-tokens >= 3")
+        if args.diagnose_outlier_pool:
+            parser.error(
+                "--diagnose-forced-raw-lifecycle cannot be combined with "
+                "--diagnose-outlier-pool"
+            )
+        args.disable_prefix_caching = True
+        args.collect_hybrid_state = True
     return args
 
 
@@ -624,6 +657,72 @@ def _install_outlier_pool_diagnostic(
     return diagnostic
 
 
+def _iter_forced_raw_diagnostic_stores(llm):
+    """Yield each test-enabled raw sidecar store exactly once."""
+    engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(engine, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    static_forward_context = getattr(compilation_config, "static_forward_context", {})
+    seen = set()
+    for module in static_forward_context.values():
+        impl = getattr(module, "impl", None)
+        store = getattr(impl, "raw_fallback_store", None)
+        if store is None or id(store) in seen:
+            continue
+        state = getattr(store, "current_state", None)
+        diagnostic = getattr(state, "forced_raw_diagnostic", None)
+        if not getattr(store, "forced_raw_diagnostic", False) and diagnostic is None:
+            continue
+        seen.add(id(store))
+        yield store
+
+
+def _control_forced_raw_diagnostic(llm, *, arm: bool) -> dict[str, Any]:
+    """Clear or arm all device latches, then return synchronized evidence."""
+    stores = list(_iter_forced_raw_diagnostic_stores(llm))
+    if not stores:
+        raise RuntimeError("ByteV2 forced raw diagnostic stores are unavailable")
+    method_name = "arm_forced_raw_promotion" if arm else "clear_forced_raw_diagnostic"
+    for store in stores:
+        method = getattr(store, method_name, None)
+        if not callable(method):
+            raise RuntimeError(
+                f"ByteV2 raw fallback store cannot {method_name.replace('_', ' ')}"
+            )
+        method()
+    return _collect_hybrid_raw_fallback_state(llm)
+
+
+def _reset_forced_raw_pages_through_runner(llm) -> dict[str, Any]:
+    """Exercise the runner's reset-before-zero hook after a diagnostic request."""
+    import torch
+
+    mapped_block_ids = set()
+    for store in _iter_forced_raw_diagnostic_stores(llm):
+        state = getattr(store, "current_state", None)
+        if state is None:
+            raise RuntimeError("ByteV2 forced raw sidecar state is uninitialized")
+        mapped = state.page_to_raw_slot.ge(0).nonzero().reshape(-1)
+        mapped_block_ids.update(int(value) for value in mapped.cpu().tolist())
+    if not mapped_block_ids:
+        raise RuntimeError("ByteV2 forced raw diagnostic published no mapped pages")
+
+    engine = getattr(llm, "llm_engine", None)
+    executor = getattr(engine, "model_executor", None)
+    driver_worker = getattr(executor, "driver_worker", None)
+    model_runner = getattr(driver_worker, "model_runner", None)
+    reset = getattr(model_runner, "_zero_block_ids", None)
+    if not callable(reset):
+        raise RuntimeError("ByteV2 diagnostic cannot access the runner reset hook")
+    ordered_block_ids = sorted(mapped_block_ids)
+    reset(ordered_block_ids)
+    torch.accelerator.synchronize()
+    return {
+        "source": "runner_zero_block_ids_after_request",
+        "physical_block_ids": ordered_block_ids,
+    }
+
+
 def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
     """Collect ByteV2 raw-sidecar state without allocating or mutating it."""
     engine = getattr(llm, "llm_engine", None)
@@ -633,6 +732,8 @@ def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
 
     layers = []
     initialized = []
+    diagnostic_initialized = []
+    diagnostic_requested = False
     for layer_name, module in sorted(static_forward_context.items()):
         impl = getattr(module, "impl", None)
         if impl is None or not hasattr(impl, "raw_fallback_store"):
@@ -649,6 +750,29 @@ def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
             "fatal": None,
         }
         layers.append(layer)
+        diagnostic = getattr(state, "forced_raw_diagnostic", None)
+        diagnostic_enabled = bool(
+            store is not None
+            and (
+                getattr(store, "forced_raw_diagnostic", False) or diagnostic is not None
+            )
+        )
+        diagnostic_requested = diagnostic_requested or diagnostic_enabled
+        if diagnostic_enabled:
+            layer.update(
+                {
+                    "forced_raw_diagnostic_enabled": True,
+                    "forced_raw_latch": None,
+                    "promotion_count": None,
+                    "mapped_page_visit_count": None,
+                }
+            )
+        if diagnostic is not None:
+            if diagnostic.numel() != 3:
+                raise RuntimeError(
+                    "ByteV2 forced raw diagnostic tensor must have 3 elements"
+                )
+            diagnostic_initialized.append((layer, diagnostic))
         if state is not None:
             initialized.append((layer, state))
 
@@ -676,6 +800,27 @@ def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
             layer["slot_count"] = int(state.raw_pages.shape[0])
             layer["fatal"] = int(fatal)
 
+    if diagnostic_initialized:
+        import torch
+
+        diagnostic_rows = (
+            torch.stack(
+                [
+                    diagnostic.reshape(-1).to(dtype=torch.int64)
+                    for _, diagnostic in diagnostic_initialized
+                ]
+            )
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        for (layer, _), (latch, promotions, mapped_visits) in zip(
+            diagnostic_initialized, diagnostic_rows
+        ):
+            layer["forced_raw_latch"] = int(latch)
+            layer["promotion_count"] = int(promotions)
+            layer["mapped_page_visit_count"] = int(mapped_visits)
+
     enabled_layer_count = sum(layer["store_enabled"] for layer in layers)
     fully_initialized = (
         enabled_layer_count > 0 and len(initialized) == enabled_layer_count
@@ -688,7 +833,7 @@ def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
     else:
         raw_page_count = free_count = slot_count = fatal = None
 
-    return {
+    result = {
         "enabled": enabled_layer_count > 0,
         "layer_count": len(layers),
         "enabled_layer_count": enabled_layer_count,
@@ -699,6 +844,111 @@ def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
         "slot_count": slot_count,
         "fatal": fatal,
         "layers": layers,
+    }
+    if diagnostic_requested:
+        diagnostic_layers = [
+            layer
+            for layer in layers
+            if layer.get("forced_raw_diagnostic_enabled", False)
+        ]
+        diagnostic_fully_initialized = bool(diagnostic_layers) and len(
+            diagnostic_initialized
+        ) == len(diagnostic_layers)
+        if diagnostic_fully_initialized:
+            armed_layer_count = sum(
+                layer["forced_raw_latch"] == 1 for layer in diagnostic_layers
+            )
+            promotion_count = sum(
+                layer["promotion_count"] for layer in diagnostic_layers
+            )
+            mapped_page_visit_count = sum(
+                layer["mapped_page_visit_count"] for layer in diagnostic_layers
+            )
+        else:
+            armed_layer_count = promotion_count = mapped_page_visit_count = None
+        result["forced_raw_lifecycle"] = {
+            "enabled": True,
+            "enabled_layer_count": len(diagnostic_layers),
+            "initialized_layer_count": len(diagnostic_initialized),
+            "fully_initialized": diagnostic_fully_initialized,
+            "armed_layer_count": armed_layer_count,
+            "promotion_count": promotion_count,
+            "mapped_page_visit_count": mapped_page_visit_count,
+            "all_latches_clear": (
+                armed_layer_count == 0 if armed_layer_count is not None else None
+            ),
+            "request_reset_observed": (
+                fully_initialized
+                and raw_page_count == 0
+                and free_count == slot_count
+                and fatal == 0
+            ),
+        }
+    return result
+
+
+def _forced_raw_phase_result(
+    armed_state: dict[str, Any],
+    completed_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Build per-phase proof from arm and request-completion snapshots."""
+    armed_layers = {
+        layer["name"]: layer
+        for layer in armed_state["layers"]
+        if layer.get("forced_raw_diagnostic_enabled", False)
+    }
+    completed_layers = {
+        layer["name"]: layer
+        for layer in completed_state["layers"]
+        if layer.get("forced_raw_diagnostic_enabled", False)
+    }
+    if not armed_layers or armed_layers.keys() != completed_layers.keys():
+        raise RuntimeError("ByteV2 forced raw diagnostic layer set changed")
+
+    layer_results = []
+    for name, armed_layer in armed_layers.items():
+        completed_layer = completed_layers[name]
+        promotion_delta = (
+            completed_layer["promotion_count"] - armed_layer["promotion_count"]
+        )
+        mapped_visit_delta = (
+            completed_layer["mapped_page_visit_count"]
+            - armed_layer["mapped_page_visit_count"]
+        )
+        reset_observed = (
+            completed_layer["raw_page_count"] == 0
+            and completed_layer["free_count"] == completed_layer["slot_count"]
+            and completed_layer["fatal"] == 0
+        )
+        layer_results.append(
+            {
+                "name": name,
+                "armed": armed_layer["forced_raw_latch"] == 1,
+                "consumed": completed_layer["forced_raw_latch"] == 0,
+                "promotion_delta": promotion_delta,
+                "mapped_page_visit_delta": mapped_visit_delta,
+                "request_reset_observed": reset_observed,
+            }
+        )
+    verified = all(
+        layer["armed"]
+        and layer["consumed"]
+        and layer["promotion_delta"] == 1
+        and layer["mapped_page_visit_delta"] >= 1
+        and layer["request_reset_observed"]
+        for layer in layer_results
+    )
+    return {
+        "layer_count": len(layer_results),
+        "promotion_count": sum(layer["promotion_delta"] for layer in layer_results),
+        "mapped_page_visit_count": sum(
+            layer["mapped_page_visit_delta"] for layer in layer_results
+        ),
+        "request_reset_observed": all(
+            layer["request_reset_observed"] for layer in layer_results
+        ),
+        "verified": verified,
+        "layers": layer_results,
     }
 
 
@@ -1004,6 +1254,9 @@ def _run_generate_step_profile(
 def _run_worker(args: argparse.Namespace) -> None:
     if args.diagnose_outlier_pool:
         os.environ["BYTE_V2_NATIVE_RAW_STAGING_UPDATE"] = "0"
+    if args.diagnose_forced_raw_lifecycle:
+        os.environ["BYTE_V2_FA2_HYBRID_RAW_FALLBACK"] = "1"
+        os.environ["BYTE_V2_TEST_FORCE_RAW_PROMOTION"] = "1"
 
     import torch
 
@@ -1066,15 +1319,37 @@ def _run_worker(args: argparse.Namespace) -> None:
                     )
                     warmup_seconds += prompt_seconds
 
+            forced_raw_measured_armed = None
+            if args.diagnose_forced_raw_lifecycle:
+                _control_forced_raw_diagnostic(llm, arm=False)
+                forced_raw_measured_armed = _control_forced_raw_diagnostic(
+                    llm,
+                    arm=True,
+                )
             before = _metric_snapshot(llm)
             measured_seconds, token_ids = _run_generate(llm, prompts, sampling_params)
             measured_metrics = _metric_diff(before, _metric_snapshot(llm))
+            forced_raw_measured_reset = (
+                _reset_forced_raw_pages_through_runner(llm)
+                if args.diagnose_forced_raw_lifecycle
+                else None
+            )
+            forced_raw_measured_completed = (
+                _collect_hybrid_raw_fallback_state(llm)
+                if args.diagnose_forced_raw_lifecycle
+                else None
+            )
 
             profile_instrumentation_installed = False
             if not args.diagnose_outlier_pool:
                 collector.install(args.backend)
                 profile_instrumentation_installed = True
             try:
+                forced_raw_profile_armed = (
+                    _control_forced_raw_diagnostic(llm, arm=True)
+                    if args.diagnose_forced_raw_lifecycle
+                    else None
+                )
                 profile_metrics_before = _metric_snapshot(llm)
                 profile_seconds, profile_token_ids, step_profile = (
                     _run_generate_step_profile(
@@ -1093,6 +1368,47 @@ def _run_worker(args: argparse.Namespace) -> None:
                 profile_metrics_before,
                 _metric_snapshot(llm),
             )
+            forced_raw_profile_reset = (
+                _reset_forced_raw_pages_through_runner(llm)
+                if args.diagnose_forced_raw_lifecycle
+                else None
+            )
+            forced_raw_profile_completed = (
+                _collect_hybrid_raw_fallback_state(llm)
+                if args.diagnose_forced_raw_lifecycle
+                else None
+            )
+            forced_raw_lifecycle = None
+            if args.diagnose_forced_raw_lifecycle:
+                assert forced_raw_measured_armed is not None
+                assert forced_raw_measured_completed is not None
+                assert forced_raw_profile_armed is not None
+                assert forced_raw_profile_completed is not None
+                measured_proof = _forced_raw_phase_result(
+                    forced_raw_measured_armed,
+                    forced_raw_measured_completed,
+                )
+                profile_proof = _forced_raw_phase_result(
+                    forced_raw_profile_armed,
+                    forced_raw_profile_completed,
+                )
+                measured_proof["reset"] = forced_raw_measured_reset
+                profile_proof["reset"] = forced_raw_profile_reset
+                forced_raw_lifecycle = {
+                    "enabled": True,
+                    "mode": "test_force_next_valid_hybrid_q1_raw_page",
+                    "performance_valid_for_tps": False,
+                    "measured": measured_proof,
+                    "profile": profile_proof,
+                    "verified": (
+                        measured_proof["verified"] and profile_proof["verified"]
+                    ),
+                }
+                if not forced_raw_lifecycle["verified"]:
+                    raise RuntimeError(
+                        "ByteV2 forced raw lifecycle diagnostic did not "
+                        f"verify: {forced_raw_lifecycle}"
+                    )
             steady_tokens = profile_metrics.get("vllm:spec_decode_num_drafts", 0)
             steady_tokens += profile_metrics.get(
                 "vllm:spec_decode_num_accepted_tokens", 0
@@ -1116,6 +1432,7 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "max_tokens": args.max_tokens,
                 "enforce_eager": args.enforce_eager,
                 "compile_size_specialization": (args.compile_size_specialization),
+                "performance_valid_for_tps": (not args.diagnose_forced_raw_lifecycle),
                 "init_seconds": init_seconds,
                 "warmup_seconds": warmup_seconds,
                 "measured_seconds": measured_seconds,
@@ -1136,10 +1453,13 @@ def _run_worker(args: argparse.Namespace) -> None:
                 ),
                 "kv_cache_plan": _collect_kv_cache_plan(llm),
                 "hybrid_raw_fallback_state": (
-                    _collect_hybrid_raw_fallback_state(llm)
+                    forced_raw_profile_completed
+                    if args.diagnose_forced_raw_lifecycle
+                    else _collect_hybrid_raw_fallback_state(llm)
                     if args.collect_hybrid_state
                     else None
                 ),
+                "forced_raw_lifecycle_diagnostic": forced_raw_lifecycle,
             }
             print(RESULT_PREFIX + json.dumps(result, sort_keys=True), flush=True)
     finally:
@@ -1170,6 +1490,11 @@ def _run_child(
     env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     if backend == "byte_v2":
         env.setdefault("BYTE_V2_DECODE_RAW_FALLBACK", "0")
+        env["BYTE_V2_TEST_FORCE_RAW_PROMOTION"] = (
+            "1" if args.diagnose_forced_raw_lifecycle else "0"
+        )
+        if args.diagnose_forced_raw_lifecycle:
+            env["BYTE_V2_FA2_HYBRID_RAW_FALLBACK"] = "1"
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -1209,6 +1534,8 @@ def _run_child(
         cmd.append("--diagnose-outlier-pool")
     if args.collect_hybrid_state:
         cmd.append("--collect-hybrid-state")
+    if args.diagnose_forced_raw_lifecycle:
+        cmd.append("--diagnose-forced-raw-lifecycle")
     if not args.enforce_eager:
         cmd.append("--no-enforce-eager")
     if args.compile_size_specialization:
@@ -1237,7 +1564,8 @@ def _run_child(
             f"{label} context={result['context_len']} "
             f"time={result['measured_seconds']:.6f}s "
             f"tokens/s={result['output_tokens_per_second']:.3f} "
-            f"accept={result['spec_metrics']['acceptance_rate']}",
+            f"accept={result['spec_metrics']['acceptance_rate']} "
+            f"performance_valid={result['performance_valid_for_tps']}",
             flush=True,
         )
     return results
@@ -1246,7 +1574,7 @@ def _run_child(
 def _print_summary(results: list[dict[str, Any]]) -> None:
     print(
         "backend,spec_tokens,context_len,batch_size,seconds,tokens_per_second,"
-        "acceptance_rate,mean_acceptance_length,reference_match"
+        "performance_valid,acceptance_rate,mean_acceptance_length,reference_match"
     )
     references = {
         (row["backend"], row["context_len"], row["batch_size"]): row
@@ -1272,6 +1600,7 @@ def _print_summary(results: list[dict[str, Any]]) -> None:
             f"{row['backend']},{row['spec_tokens']},{row['context_len']},"
             f"{row['batch_size']},{row['measured_seconds']:.6f},"
             f"{row['output_tokens_per_second']:.3f},"
+            f"{row['performance_valid_for_tps']},"
             f"{metrics['acceptance_rate']},{metrics['mean_acceptance_length']},"
             f"{reference_match}"
         )

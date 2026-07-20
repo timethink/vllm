@@ -6930,6 +6930,123 @@ __global__ void byte_v2_persist_raw_fallback_pages_kernel(
   }
 }
 
+__global__ void byte_v2_test_force_promote_raw_staging_q1_kernel(
+    const uint8_t* __restrict__ raw_staging,
+    uint8_t* __restrict__ persistent_raw_staging, int64_t persistent_raw_slots,
+    int64_t persistent_raw_stride_slot,
+    const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ page_to_raw_slot,
+    const int32_t* __restrict__ free_raw_slots,
+    int32_t* __restrict__ free_raw_slot_count,
+    int32_t* __restrict__ raw_pool_overflow, int32_t* __restrict__ diagnostic,
+    int64_t num_physical_blocks) {
+  // diagnostic[0:3] is the device-resident one-shot latch, successful
+  // promotion count, and subsequent mapped-page visit count respectively.
+  // The kernel is intentionally a separate, test-only launch after fused Q1.
+  constexpr int32_t kNoop = 0;
+  constexpr int32_t kPromote = 1;
+  constexpr int32_t kFatal = 2;
+  __shared__ int32_t shared_action;
+  __shared__ int32_t shared_raw_slot;
+  __shared__ int64_t shared_physical_block;
+
+  if (threadIdx.x == 0) {
+    shared_action = kNoop;
+    shared_raw_slot = -1;
+    shared_physical_block = -1;
+    const int64_t mapped_slot = slot_mapping[0];
+    // Dummy graph padding must neither consume the latch nor touch allocator
+    // state. Any negative mapping follows the existing dummy-slot convention.
+    if (mapped_slot >= 0) {
+      const int64_t physical_block =
+          mapped_slot / ByteV2DefaultPolicy::AllocBlockTokens;
+      if (physical_block < 0 || physical_block >= num_physical_blocks ||
+          atomicAdd(raw_pool_overflow, 0) != 0) {
+        atomicExch(raw_pool_overflow, 1);
+        shared_action = kFatal;
+      } else {
+        shared_physical_block = physical_block;
+        const int32_t current_raw_slot = page_to_raw_slot[physical_block];
+        if (current_raw_slot < -1 || current_raw_slot >= persistent_raw_slots) {
+          atomicExch(raw_pool_overflow, 1);
+          shared_action = kFatal;
+        } else {
+          // Every valid Q1 consumes an armed latch exactly once. If fused Q1
+          // already used an authoritative raw page, record the visit without
+          // allocating or copying a second page.
+          const int32_t armed = atomicCAS(diagnostic, 1, 0);
+          if (current_raw_slot >= 0) {
+            atomicAdd(diagnostic + 2, 1);
+          } else if (armed == 1) {
+            int32_t observed = atomicAdd(free_raw_slot_count, 0);
+            while (true) {
+              if (observed <= 0 || observed > persistent_raw_slots) {
+                atomicExch(raw_pool_overflow, 1);
+                shared_action = kFatal;
+                break;
+              }
+              const int32_t prior =
+                  atomicCAS(free_raw_slot_count, observed, observed - 1);
+              if (prior == observed) {
+                const int32_t raw_slot = free_raw_slots[observed - 1];
+                if (raw_slot < 0 || raw_slot >= persistent_raw_slots) {
+                  atomicExch(raw_pool_overflow, 1);
+                  shared_action = kFatal;
+                } else {
+                  shared_raw_slot = raw_slot;
+                  shared_action = kPromote;
+                }
+                break;
+              }
+              observed = prior;
+            }
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  if (shared_action == kFatal) {
+    __trap();
+    return;
+  }
+  if (shared_action != kPromote) {
+    return;
+  }
+
+  const uint8_t* __restrict__ source = raw_staging;
+  uint8_t* __restrict__ destination =
+      persistent_raw_staging +
+      static_cast<int64_t>(shared_raw_slot) * persistent_raw_stride_slot;
+  // For a partial page, the prefix through the appended row is bitwise exact;
+  // unused tail rows are unspecified and remain masked by sequence length.
+  // Later Q1 appends hydrate only the valid prefix before overwriting the new
+  // target row, matching the normal raw-fallback persist contract.
+  static_assert(ByteV2DefaultRawStagingLayout::SlotSizeBytes % sizeof(uint4) ==
+                0);
+  constexpr int64_t kVectorsPerRawPage =
+      ByteV2DefaultRawStagingLayout::SlotSizeBytes / sizeof(uint4);
+  const auto* __restrict__ source_vectors =
+      reinterpret_cast<const uint4*>(source);
+  auto* __restrict__ destination_vectors =
+      reinterpret_cast<uint4*>(destination);
+  for (int64_t vector_idx = threadIdx.x; vector_idx < kVectorsPerRawPage;
+       vector_idx += blockDim.x) {
+    destination_vectors[vector_idx] = source_vectors[vector_idx];
+  }
+
+  // Each copy thread orders its own global stores. Only after every thread has
+  // fenced and reached the CTA barrier may thread 0 publish the authoritative
+  // raw mapping and the corresponding diagnostic evidence.
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicExch(page_to_raw_slot + shared_physical_block, shared_raw_slot);
+    atomicAdd(diagnostic + 1, 1);
+  }
+}
+
 __global__ void byte_v2_reset_raw_fallback_pages_kernel(
     int32_t* __restrict__ page_to_raw_slot,
     int32_t* __restrict__ free_raw_slots,
@@ -9681,6 +9798,102 @@ void byte_v2_update_hybrid_cache_raw_staging_q1(
       err == cudaSuccess,
       "byte_v2 fused hybrid Q1 persist/release kernel launch failed: ",
       cudaGetErrorString(err));
+}
+
+void byte_v2_test_force_promote_raw_staging_q1(
+    torch::stable::Tensor& raw_staging,
+    torch::stable::Tensor& persistent_raw_staging,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_raw_slots,
+    torch::stable::Tensor& free_raw_slot_count,
+    torch::stable::Tensor& raw_pool_overflow,
+    torch::stable::Tensor& diagnostic) {
+  using torch::headeronly::ScalarType;
+
+  STD_TORCH_CHECK(raw_staging.device().is_cuda(),
+                  "raw_staging must be a CUDA tensor");
+  const auto device = raw_staging.device();
+  STD_TORCH_CHECK(
+      persistent_raw_staging.device() == device &&
+          slot_mapping.device() == device &&
+          page_to_raw_slot.device() == device &&
+          free_raw_slots.device() == device &&
+          free_raw_slot_count.device() == device &&
+          raw_pool_overflow.device() == device && diagnostic.device() == device,
+      "ByteV2 test forced-raw promotion tensors must be on the same device");
+  STD_TORCH_CHECK(
+      raw_staging.scalar_type() == ScalarType::Byte &&
+          persistent_raw_staging.scalar_type() == ScalarType::Byte,
+      "ByteV2 test forced-raw promotion requires uint8 raw-page storage");
+  STD_TORCH_CHECK(slot_mapping.scalar_type() == ScalarType::Long,
+                  "slot_mapping must be int64");
+  STD_TORCH_CHECK(
+      page_to_raw_slot.scalar_type() == ScalarType::Int &&
+          free_raw_slots.scalar_type() == ScalarType::Int &&
+          free_raw_slot_count.scalar_type() == ScalarType::Int &&
+          raw_pool_overflow.scalar_type() == ScalarType::Int &&
+          diagnostic.scalar_type() == ScalarType::Int,
+      "ByteV2 test forced-raw maps, allocator, and diagnostic must be int32");
+  STD_TORCH_CHECK(
+      raw_staging.dim() == 2 && raw_staging.size(0) == 1 &&
+          raw_staging.size(1) >= ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          raw_staging.stride(0) >=
+              ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          raw_staging.stride(1) == 1,
+      "raw_staging must contain one contiguous ByteV2 raw page");
+  STD_TORCH_CHECK(
+      persistent_raw_staging.dim() == 2 && persistent_raw_staging.size(0) > 0 &&
+          persistent_raw_staging.size(1) >=
+              ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          persistent_raw_staging.stride(0) >=
+              ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+          persistent_raw_staging.stride(1) == 1,
+      "persistent_raw_staging must contain complete contiguous raw pages");
+  STD_TORCH_CHECK(slot_mapping.dim() == 1 && slot_mapping.size(0) == 1 &&
+                      slot_mapping.stride(0) == 1,
+                  "slot_mapping must contain one contiguous token");
+  STD_TORCH_CHECK(
+      page_to_raw_slot.dim() == 1 && page_to_raw_slot.size(0) > 0 &&
+          page_to_raw_slot.stride(0) == 1 && free_raw_slots.dim() == 1 &&
+          free_raw_slots.size(0) == persistent_raw_staging.size(0) &&
+          free_raw_slots.stride(0) == 1 && free_raw_slot_count.dim() == 1 &&
+          free_raw_slot_count.size(0) == 1 &&
+          free_raw_slot_count.stride(0) == 1 && raw_pool_overflow.dim() == 1 &&
+          raw_pool_overflow.size(0) == 1 && raw_pool_overflow.stride(0) == 1 &&
+          diagnostic.dim() == 1 && diagnostic.size(0) == 3 &&
+          diagnostic.stride(0) == 1,
+      "ByteV2 test forced-raw allocator or diagnostic shapes are invalid");
+  STD_TORCH_CHECK(
+      raw_staging.stride(0) % alignof(uint4) == 0 &&
+          persistent_raw_staging.stride(0) % alignof(uint4) == 0 &&
+          reinterpret_cast<uintptr_t>(raw_staging.const_data_ptr()) %
+                  alignof(uint4) ==
+              0 &&
+          reinterpret_cast<uintptr_t>(persistent_raw_staging.const_data_ptr()) %
+                  alignof(uint4) ==
+              0,
+      "transient and persistent raw pages must be 16-byte aligned");
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      raw_staging.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(raw_staging.get_device_index());
+  constexpr int kThreads = 256;
+  byte_v2_test_force_promote_raw_staging_q1_kernel<<<1, kThreads, 0, stream>>>(
+      reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
+      reinterpret_cast<uint8_t*>(persistent_raw_staging.mutable_data_ptr()),
+      persistent_raw_staging.size(0), persistent_raw_staging.stride(0),
+      slot_mapping.const_data_ptr<int64_t>(),
+      page_to_raw_slot.mutable_data_ptr<int32_t>(),
+      free_raw_slots.const_data_ptr<int32_t>(),
+      free_raw_slot_count.mutable_data_ptr<int32_t>(),
+      raw_pool_overflow.mutable_data_ptr<int32_t>(),
+      diagnostic.mutable_data_ptr<int32_t>(), page_to_raw_slot.size(0));
+  const cudaError_t err = cudaGetLastError();
+  STD_TORCH_CHECK(err == cudaSuccess,
+                  "byte_v2 test forced-raw promotion kernel launch failed: ",
+                  cudaGetErrorString(err));
 }
 
 void byte_v2_collect_cache_stats(torch::stable::Tensor& stats,

@@ -39,6 +39,14 @@ def byte_v2_hybrid_raw_fallback_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def byte_v2_test_forced_raw_promotion_enabled() -> bool:
+    """Return whether the test-only forced raw lifecycle hook is enabled."""
+    value = os.environ.get("BYTE_V2_TEST_FORCE_RAW_PROMOTION")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 def byte_v2_raw_staging_slots() -> int:
     """Return the strictly validated shared ByteV2 staging-slot count."""
     value = os.environ.get(_BYTE_V2_RAW_STAGING_SLOTS_ENV)
