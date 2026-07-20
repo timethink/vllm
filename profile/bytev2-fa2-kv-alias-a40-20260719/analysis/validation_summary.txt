@@ -1,0 +1,41 @@
+ByteV2 FA2 split-only K/V shared-memory alias validation
+
+Bitwise oracle matrix (all output mismatch=0, LSE mismatch=0, max_abs=0):
+- Q1: seq 64, 73 forced-outlier, 79 forced-outlier, and 4099
+- Q2/Q4: seq 67 forced-outlier
+- batch 3: [73, 73, 73] forced-outlier
+- ragged [73, 128, 4105], permuted physical pages, four shared-prefix
+  blocks, forced outliers, and explicit split 4
+
+Fail-closed probes (fresh subprocesses):
+- injected overflow marker: nonzero CUDA launch failure
+- injected fallback bit: nonzero CUDA launch failure
+- real page-wide outlier-pool exhaustion: nonzero CUDA launch failure
+
+Compute Sanitizer, GPU1:
+- memcheck: seq73 forced-outlier and seq4099, 0 errors
+- synccheck: seq73 forced-outlier and seq4099, 0 errors
+- racecheck: seq73 forced-outlier and seq4099, 0 hazards/errors/warnings
+
+Test suite:
+- .venv/bin/python -m pytest tests/v1/attention/test_byte_v2_layout.py -q
+- 194 passed, 1 skipped, 16 warnings in 200.25 seconds
+
+Serving-path witness with BYTE_V2_DECODE_KERNEL=fa2:
+- 64 split ByteV2 FA2 launches: 49,152 B dynamic shared, 240 registers
+- 32 nonsplit ByteV2 FA2 launches: 81,920 B dynamic shared, 245 registers
+- no legacy ByteV2 decode kernel was present
+
+Independent-engine E2E:
+- eager context128, 8 tokens: 32.151 ByteV2 tok/s, 34.233 raw tok/s,
+  paired ratio 0.93919; all 8 token IDs exact
+- compiled/CUDA graph context4096, 32 tokens, fresh paired order B-R/R-B/B-R:
+  - run 1: 21.7219 / 22.7921 tok/s, ratio 0.953047
+  - run 2: 21.7965 / 22.8098 tok/s, ratio 0.955579
+  - run 3: 21.7809 / 22.7561 tok/s, ratio 0.957142
+  - medians: 21.7809 ByteV2, 22.7921 raw, paired ratio 0.955579
+    (4.442% gap); all 32 token IDs exact in all runs
+
+The first two E2E files were collected without explicitly selecting the FA2
+decode mode and therefore measured the default legacy path. They are retained
+as legacy-control-e2e-*.jsonl and excluded from the candidate result.

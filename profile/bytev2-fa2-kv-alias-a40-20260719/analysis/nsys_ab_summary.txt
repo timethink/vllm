@@ -1,0 +1,35 @@
+ByteV2 FA2 split-only K/V shared-memory alias A/B
+
+Profiler: Nsight Systems, 20 interleaved ByteV2/raw calls per process
+GPU: NVIDIA A40
+Workload: BF16, Hq=32, Hkv=8, D=128, Q1
+
+seq=4099 (split=17)
+metric                         baseline mode-2   K/V alias       change
+ByteV2 main mean                 44.711 us       36.163 us       -19.12%
+ByteV2 main median               44.704 us       36.017 us       -19.43%
+raw main mean                    35.195 us       35.627 us        +1.23%
+paired ByteV2/raw mean ratio       1.270x          1.015x        -20.10%
+ByteV2 main+combine mean         53.448 us       44.432 us       -16.87%
+raw main+combine mean            44.270 us       44.709 us        +0.99%
+paired main+combine mean ratio     1.207x          0.994x        -17.68%
+ByteV2 dynamic shared memory      81,920 B        49,152 B       -40.00%
+ByteV2 registers/thread               244             240       -4
+ByteV2 local memory/thread              0 B             0 B      unchanged
+
+seq=64 (nonsplit control)
+metric                         baseline mode-2   K/V alias       change
+ByteV2 main mean                  9.267 us        9.283 us        +0.17%
+ByteV2 main median                9.216 us        9.216 us         0.00%
+raw main mean                     6.834 us        6.835 us        +0.01%
+ByteV2 dynamic shared memory      81,920 B        81,920 B        unchanged
+ByteV2 registers/thread               245             245        unchanged
+
+Every measured output and LSE comparison had zero bitwise mismatches.
+
+The reports named candidate-*.nsys-rep are a build-dependency diagnostic:
+the ByteV2 CUDA objects had recorded zero header dependencies and therefore
+still launched with the old 81,920-byte host configuration. They are excluded
+from the A/B above. The retained candidate is recorded by
+final-seq4099-q1.nsys-rep; kv-alias-*.nsys-rep is the equivalent pre-comment
+build and gives the same conclusion.

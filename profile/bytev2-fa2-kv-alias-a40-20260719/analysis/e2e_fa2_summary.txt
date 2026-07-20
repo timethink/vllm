@@ -1,0 +1,27 @@
+ByteV2 FA2 K/V-alias end-to-end summary
+
+Required environment:
+  BYTE_V2_DECODE_KERNEL=fa2
+  BYTE_V2_DECODE_RAW_FALLBACK=0
+
+Serving-path Nsys witness, context4096/max_tokens2:
+  split flash_fwd_splitkv_byte_v2_kernel: 64 calls, 49,152 B dynamic
+    shared memory, 240 registers/thread
+  nonsplit flash_fwd_splitkv_byte_v2_kernel: 32 calls, 81,920 B dynamic
+    shared memory, 245 registers/thread
+  legacy byte_v2_paged_decode_attention_split_k_kernel: 0 calls
+
+Compiled/CUDA-graph context4096, 32 output tokens, fresh engines:
+run  order  ByteV2 tok/s  raw tok/s  paired ratio  gap       token match
+  1  B-R       21.721930   22.792075      0.953047  -4.6953%  32/32 exact
+  2  R-B       21.796536   22.809762      0.955579  -4.4421%  32/32 exact
+  3  B-R       21.780853   22.756131      0.957142  -4.2858%  32/32 exact
+median         21.780853   22.792075      0.955579  -4.4421%  32/32 exact
+
+Eager context128, 8 output tokens:
+  ByteV2 32.151039 tok/s, raw 34.232764 tok/s, ratio 0.939189,
+  8/8 token IDs exact. This uses the unchanged nonsplit path.
+
+The files legacy-control-e2e-*.jsonl were collected before explicitly setting
+BYTE_V2_DECODE_KERNEL=fa2. They measure the default legacy path and are not
+candidate performance results.

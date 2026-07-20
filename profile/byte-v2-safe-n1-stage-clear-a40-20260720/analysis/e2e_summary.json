@@ -1,0 +1,79 @@
+{
+  "configuration": {
+    "batch_size": 1,
+    "context_length": 4096,
+    "max_tokens": 256,
+    "speculative_tokens": 0
+  },
+  "four_kernel_baseline": {
+    "runs": [
+      {
+        "byte_seconds": 7.361271717119962,
+        "byte_tokens_per_second": 34.77659972863465,
+        "paired_ratio": 0.9864291740620158,
+        "raw_seconds": 7.261373179964721,
+        "raw_tokens_per_second": 35.255039736333146
+      },
+      {
+        "byte_seconds": 7.396134110167623,
+        "byte_tokens_per_second": 34.61267686426499,
+        "paired_ratio": 0.9853813226415209,
+        "raw_seconds": 7.2880124119110405,
+        "raw_tokens_per_second": 35.12617508466516
+      },
+      {
+        "byte_seconds": 7.400750311790034,
+        "byte_tokens_per_second": 34.591087283700126,
+        "paired_ratio": 0.9843131330135553,
+        "raw_seconds": 7.284655726049095,
+        "raw_tokens_per_second": 35.14236082352846
+      }
+    ],
+    "median_byte_seconds": 7.396134110167623,
+    "median_byte_tokens_per_second": 34.61267686426499,
+    "median_paired_gap_percent": -1.46186773584791,
+    "median_paired_ratio": 0.9853813226415209
+  },
+  "two_kernel_candidate": {
+    "runs": [
+      {
+        "byte_seconds": 7.346305380109698,
+        "byte_tokens_per_second": 34.84744871798092,
+        "paired_ratio": 0.9879876910176192,
+        "raw_seconds": 7.258059290004894,
+        "raw_tokens_per_second": 35.27113650787322
+      },
+      {
+        "byte_seconds": 7.374872168991715,
+        "byte_tokens_per_second": 34.71246607858154,
+        "paired_ratio": 0.988053049726945,
+        "raw_seconds": 7.286764937918633,
+        "raw_tokens_per_second": 35.13218858863354
+      },
+      {
+        "byte_seconds": 7.38463884498924,
+        "byte_tokens_per_second": 34.66655653359484,
+        "paired_ratio": 0.9873615858694604,
+        "raw_seconds": 7.291308721061796,
+        "raw_tokens_per_second": 35.110294981820495
+      }
+    ],
+    "median_byte_seconds": 7.374872168991715,
+    "median_byte_tokens_per_second": 34.71246607858154,
+    "median_paired_gap_percent": -1.20123089823808,
+    "median_paired_ratio": 0.9879876910176192
+  },
+  "candidate_vs_baseline": {
+    "byte_seconds_delta": -0.02126194117590785,
+    "byte_wall_improvement_percent": 0.2874737107143366,
+    "byte_throughput_improvement_percent": 0.28830250462243967,
+    "paired_gap_improvement_percentage_points": 0.2606368145180449
+  },
+  "retention_gate_percent": 0.5,
+  "retained_as_default": false,
+  "tokens": {
+    "all_byte_raw_pairs_exact": true,
+    "output_tokens_per_run": 256,
+    "sequence_sha256": "1926b18b058324320c4bbdf574eb9cc3d7a71aba799ed6f4ca5f1d92d7d45c1c"
+  }
+}

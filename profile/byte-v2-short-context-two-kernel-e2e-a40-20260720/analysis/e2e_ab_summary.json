@@ -1,0 +1,493 @@
+{
+  "configuration": {
+    "batch_size": 1,
+    "compile_size_specialization": true,
+    "contexts": [
+      128,
+      512,
+      1024
+    ],
+    "declared_latin_square_order": {
+      "1": [
+        "four_kernel",
+        "two_kernel",
+        "raw"
+      ],
+      "2": [
+        "two_kernel",
+        "raw",
+        "four_kernel"
+      ],
+      "3": [
+        "raw",
+        "four_kernel",
+        "two_kernel"
+      ]
+    },
+    "enforce_eager": false,
+    "max_tokens": 256,
+    "modes": [
+      "four_kernel",
+      "two_kernel",
+      "raw"
+    ],
+    "rounds": [
+      1,
+      2,
+      3
+    ],
+    "spec_tokens": 0
+  },
+  "contexts": {
+    "1024": {
+      "all_rounds_non_regressing": false,
+      "median_passes_0_5_percent_retention_gate": false,
+      "rounds": [
+        {
+          "declared_mode_order": [
+            "four_kernel",
+            "two_kernel",
+            "raw"
+          ],
+          "four_kernel_seconds": 7.05089026899077,
+          "four_kernel_tokens_per_second": 36.30747185584021,
+          "four_over_raw_gap_percent": -1.9467636409895572,
+          "four_over_raw_ratio": 0.9805323635901044,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": -0.2642086379811004,
+          "raw_seconds": 6.913626100867987,
+          "raw_tokens_per_second": 37.02832584016366,
+          "round": 1,
+          "tokens_exact": true,
+          "two_kernel_seconds": 7.069940526038408,
+          "two_kernel_tokens_per_second": 36.20963982047071,
+          "two_over_four_gain_percent": -0.2694542758524876,
+          "two_over_four_ratio": 0.9973054572414751,
+          "two_over_raw_gap_percent": -2.2109722789706576,
+          "two_over_raw_ratio": 0.9778902772102934
+        },
+        {
+          "declared_mode_order": [
+            "two_kernel",
+            "raw",
+            "four_kernel"
+          ],
+          "four_kernel_seconds": 7.089998912997544,
+          "four_kernel_tokens_per_second": 36.107198765671896,
+          "four_over_raw_gap_percent": -2.3245564068355318,
+          "four_over_raw_ratio": 0.9767544359316447,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": 0.19232048286468295,
+          "raw_seconds": 6.92518788902089,
+          "raw_tokens_per_second": 36.966506050450896,
+          "round": 2,
+          "tokens_exact": true,
+          "two_kernel_seconds": 7.076066317036748,
+          "two_kernel_tokens_per_second": 36.178292928606325,
+          "two_over_four_gain_percent": 0.19689747575217798,
+          "two_over_four_ratio": 1.0019689747575218,
+          "two_over_raw_gap_percent": -2.132235923970849,
+          "two_over_raw_ratio": 0.9786776407602915
+        },
+        {
+          "declared_mode_order": [
+            "raw",
+            "four_kernel",
+            "two_kernel"
+          ],
+          "four_kernel_seconds": 7.07302088290453,
+          "four_kernel_tokens_per_second": 36.193870234251854,
+          "four_over_raw_gap_percent": -2.0363426246521765,
+          "four_over_raw_ratio": 0.9796365737534782,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": 0.07460684359648084,
+          "raw_seconds": 6.928989943815395,
+          "raw_tokens_per_second": 36.946221898979346,
+          "round": 3,
+          "tokens_exact": true,
+          "two_kernel_seconds": 7.067638333886862,
+          "two_kernel_tokens_per_second": 36.22143464423883,
+          "two_over_four_gain_percent": 0.07615767479016711,
+          "two_over_four_ratio": 1.0007615767479017,
+          "two_over_raw_gap_percent": -1.9617357810556957,
+          "two_over_raw_ratio": 0.980382642189443
+        }
+      ],
+      "rounds_at_or_above_retention_gate": 0,
+      "statistics": {
+        "four_kernel_seconds": {
+          "max": 7.089998912997544,
+          "median": 7.07302088290453,
+          "min": 7.05089026899077
+        },
+        "four_kernel_tokens_per_second": {
+          "max": 36.30747185584021,
+          "median": 36.193870234251854,
+          "min": 36.107198765671896
+        },
+        "four_over_raw_gap_percent": {
+          "max": -1.9467636409895572,
+          "median": -2.0363426246521765,
+          "min": -2.3245564068355318
+        },
+        "four_over_raw_ratio": {
+          "max": 0.9805323635901044,
+          "median": 0.9796365737534782,
+          "min": 0.9767544359316447
+        },
+        "raw_gap_closure_percentage_points": {
+          "max": 0.19232048286468295,
+          "median": 0.07460684359648084,
+          "min": -0.2642086379811004
+        },
+        "raw_seconds": {
+          "max": 6.928989943815395,
+          "median": 6.92518788902089,
+          "min": 6.913626100867987
+        },
+        "raw_tokens_per_second": {
+          "max": 37.02832584016366,
+          "median": 36.966506050450896,
+          "min": 36.946221898979346
+        },
+        "two_kernel_seconds": {
+          "max": 7.076066317036748,
+          "median": 7.069940526038408,
+          "min": 7.067638333886862
+        },
+        "two_kernel_tokens_per_second": {
+          "max": 36.22143464423883,
+          "median": 36.20963982047071,
+          "min": 36.178292928606325
+        },
+        "two_over_four_gain_percent": {
+          "max": 0.19689747575217798,
+          "median": 0.07615767479016711,
+          "min": -0.2694542758524876
+        },
+        "two_over_four_ratio": {
+          "max": 1.0019689747575218,
+          "median": 1.0007615767479017,
+          "min": 0.9973054572414751
+        },
+        "two_over_raw_gap_percent": {
+          "max": -1.9617357810556957,
+          "median": -2.132235923970849,
+          "min": -2.2109722789706576
+        },
+        "two_over_raw_ratio": {
+          "max": 0.980382642189443,
+          "median": 0.9786776407602915,
+          "min": 0.9778902772102934
+        }
+      },
+      "token_sha256": "8df12ab655390457ff63a217444ebeee4e1539d050765eb77587e5b5a68930e9"
+    },
+    "128": {
+      "all_rounds_non_regressing": false,
+      "median_passes_0_5_percent_retention_gate": false,
+      "rounds": [
+        {
+          "declared_mode_order": [
+            "four_kernel",
+            "two_kernel",
+            "raw"
+          ],
+          "four_kernel_seconds": 6.767968160100281,
+          "four_kernel_tokens_per_second": 37.825237049609115,
+          "four_over_raw_gap_percent": -0.564314330549831,
+          "four_over_raw_ratio": 0.9943568566945017,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": -1.0197964805434,
+          "raw_seconds": 6.729775545885786,
+          "raw_tokens_per_second": 38.03990166603763,
+          "round": 1,
+          "tokens_exact": true,
+          "two_kernel_seconds": 6.838098605163395,
+          "two_kernel_tokens_per_second": 37.43730747121669,
+          "two_over_four_gain_percent": -1.025583998016033,
+          "two_over_four_ratio": 0.9897441600198397,
+          "two_over_raw_gap_percent": -1.5841108110932312,
+          "two_over_raw_ratio": 0.9841588918890677
+        },
+        {
+          "declared_mode_order": [
+            "two_kernel",
+            "raw",
+            "four_kernel"
+          ],
+          "four_kernel_seconds": 6.845643003005534,
+          "four_kernel_tokens_per_second": 37.39604882808012,
+          "four_over_raw_gap_percent": -1.6516015798274775,
+          "four_over_raw_ratio": 0.9834839842017252,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": 0.3638358168650657,
+          "raw_seconds": 6.732580255018547,
+          "raw_tokens_per_second": 38.02405471649217,
+          "round": 2,
+          "tokens_exact": true,
+          "two_kernel_seconds": 6.820411175023764,
+          "two_kernel_tokens_per_second": 37.534393958163086,
+          "two_over_four_gain_percent": 0.36994584834075805,
+          "two_over_four_ratio": 1.0036994584834076,
+          "two_over_raw_gap_percent": -1.2877657629624117,
+          "two_over_raw_ratio": 0.9871223423703759
+        },
+        {
+          "declared_mode_order": [
+            "raw",
+            "four_kernel",
+            "two_kernel"
+          ],
+          "four_kernel_seconds": 6.7984434440732,
+          "four_kernel_tokens_per_second": 37.65567840726507,
+          "four_over_raw_gap_percent": -1.0778402706520196,
+          "four_over_raw_ratio": 0.9892215972934798,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": -0.5996764368418117,
+          "raw_seconds": 6.725167082855478,
+          "raw_tokens_per_second": 38.06596874784314,
+          "round": 3,
+          "tokens_exact": true,
+          "two_kernel_seconds": 6.839907676912844,
+          "two_kernel_tokens_per_second": 37.42740576222869,
+          "two_over_four_gain_percent": -0.6062104168393923,
+          "two_over_four_ratio": 0.9939378958316061,
+          "two_over_raw_gap_percent": -1.6775167074938313,
+          "two_over_raw_ratio": 0.9832248329250617
+        }
+      ],
+      "rounds_at_or_above_retention_gate": 0,
+      "statistics": {
+        "four_kernel_seconds": {
+          "max": 6.845643003005534,
+          "median": 6.7984434440732,
+          "min": 6.767968160100281
+        },
+        "four_kernel_tokens_per_second": {
+          "max": 37.825237049609115,
+          "median": 37.65567840726507,
+          "min": 37.39604882808012
+        },
+        "four_over_raw_gap_percent": {
+          "max": -0.564314330549831,
+          "median": -1.0778402706520196,
+          "min": -1.6516015798274775
+        },
+        "four_over_raw_ratio": {
+          "max": 0.9943568566945017,
+          "median": 0.9892215972934798,
+          "min": 0.9834839842017252
+        },
+        "raw_gap_closure_percentage_points": {
+          "max": 0.3638358168650657,
+          "median": -0.5996764368418117,
+          "min": -1.0197964805434
+        },
+        "raw_seconds": {
+          "max": 6.732580255018547,
+          "median": 6.729775545885786,
+          "min": 6.725167082855478
+        },
+        "raw_tokens_per_second": {
+          "max": 38.06596874784314,
+          "median": 38.03990166603763,
+          "min": 38.02405471649217
+        },
+        "two_kernel_seconds": {
+          "max": 6.839907676912844,
+          "median": 6.838098605163395,
+          "min": 6.820411175023764
+        },
+        "two_kernel_tokens_per_second": {
+          "max": 37.534393958163086,
+          "median": 37.43730747121669,
+          "min": 37.42740576222869
+        },
+        "two_over_four_gain_percent": {
+          "max": 0.36994584834075805,
+          "median": -0.6062104168393923,
+          "min": -1.025583998016033
+        },
+        "two_over_four_ratio": {
+          "max": 1.0036994584834076,
+          "median": 0.9939378958316061,
+          "min": 0.9897441600198397
+        },
+        "two_over_raw_gap_percent": {
+          "max": -1.2877657629624117,
+          "median": -1.5841108110932312,
+          "min": -1.6775167074938313
+        },
+        "two_over_raw_ratio": {
+          "max": 0.9871223423703759,
+          "median": 0.9841588918890677,
+          "min": 0.9832248329250617
+        }
+      },
+      "token_sha256": "b065e99e08886d010ec2396707129343eceb03775169c85f5bdd2359bce1edc1"
+    },
+    "512": {
+      "all_rounds_non_regressing": false,
+      "median_passes_0_5_percent_retention_gate": false,
+      "rounds": [
+        {
+          "declared_mode_order": [
+            "four_kernel",
+            "two_kernel",
+            "raw"
+          ],
+          "four_kernel_seconds": 6.862103410996497,
+          "four_kernel_tokens_per_second": 37.30634539691735,
+          "four_over_raw_gap_percent": -0.748336639823155,
+          "four_over_raw_ratio": 0.9925166336017684,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": -0.9321131299942942,
+          "raw_seconds": 6.810751776909456,
+          "raw_tokens_per_second": 37.58762738467709,
+          "round": 1,
+          "tokens_exact": true,
+          "two_kernel_seconds": 6.927159207873046,
+          "two_kernel_tokens_per_second": 36.955986186811444,
+          "two_over_four_gain_percent": -0.9391410666960143,
+          "two_over_four_ratio": 0.9906085893330399,
+          "two_over_raw_gap_percent": -1.6804497698174492,
+          "two_over_raw_ratio": 0.9831955023018255
+        },
+        {
+          "declared_mode_order": [
+            "two_kernel",
+            "raw",
+            "four_kernel"
+          ],
+          "four_kernel_seconds": 6.936638175044209,
+          "four_kernel_tokens_per_second": 36.905485559417755,
+          "four_over_raw_gap_percent": -1.7417607491628129,
+          "four_over_raw_ratio": 0.9825823925083719,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": 0.29053060759925975,
+          "raw_seconds": 6.815818533999845,
+          "raw_tokens_per_second": 37.55968541752931,
+          "round": 2,
+          "tokens_exact": true,
+          "two_kernel_seconds": 6.916188343893737,
+          "two_kernel_tokens_per_second": 37.014607941673674,
+          "two_over_four_gain_percent": 0.29568065722975767,
+          "two_over_four_ratio": 1.0029568065722976,
+          "two_over_raw_gap_percent": -1.4512301415635531,
+          "two_over_raw_ratio": 0.9854876985843645
+        },
+        {
+          "declared_mode_order": [
+            "raw",
+            "four_kernel",
+            "two_kernel"
+          ],
+          "four_kernel_seconds": 6.903188982047141,
+          "four_kernel_tokens_per_second": 37.084309971198735,
+          "four_over_raw_gap_percent": -1.3577563995071262,
+          "four_over_raw_ratio": 0.9864224360049287,
+          "profile_tokens_exact": true,
+          "raw_gap_closure_percentage_points": -0.31307821401586056,
+          "raw_seconds": 6.809460491873324,
+          "raw_tokens_per_second": 37.59475516533511,
+          "round": 3,
+          "tokens_exact": true,
+          "two_kernel_seconds": 6.925168605986983,
+          "two_kernel_tokens_per_second": 36.96660898316347,
+          "two_over_four_gain_percent": -0.31738756397700074,
+          "two_over_four_ratio": 0.99682612436023,
+          "two_over_raw_gap_percent": -1.6708346135229868,
+          "two_over_raw_ratio": 0.9832916538647701
+        }
+      ],
+      "rounds_at_or_above_retention_gate": 0,
+      "statistics": {
+        "four_kernel_seconds": {
+          "max": 6.936638175044209,
+          "median": 6.903188982047141,
+          "min": 6.862103410996497
+        },
+        "four_kernel_tokens_per_second": {
+          "max": 37.30634539691735,
+          "median": 37.084309971198735,
+          "min": 36.905485559417755
+        },
+        "four_over_raw_gap_percent": {
+          "max": -0.748336639823155,
+          "median": -1.3577563995071262,
+          "min": -1.7417607491628129
+        },
+        "four_over_raw_ratio": {
+          "max": 0.9925166336017684,
+          "median": 0.9864224360049287,
+          "min": 0.9825823925083719
+        },
+        "raw_gap_closure_percentage_points": {
+          "max": 0.29053060759925975,
+          "median": -0.31307821401586056,
+          "min": -0.9321131299942942
+        },
+        "raw_seconds": {
+          "max": 6.815818533999845,
+          "median": 6.810751776909456,
+          "min": 6.809460491873324
+        },
+        "raw_tokens_per_second": {
+          "max": 37.59475516533511,
+          "median": 37.58762738467709,
+          "min": 37.55968541752931
+        },
+        "two_kernel_seconds": {
+          "max": 6.927159207873046,
+          "median": 6.925168605986983,
+          "min": 6.916188343893737
+        },
+        "two_kernel_tokens_per_second": {
+          "max": 37.014607941673674,
+          "median": 36.96660898316347,
+          "min": 36.955986186811444
+        },
+        "two_over_four_gain_percent": {
+          "max": 0.29568065722975767,
+          "median": -0.31738756397700074,
+          "min": -0.9391410666960143
+        },
+        "two_over_four_ratio": {
+          "max": 1.0029568065722976,
+          "median": 0.99682612436023,
+          "min": 0.9906085893330399
+        },
+        "two_over_raw_gap_percent": {
+          "max": -1.4512301415635531,
+          "median": -1.6708346135229868,
+          "min": -1.6804497698174492
+        },
+        "two_over_raw_ratio": {
+          "max": 0.9854876985843645,
+          "median": 0.9832916538647701,
+          "min": 0.9831955023018255
+        }
+      },
+      "token_sha256": "9b10f04ca1bd79c633f3a6fc99f1ebb0b47fec5799926dc21421406859fbd70b"
+    }
+  },
+  "correctness": {
+    "all_measured_tokens_exact_across_modes_and_rounds": true,
+    "all_profile_replays_match_measured_tokens": true,
+    "output_tokens_per_run": 256,
+    "token_sha256_by_context": {
+      "1024": "8df12ab655390457ff63a217444ebeee4e1539d050765eb77587e5b5a68930e9",
+      "128": "b065e99e08886d010ec2396707129343eceb03775169c85f5bdd2359bce1edc1",
+      "512": "9b10f04ca1bd79c633f3a6fc99f1ebb0b47fec5799926dc21421406859fbd70b"
+    }
+  },
+  "retention": {
+    "all_contexts_pass_median_gate": false,
+    "all_rounds_non_regressing": false,
+    "primary_metric": "median per-round two_over_four_ratio per context",
+    "retained_as_default": false,
+    "threshold_percent": 0.49999999999998934,
+    "threshold_ratio": 1.005
+  }
+}

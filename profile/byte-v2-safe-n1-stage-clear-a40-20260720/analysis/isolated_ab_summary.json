@@ -1,0 +1,26 @@
+{
+  "commit_release_fusion": {
+    "comparison": "four kernels to three kernels",
+    "iterations_per_trial": 500,
+    "row": 8,
+    "trials": 21,
+    "baseline_event_us": 27.117567,
+    "candidate_event_us": 21.956608,
+    "event_improvement_percent": 19.0318,
+    "baseline_wall_us": 27.149990,
+    "candidate_wall_us": 21.986646,
+    "wall_improvement_percent": 19.0178
+  },
+  "stage_metadata_clear_fusion": {
+    "comparison": "three kernels to two kernels",
+    "iterations_per_trial": 500,
+    "row": 8,
+    "trials": 21,
+    "baseline_event_us": 22.394880,
+    "candidate_event_us": 19.474432,
+    "event_improvement_percent": 13.0407,
+    "baseline_wall_us": 22.425938,
+    "candidate_wall_us": 19.505242,
+    "wall_improvement_percent": 13.0237
+  }
+}

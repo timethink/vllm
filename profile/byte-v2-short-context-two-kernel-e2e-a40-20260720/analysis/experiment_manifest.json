@@ -1,0 +1,91 @@
+{
+  "date": "2026-07-20",
+  "device": {
+    "cuda_visible_devices": "0",
+    "driver_version": "590.48.01",
+    "name": "NVIDIA A40",
+    "sm": "86"
+  },
+  "software": {
+    "cuda_runtime": "13.0",
+    "harness": {
+      "path": "scripts/byte_v2_speculative_profile.py",
+      "sha256": "c84c6a059815ac390162eb22c892db2f761086a354858e4fdd889384f736cbbe"
+    },
+    "pytorch": "2.11.0+cu130",
+    "source_revision": "c08264a54c55aa893144b6387ec8670911230e33",
+    "stable_extension": {
+      "path": "vllm/_C_stable_libtorch.abi3.so",
+      "sha256": "d04c3cbc3f13b2bf4a73fffc22e1a596af849aa6c0751dbd1c042387e47dd38f"
+    },
+    "working_tree": "source revision plus pre-existing ByteV2 changes"
+  },
+  "workload": {
+    "batch_size": 1,
+    "compile_size_specialization": true,
+    "contexts": [
+      128,
+      512,
+      1024
+    ],
+    "dtype": "bfloat16",
+    "enforce_eager": false,
+    "gpu_memory_utilization": 0.8,
+    "max_model_len": 1288,
+    "model": "/mnt/sdb/yxz/ByteV2/Meta-Llama-3.1-8B-Instruct",
+    "output_tokens": 256,
+    "prefix_caching": false,
+    "prompt_source": "synthetic_repeat",
+    "sampling": "greedy",
+    "spec_tokens": 0
+  },
+  "common_byte_v2_environment": {
+    "BYTE_V2_DEBUG_WARMUP": "unset",
+    "BYTE_V2_DECODE_KERNEL": "fa2",
+    "BYTE_V2_DECODE_RAW_FALLBACK": "0",
+    "BYTE_V2_FUSED_COMMIT_METADATA_CLEAR": "1",
+    "BYTE_V2_FUSED_SINGLE_TOKEN_STAGING": "1",
+    "BYTE_V2_FUSED_STAGING_RELEASE_FLAGS": "1",
+    "BYTE_V2_NATIVE_RAW_STAGING_UPDATE": "1",
+    "BYTE_V2_NATIVE_SINGLE_TOKEN_UPDATE": "0",
+    "BYTE_V2_WARP_PARALLEL_COMMIT_HISTOGRAM": "1",
+    "VLLM_BYTE_V2_DEBUG_WARMUP": "unset",
+    "VLLM_ENABLE_V1_MULTIPROCESSING": "0"
+  },
+  "modes": {
+    "four_kernel": {
+      "backend": "byte_v2",
+      "BYTE_V2_FUSED_SINGLE_TOKEN_COMMIT_RELEASE": "0",
+      "BYTE_V2_FUSED_SINGLE_TOKEN_STAGE_METADATA_CLEAR": "0"
+    },
+    "raw": {
+      "backend": "flash_attn"
+    },
+    "two_kernel": {
+      "backend": "byte_v2",
+      "BYTE_V2_FUSED_SINGLE_TOKEN_COMMIT_RELEASE": "1",
+      "BYTE_V2_FUSED_SINGLE_TOKEN_STAGE_METADATA_CLEAR": "1"
+    }
+  },
+  "round_order": {
+    "1": [
+      "four_kernel",
+      "two_kernel",
+      "raw"
+    ],
+    "2": [
+      "two_kernel",
+      "raw",
+      "four_kernel"
+    ],
+    "3": [
+      "raw",
+      "four_kernel",
+      "two_kernel"
+    ]
+  },
+  "decision_rule": {
+    "metric": "median per-round two_kernel/four_kernel throughput ratio for each context",
+    "retention_threshold": 1.005
+  }
+}
