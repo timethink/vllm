@@ -2560,3 +2560,81 @@ Additional artifacts:
 - `profile/byte-v2-retained-prefill-a40-20260720/sharegpt_batch8_cooperative_writer_round2_{hybrid,raw}.jsonl`
 - `profile/byte-v2-retained-prefill-a40-20260720/sharegpt_batch8_cooperative_writer_round3.jsonl`
 - `profile/byte-v2-sharegpt-exactness-a40-20260720/batch8_cooperative_writer_{compiled,eager}_logprobs.jsonl`
+
+### Adaptive Small-Batch Cooperative Sharding
+
+The next experiment audited whether the serial prepare launch could be folded
+into the cooperative hydrate kernel. The direct design was rejected before
+implementation. Without a grid barrier or a generation counter, a late CTA
+cannot distinguish stale `valid_rows` state from completion state written by
+an earlier CTA. Letting each page publish independently also allows one page
+to mutate maps while another page is still validating the clean allocator
+state. Accepting that protocol would weaken the existing fail-closed
+guarantee. A conditionally safe design would need another manager-owned
+completion scalar and a global-last publisher, but the maximum E2E upside from
+removing prepare is less than about 0.5 percentage point. The production path
+therefore retains the separate prepare boundary.
+
+A lower-risk follow-up keeps the allocator, completion, commit, persist, and
+release protocols unchanged and only adapts the number of hydrate shards per
+page. The prior eight-CTA setting underfills the GPU for two to four active
+staging slots. The retained policy fills approximately one 64-CTA wave for
+`N <= 4`, where `N=min(num_tokens, staging_capacity)`:
+
+| Small-stage slots | CTAs per page |
+| ---: | ---: |
+| 2 | 32 |
+| 3 | 21 |
+| 4 | 16 |
+| 5--16 | 8 |
+
+The CUDA Graph A/B used complete compact pages, a raw FA2 oracle, and
+alternating execution order. A paired `N=2..16` sweep with identical slot/row
+inputs produced:
+
+| Batch/pages | Fixed 8 CTAs | 64-wave policy | Change |
+| ---: | ---: | ---: | ---: |
+| 2 | 16.384 us | 16.384 us | 0.0% |
+| 3 | 18.432 us | 17.408 us | -5.6% |
+| 4 | 19.456 us | 18.432 us | -5.3% |
+| 8 | 26.624 us | 26.624 us | 0.0% |
+
+Trying to keep 64 total CTAs by reducing the per-page shard count above batch
+eight regressed `N=9..16` by 3.6% to 17.1%. The final policy consequently
+retains eight shards for every `N >= 5`; in particular the established batch-8
+and batch-16 paths are unchanged. A separate representative ShareGPT-prefix
+run with 100 warmups and 500 samples improves batch 4 from 24.576 us to
+21.504 us (-12.5%), versus 13.312 us for raw. The unchanged batch-8 result is
+30.720 us versus 13.312 us for raw.
+
+New regression coverage compares generic and adaptive writers bitwise for two,
+three, and four distinct compact pages at the append-prefix row. Output, LSE,
+compact cache bytes, allocator state, and page flags match. An eager update
+followed by three CUDA Graph replays at `N=4` reports zero memcheck errors,
+zero racecheck hazards, and zero synccheck errors. This optimization targets
+small or shrinking dynamic batches and does not change the earlier batch-8
+E2E result by construction.
+
+A three-round batch-4 compiled E2E comparison used ShareGPT prompt lengths
+`[512, 768, 1024, 1279]`, 64 output tokens, speculative decoding disabled,
+prefix caching disabled, and alternating backend order:
+
+| Round | Hybrid tok/s | Raw tok/s | Hybrid/raw | Wall excess |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 93.0588 | 106.2078 | -12.3805% | +340.58 ms |
+| 2 | 102.1808 | 106.0990 | -3.6929% | +92.52 ms |
+| 3 | 102.1571 | 105.8642 | -3.5017% | +87.75 ms |
+
+Round 1 is a visible slow outlier, while rounds 2 and 3 are stable. Retaining
+all rounds, the paired median is -3.6929% and +92.52 ms. All four requests
+produce elementwise-identical token IDs across backends in every round, both
+backends are internally repeatable, and all profiler replays reproduce the
+measured tokens. Hybrid state remains `fatal=0`, with zero raw pages and
+`free_count=slot_count=1472` in every round.
+
+The stable memory plan remains 11,979 hybrid blocks versus 9,601 raw blocks,
+or 24.7683% more block capacity under the fixed budget. At equal 11,979-block
+capacity, the complete hybrid allocation is 4,985,575,100 bytes, or 19.8456%,
+smaller than raw BF16. This E2E result validates the current small-batch path
+against raw FA2; it does not isolate the adaptive-shard gain from the prior
+fixed-eight-CTA implementation.

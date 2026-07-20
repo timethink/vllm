@@ -15,6 +15,7 @@
 #include <cutlass/numeric_types.h>
 #include <cute/tensor.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -10498,9 +10499,22 @@ static void byte_v2_update_hybrid_cache_raw_staging_multi_token_impl(
   const cudaStream_t stream = get_current_cuda_stream(key.get_device_index());
   constexpr int kStageThreads = 256;
   constexpr int kTokensPerStageBlock = ByteV2DefaultPolicy::AllocBlockTokens;
-  constexpr int kSmallStageCtasPerPage = 8;
   if (key.size(0) <= kTokensPerStageBlock &&
       raw_staging.size(0) <= kTokensPerStageBlock) {
+    const int64_t small_stage_slots =
+        std::min(key.size(0), raw_staging.size(0));
+    // A few staging slots do not expose enough CTA-level parallelism with the
+    // eight-shard default. Fill roughly one 64-CTA wave only for N<=4; a
+    // paired N=2..16 sweep shows that reducing shards for larger batches is
+    // counterproductive, so those retain the established eight-CTA path.
+    constexpr int64_t kDefaultSmallStageCtasPerPage = 8;
+    constexpr int64_t kTargetSmallStageCtas = 64;
+    constexpr int64_t kMaxSmallStageCtasPerPage = 32;
+    const int32_t small_stage_ctas_per_page = static_cast<int32_t>(
+        small_stage_slots <= 4
+            ? std::min(kTargetSmallStageCtas / small_stage_slots,
+                       kMaxSmallStageCtasPerPage)
+            : kDefaultSmallStageCtasPerPage);
     byte_v2_prepare_small_multi_token_hybrid_staging_kernel<<<1, 1, 0,
                                                               stream>>>(
         slot_mapping.const_data_ptr<int64_t>(),
@@ -10512,11 +10526,9 @@ static void byte_v2_update_hybrid_cache_raw_staging_multi_token_impl(
         page_to_raw_slot.const_data_ptr<int32_t>(),
         raw_pool_overflow.mutable_data_ptr<int32_t>(), key.size(0),
         kv_cache.size(0), raw_staging.size(0), persistent_raw_staging.size(0),
-        kSmallStageCtasPerPage);
-    const dim3 stage_grid(
-        kSmallStageCtasPerPage,
-        static_cast<unsigned int>(std::min(key.size(0), raw_staging.size(0))),
-        1);
+        small_stage_ctas_per_page);
+    const dim3 stage_grid(static_cast<unsigned int>(small_stage_ctas_per_page),
+                          static_cast<unsigned int>(small_stage_slots), 1);
     byte_v2_hydrate_append_small_multi_token_hybrid_staging_kernel<<<
         stage_grid, kStageThreads, 0, stream>>>(
         reinterpret_cast<const uint16_t*>(key.const_data_ptr()),

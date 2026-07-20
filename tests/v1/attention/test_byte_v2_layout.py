@@ -5012,6 +5012,78 @@ def test_byte_v2_fused_hybrid_small_batch_matches_generic_bitwise(source):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_pages", [2, 3, 4])
+def test_byte_v2_fused_hybrid_multi_token_adaptive_ctas_are_bitwise(
+    num_pages,
+):
+    _require_byte_v2_fused_multi_token_hybrid_writer_reader_ops()
+    tensors, state, full_slots = _make_byte_v2_hybrid_writer_case(
+        seq_len=64,
+        force_outliers=True,
+        raw_pool_slots=4,
+    )
+    _byte_v2_hybrid_writer_update(
+        tensors,
+        state,
+        full_slots,
+        active_capacity=4,
+    )
+    torch.accelerator.synchronize()
+    assert bool((tensors["page_to_raw_slot"] == -1).all())
+
+    slot_mapping = (
+        torch.arange(num_pages, dtype=torch.int64, device=full_slots.device) * 16 + 15
+    )
+    for tensor_name in ("key", "value"):
+        flat = tensors[tensor_name].view(-1, 8, 128)
+        flat.index_copy_(
+            0,
+            slot_mapping,
+            -flat.index_select(0, slot_mapping),
+        )
+
+    reference_tensors, reference_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    candidate_tensors, candidate_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    reference_flags = torch.zeros(
+        (tensors["byte_cache"].size(0),),
+        dtype=torch.int32,
+        device=tensors["byte_cache"].device,
+    )
+    candidate_flags = torch.zeros_like(reference_flags)
+
+    _byte_v2_hybrid_writer_update(
+        reference_tensors,
+        reference_state,
+        slot_mapping,
+        active_capacity=num_pages,
+        page_unsafe_flags=reference_flags,
+    )
+    _byte_v2_fused_hybrid_writer_multi_token_update(
+        candidate_tensors,
+        candidate_state,
+        slot_mapping,
+        active_capacity=num_pages,
+        page_unsafe_flags=candidate_flags,
+    )
+    torch.accelerator.synchronize()
+
+    _assert_byte_v2_hybrid_writer_matches_raw(reference_tensors)
+    _assert_byte_v2_hybrid_writer_matches_raw(candidate_tensors)
+    _assert_byte_v2_hybrid_writers_are_canonically_equal(
+        reference_tensors,
+        reference_state,
+        candidate_tensors,
+        candidate_state,
+        reference_flags,
+        candidate_flags,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [16, 17])
 def test_byte_v2_fused_hybrid_multi_token_dispatch_boundary_is_bitwise(
     num_tokens,
