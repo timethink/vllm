@@ -5590,6 +5590,7 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
 
   __shared__ int shared_base;
   __shared__ int shared_fallback;
+  __shared__ int shared_high_counts[128];
 
   for (int64_t page_token_start = source_chunk_start;
        page_token_start < source_chunk_end; ++page_token_start) {
@@ -5619,43 +5620,65 @@ __global__ void byte_v2_reshape_and_cache_block_direct_kernel(
 
     uint8_t* __restrict__ page =
         kv_cache + physical_block * kv_cache_stride_block;
-    if (threadIdx.x == 0) {
-      int high_counts[128];
-      for (int i = 0; i < 128; ++i) {
-        high_counts[i] = 0;
-      }
-      const uint16_t* __restrict__ src = kv_side == 0 ? key : value;
-      const int64_t stride_dim =
-          kv_side == 0 ? key_stride_dim : value_stride_dim;
-      for (int source_offset = 0; source_offset < page_token_count;
-           ++source_offset) {
-        const int64_t token_idx = page_token_start + source_offset;
-        const int64_t row_src_base =
-            token_idx * (kv_side == 0 ? key_stride_token : value_stride_token) +
-            head_idx * (kv_side == 0 ? key_stride_head : value_stride_head);
-        for (int dim_offset = 0; dim_offset < kCodecDimBlock; ++dim_offset) {
-          const int dim = dim_tile * kCodecDimBlock + dim_offset;
-          const uint16_t bits = src[row_src_base + dim * stride_dim];
-          ++high_counts[byte_v2_high7(bits)];
-        }
-      }
+    shared_high_counts[threadIdx.x] = 0;
+    __syncthreads();
 
-      int best_base = 0;
-      int best_count = -1;
-      for (int base = 0; base <= 120; ++base) {
+    const uint16_t* __restrict__ src = kv_side == 0 ? key : value;
+    const int64_t stride_dim = kv_side == 0 ? key_stride_dim : value_stride_dim;
+    const int elem_count = page_token_count * kCodecDimBlock;
+    for (int elem_idx = threadIdx.x; elem_idx < elem_count;
+         elem_idx += blockDim.x) {
+      const int source_offset = elem_idx / kCodecDimBlock;
+      const int dim_offset = elem_idx % kCodecDimBlock;
+      const int64_t token_idx = page_token_start + source_offset;
+      const int64_t row_src_base =
+          token_idx * (kv_side == 0 ? key_stride_token : value_stride_token) +
+          head_idx * (kv_side == 0 ? key_stride_head : value_stride_head);
+      const int dim = dim_tile * kCodecDimBlock + dim_offset;
+      const uint16_t bits = src[row_src_base + dim * stride_dim];
+      atomicAdd(shared_high_counts + byte_v2_high7(bits), 1);
+    }
+    __syncthreads();
+
+    int parallel_best_base = 0;
+    int parallel_outlier_count = 0;
+    int parallel_fallback = 0;
+    if (threadIdx.x < 32) {
+      const int lane = threadIdx.x;
+      int lane_best_count = -1;
+      int lane_best_base = lane;
+      for (int base = lane; base <= 120; base += 32) {
         int window_count = 0;
+#pragma unroll
         for (int delta = 0; delta < 8; ++delta) {
-          window_count += high_counts[base + delta];
+          window_count += shared_high_counts[base + delta];
         }
-        if (window_count > best_count) {
-          best_count = window_count;
-          best_base = base;
+        if (window_count > lane_best_count) {
+          lane_best_count = window_count;
+          lane_best_base = base;
         }
       }
-      const int elem_count = page_token_count * kCodecDimBlock;
-      const int outlier_count = elem_count - best_count;
-      const int fallback =
-          outlier_count > ByteV2DefaultLayout::OutlierEntriesPerTileValue;
+      unsigned int best_score =
+          (static_cast<unsigned int>(lane_best_count) << 8) |
+          static_cast<unsigned int>(255 - lane_best_base);
+#pragma unroll
+      for (int offset = 16; offset > 0; offset /= 2) {
+        best_score =
+            max(best_score, __shfl_down_sync(0xffffffffu, best_score, offset));
+      }
+      if (lane == 0) {
+        const int best_count = static_cast<int>(best_score >> 8);
+        parallel_best_base = 255 - static_cast<int>(best_score & 0xffu);
+        parallel_outlier_count = elem_count - best_count;
+        parallel_fallback = parallel_outlier_count >
+                            ByteV2DefaultLayout::OutlierEntriesPerTileValue;
+      }
+    }
+
+    if (threadIdx.x == 0) {
+      const int best_base = parallel_best_base;
+      const int outlier_count = parallel_outlier_count;
+      const int fallback = parallel_fallback;
       const int has_overlay = outlier_count > 0 && !fallback;
       const int token_tile = 0;
       int outlier_pool_index = 0;
@@ -6079,6 +6102,138 @@ __global__ void byte_v2_hydrate_raw_staging_from_cache_kernel(
   }
 }
 
+template <bool FuseStageMetadataClear>
+__global__ void byte_v2_hydrate_append_single_token_raw_staging_kernel(
+    const uint16_t* __restrict__ key, const uint16_t* __restrict__ value,
+    uint8_t* __restrict__ raw_staging, uint8_t* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping,
+    int32_t* __restrict__ block_to_staging_slot,
+    int32_t* __restrict__ staging_to_physical_block,
+    int32_t* __restrict__ valid_rows, int32_t* __restrict__ next_staging_slot,
+    int32_t* __restrict__ overflow,
+    int32_t* __restrict__ fused_release_page_unsafe_flags,
+    int64_t key_stride_head, int64_t key_stride_dim, int64_t value_stride_head,
+    int64_t value_stride_dim, int64_t num_physical_blocks,
+    int64_t kv_cache_stride_block) {
+  constexpr int kBlockSize = ByteV2DefaultPolicy::AllocBlockTokens;
+  constexpr int kHeadDim = ByteV2DefaultPolicy::HeadDim;
+  constexpr int kHeadDimV = ByteV2DefaultPolicy::HeadDimV;
+  constexpr int kNumKvHeads = ByteV2DefaultLayout::NumKvHeadsValue;
+
+  const int64_t slot_idx = slot_mapping[0];
+  const int64_t physical_block = slot_idx < 0 ? -1 : slot_idx / kBlockSize;
+  const bool valid_block =
+      physical_block >= 0 && physical_block < num_physical_blocks;
+  const int target_row =
+      valid_block ? static_cast<int>(slot_idx % kBlockSize) : -1;
+
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (valid_block) {
+      block_to_staging_slot[physical_block] = 0;
+      staging_to_physical_block[0] = static_cast<int32_t>(physical_block);
+      valid_rows[0] = target_row + 1;
+      if constexpr (!FuseStageMetadataClear) {
+        next_staging_slot[0] = 1;
+      }
+      overflow[0] = 0;
+      if (fused_release_page_unsafe_flags != nullptr) {
+        fused_release_page_unsafe_flags[physical_block] = 0;
+      }
+    } else {
+      staging_to_physical_block[0] = -1;
+      valid_rows[0] = 0;
+      if constexpr (!FuseStageMetadataClear) {
+        next_staging_slot[0] = 0;
+      }
+      overflow[0] = fused_release_page_unsafe_flags != nullptr
+                        ? 0
+                        : (slot_idx < 0 ? 0 : 1);
+    }
+  }
+  if (valid_block) {
+    const uint8_t* __restrict__ page =
+        kv_cache + physical_block * kv_cache_stride_block;
+    constexpr int64_t kWorkItems = 2 * kNumKvHeads * kBlockSize * kHeadDim;
+    for (int64_t work_idx = blockIdx.x * blockDim.x + threadIdx.x;
+         work_idx < kWorkItems;
+         work_idx += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+      int64_t tmp = work_idx;
+      const int dim = tmp % kHeadDim;
+      tmp /= kHeadDim;
+      const int row = tmp % kBlockSize;
+      tmp /= kBlockSize;
+      const int head_idx = tmp % kNumKvHeads;
+      tmp /= kNumKvHeads;
+      const int kv_side = tmp & 1;
+
+      if (row > target_row || (kv_side != 0 && dim >= kHeadDimV)) {
+        continue;
+      }
+
+      uint16_t bits;
+      if (row == target_row) {
+        const uint16_t* __restrict__ src = kv_side == 0 ? key : value;
+        const int64_t stride_head =
+            kv_side == 0 ? key_stride_head : value_stride_head;
+        const int64_t stride_dim =
+            kv_side == 0 ? key_stride_dim : value_stride_dim;
+        bits = src[head_idx * stride_head + dim * stride_dim];
+      } else {
+        const float decoded =
+            kv_side == 0
+                ? byte_v2_load_payload_elem<ByteV2DefaultLayout, false>(
+                      page,
+                      ByteV2DefaultLayout::KPayloadBaseBytes +
+                          head_idx * ByteV2DefaultLayout::
+                                         AlignedKPayloadBytesPerKvHead,
+                      head_idx, row, dim)
+                : byte_v2_load_payload_elem<ByteV2DefaultLayout, true>(
+                      page,
+                      ByteV2DefaultLayout::VPayloadBaseBytes +
+                          head_idx * ByteV2DefaultLayout::
+                                         AlignedVPayloadBytesPerKvHead,
+                      head_idx, row, dim);
+        bits = byte_v2_float_to_bf16_bits(decoded);
+      }
+
+      const int64_t staging_offset =
+          kv_side == 0
+              ? ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim)
+              : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim);
+      byte_v2_store_u16_bytes(raw_staging, staging_offset, bits);
+    }
+  }
+
+  if constexpr (FuseStageMetadataClear) {
+    __shared__ int shared_is_last_stage_block;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const int completed_before = atomicAdd(next_staging_slot, 1);
+      if (completed_before < 0 ||
+          completed_before >= static_cast<int>(gridDim.x)) {
+        __trap();
+      }
+      shared_is_last_stage_block =
+          completed_before == static_cast<int>(gridDim.x) - 1;
+    }
+    __syncthreads();
+
+    if (shared_is_last_stage_block && valid_block) {
+      uint8_t* __restrict__ page =
+          kv_cache + physical_block * kv_cache_stride_block;
+      for (int metadata_byte = threadIdx.x;
+           metadata_byte < ByteV2DefaultLayout::AlignedMetadataBytes;
+           metadata_byte += blockDim.x) {
+        page[metadata_byte] = 0;
+      }
+    }
+    __syncthreads();
+    if (shared_is_last_stage_block && threadIdx.x == 0) {
+      next_staging_slot[0] = valid_block ? 1 : 0;
+    }
+  }
+}
+
 __global__ void byte_v2_release_raw_staging_kernel(
     int32_t* __restrict__ block_to_staging_slot,
     int32_t* __restrict__ staging_to_physical_block,
@@ -6132,13 +6287,41 @@ __global__ void byte_v2_release_raw_staging_and_update_flags_kernel(
   }
 }
 
+__device__ __forceinline__ void byte_v2_complete_single_token_commit(
+    int32_t physical_block, int32_t* __restrict__ block_to_staging_slot,
+    int32_t* __restrict__ staging_to_physical_block,
+    int32_t* __restrict__ valid_rows, int32_t* __restrict__ next_staging_slot,
+    int32_t* __restrict__ completion_counter, int64_t num_physical_blocks) {
+  const int commit_blocks = static_cast<int>(gridDim.x * gridDim.y * gridDim.z);
+
+  const int completed_before = atomicAdd(completion_counter, 1);
+  if (completed_before < 0 || completed_before >= commit_blocks) {
+    __trap();
+  }
+  if (completed_before != commit_blocks - 1) {
+    return;
+  }
+
+  if (physical_block >= 0 && physical_block < num_physical_blocks) {
+    atomicCAS(block_to_staging_slot + physical_block, 0, -1);
+  }
+  staging_to_physical_block[0] = -1;
+  valid_rows[0] = 0;
+  next_staging_slot[0] = 0;
+  completion_counter[0] = 0;
+}
+
 template <bool FuseMetadataClear, bool BypassSerialMetadata,
-          bool WarpParallelHistogram>
+          bool WarpParallelHistogram, bool FuseSingleTokenCommitRelease>
 __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
     const uint8_t* __restrict__ raw_staging, uint8_t* __restrict__ kv_cache,
-    const int32_t* __restrict__ staging_to_physical_block,
-    const int32_t* __restrict__ valid_rows, int64_t num_staging_slots,
-    int64_t raw_staging_stride_slot, int64_t kv_cache_stride_block) {
+    int32_t* __restrict__ staging_to_physical_block,
+    int32_t* __restrict__ valid_rows, int64_t num_staging_slots,
+    int64_t raw_staging_stride_slot, int64_t kv_cache_stride_block,
+    int32_t* __restrict__ block_to_staging_slot,
+    int32_t* __restrict__ next_staging_slot,
+    int32_t* __restrict__ completion_counter,
+    int32_t* __restrict__ page_unsafe_flags, int64_t num_physical_blocks) {
   constexpr int kCodecDimBlock = ByteV2DefaultPolicy::CodecDimBlock;
   constexpr int kCodecTileElems = ByteV2DefaultPolicy::CodecTileElems;
   constexpr int kPairsPerRow = kCodecDimBlock / 2;
@@ -6156,10 +6339,37 @@ __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
   }
   const int32_t physical_block = staging_to_physical_block[staging_slot];
   if (physical_block < 0) {
+    if constexpr (FuseSingleTokenCommitRelease) {
+      if (threadIdx.x == 0) {
+        byte_v2_complete_single_token_commit(
+            physical_block, block_to_staging_slot, staging_to_physical_block,
+            valid_rows, next_staging_slot, completion_counter,
+            num_physical_blocks);
+      }
+    }
     return;
+  }
+  if constexpr (FuseSingleTokenCommitRelease) {
+    if (physical_block >= num_physical_blocks) {
+      if (threadIdx.x == 0) {
+        byte_v2_complete_single_token_commit(
+            physical_block, block_to_staging_slot, staging_to_physical_block,
+            valid_rows, next_staging_slot, completion_counter,
+            num_physical_blocks);
+      }
+      return;
+    }
   }
   int rows = valid_rows[staging_slot];
   if (rows <= 0) {
+    if constexpr (FuseSingleTokenCommitRelease) {
+      if (threadIdx.x == 0) {
+        byte_v2_complete_single_token_commit(
+            physical_block, block_to_staging_slot, staging_to_physical_block,
+            valid_rows, next_staging_slot, completion_counter,
+            num_physical_blocks);
+      }
+    }
     return;
   }
   if (rows > kBlockSize) {
@@ -6387,73 +6597,93 @@ __global__ void byte_v2_commit_raw_staging_to_cache_kernel(
         }
       }
     }
+    if constexpr (FuseSingleTokenCommitRelease) {
+      if (fallback || has_overlay) {
+        const int side_flag =
+            kv_side == 0 ? kByteV2PageUnsafeK : kByteV2PageUnsafeV;
+        atomicOr(page_unsafe_flags + physical_block,
+                 kByteV2PageUnsafeAny | side_flag);
+      }
+    }
     shared_base = best_base;
     shared_fallback = fallback;
   }
   __syncthreads();
 
   const int pair_idx = threadIdx.x;
-  if (pair_idx >= kPairsPerCodecTile) {
-    return;
-  }
   const int row = pair_idx / kPairsPerRow;
-  if (row >= rows) {
-    return;
+  const bool active_pair = pair_idx < kPairsPerCodecTile && row < rows;
+  if constexpr (!FuseSingleTokenCommitRelease) {
+    if (!active_pair) {
+      return;
+    }
   }
 
-  const int pair_in_dim_tile = pair_idx % kPairsPerRow;
-  const int dim0 = dim_tile * kCodecDimBlock + pair_in_dim_tile * 2;
-  const int dim1 = dim0 + 1;
-  const uint8_t* __restrict__ staging =
-      raw_staging + staging_slot * raw_staging_stride_slot;
-  const int64_t offset0 =
-      kv_side == 0
-          ? ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim0)
-          : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim0);
-  const int64_t offset1 =
-      kv_side == 0
-          ? ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim1)
-          : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim1);
-  const uint16_t bits0 = byte_v2_load_u16_bytes(staging, offset0);
-  const uint16_t bits1 = byte_v2_load_u16_bytes(staging, offset1);
+  if (active_pair) {
+    const int pair_in_dim_tile = pair_idx % kPairsPerRow;
+    const int dim0 = dim_tile * kCodecDimBlock + pair_in_dim_tile * 2;
+    const int dim1 = dim0 + 1;
+    const uint8_t* __restrict__ staging =
+        raw_staging + staging_slot * raw_staging_stride_slot;
+    const int64_t offset0 =
+        kv_side == 0
+            ? ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim0)
+            : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim0);
+    const int64_t offset1 =
+        kv_side == 0
+            ? ByteV2DefaultRawStagingLayout::key_offset(head_idx, row, dim1)
+            : ByteV2DefaultRawStagingLayout::value_offset(head_idx, row, dim1);
+    const uint16_t bits0 = byte_v2_load_u16_bytes(staging, offset0);
+    const uint16_t bits1 = byte_v2_load_u16_bytes(staging, offset1);
 
-  int64_t tile_offset;
-  if (kv_side == 0) {
-    tile_offset =
-        ByteV2DefaultLayout::KPayloadBaseBytes +
-        head_idx * ByteV2DefaultLayout::AlignedKPayloadBytesPerKvHead +
-        dim_tile * ByteV2DefaultPolicy::CodecTokenTilesPerAllocBlock *
-            kPayloadBytesPerTile;
-  } else {
-    tile_offset =
-        ByteV2DefaultLayout::VPayloadBaseBytes +
-        head_idx * ByteV2DefaultLayout::AlignedVPayloadBytesPerKvHead +
-        dim_tile * kPayloadBytesPerTile;
+    int64_t tile_offset;
+    if (kv_side == 0) {
+      tile_offset =
+          ByteV2DefaultLayout::KPayloadBaseBytes +
+          head_idx * ByteV2DefaultLayout::AlignedKPayloadBytesPerKvHead +
+          dim_tile * ByteV2DefaultPolicy::CodecTokenTilesPerAllocBlock *
+              kPayloadBytesPerTile;
+    } else {
+      tile_offset =
+          ByteV2DefaultLayout::VPayloadBaseBytes +
+          head_idx * ByteV2DefaultLayout::AlignedVPayloadBytesPerKvHead +
+          dim_tile * kPayloadBytesPerTile;
+    }
+
+    const int elem_base = row * kCodecDimBlock + pair_in_dim_tile * 2;
+    page[tile_offset + elem_base] = static_cast<uint8_t>(bits0 & 0xff);
+    page[tile_offset + elem_base + 1] = static_cast<uint8_t>(bits1 & 0xff);
+    const uint8_t code0 = shared_fallback
+                              ? byte_v2_code_nibble(bits0)
+                              : byte_v2_delta_code_nibble(bits0, shared_base);
+    const uint8_t code1 = shared_fallback
+                              ? byte_v2_code_nibble(bits1)
+                              : byte_v2_delta_code_nibble(bits1, shared_base);
+    page[tile_offset + kCodeBase + elem_base / 2] =
+        (code0 & 0x0f) | static_cast<uint8_t>((code1 & 0x0f) << 4);
+
+    if constexpr (ByteV2DefaultLayout::IncludeRawPayloadValue) {
+      const int64_t raw_offset0 =
+          kv_side == 0
+              ? ByteV2DefaultLayout::raw_key_offset(head_idx, row, dim0)
+              : ByteV2DefaultLayout::raw_value_offset(head_idx, row, dim0);
+      const int64_t raw_offset1 =
+          kv_side == 0
+              ? ByteV2DefaultLayout::raw_key_offset(head_idx, row, dim1)
+              : ByteV2DefaultLayout::raw_value_offset(head_idx, row, dim1);
+      byte_v2_store_u16_bytes(page, raw_offset0, bits0);
+      byte_v2_store_u16_bytes(page, raw_offset1, bits1);
+    }
   }
 
-  const int elem_base = row * kCodecDimBlock + pair_in_dim_tile * 2;
-  page[tile_offset + elem_base] = static_cast<uint8_t>(bits0 & 0xff);
-  page[tile_offset + elem_base + 1] = static_cast<uint8_t>(bits1 & 0xff);
-  const uint8_t code0 = shared_fallback
-                            ? byte_v2_code_nibble(bits0)
-                            : byte_v2_delta_code_nibble(bits0, shared_base);
-  const uint8_t code1 = shared_fallback
-                            ? byte_v2_code_nibble(bits1)
-                            : byte_v2_delta_code_nibble(bits1, shared_base);
-  page[tile_offset + kCodeBase + elem_base / 2] =
-      (code0 & 0x0f) | static_cast<uint8_t>((code1 & 0x0f) << 4);
-
-  if constexpr (ByteV2DefaultLayout::IncludeRawPayloadValue) {
-    const int64_t raw_offset0 =
-        kv_side == 0
-            ? ByteV2DefaultLayout::raw_key_offset(head_idx, row, dim0)
-            : ByteV2DefaultLayout::raw_value_offset(head_idx, row, dim0);
-    const int64_t raw_offset1 =
-        kv_side == 0
-            ? ByteV2DefaultLayout::raw_key_offset(head_idx, row, dim1)
-            : ByteV2DefaultLayout::raw_value_offset(head_idx, row, dim1);
-    byte_v2_store_u16_bytes(page, raw_offset0, bits0);
-    byte_v2_store_u16_bytes(page, raw_offset1, bits1);
+  if constexpr (FuseSingleTokenCommitRelease) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      byte_v2_complete_single_token_commit(
+          physical_block, block_to_staging_slot, staging_to_physical_block,
+          valid_rows, next_staging_slot, completion_counter,
+          num_physical_blocks);
+    }
   }
 }
 
@@ -8397,30 +8627,33 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
   }
   if (fuse_metadata_clear) {
     if (bypass_serial_metadata) {
-      byte_v2_commit_raw_staging_to_cache_kernel<true, true, false>
+      byte_v2_commit_raw_staging_to_cache_kernel<true, true, false, false>
           <<<grid, kThreads, 0, stream>>>(
               reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
               reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
-              staging_to_physical_block.const_data_ptr<int32_t>(),
-              valid_rows.const_data_ptr<int32_t>(), num_staging_slots,
-              raw_staging.stride(0), kv_cache.stride(0));
+              staging_to_physical_block.mutable_data_ptr<int32_t>(),
+              valid_rows.mutable_data_ptr<int32_t>(), num_staging_slots,
+              raw_staging.stride(0), kv_cache.stride(0), nullptr, nullptr,
+              nullptr, nullptr, 0);
     } else if (warp_parallel_histogram) {
       constexpr int kHistogramBytes = 128 * sizeof(int);
-      byte_v2_commit_raw_staging_to_cache_kernel<true, false, true>
+      byte_v2_commit_raw_staging_to_cache_kernel<true, false, true, false>
           <<<grid, kThreads, kHistogramBytes, stream>>>(
               reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
               reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
-              staging_to_physical_block.const_data_ptr<int32_t>(),
-              valid_rows.const_data_ptr<int32_t>(), num_staging_slots,
-              raw_staging.stride(0), kv_cache.stride(0));
+              staging_to_physical_block.mutable_data_ptr<int32_t>(),
+              valid_rows.mutable_data_ptr<int32_t>(), num_staging_slots,
+              raw_staging.stride(0), kv_cache.stride(0), nullptr, nullptr,
+              nullptr, nullptr, 0);
     } else {
-      byte_v2_commit_raw_staging_to_cache_kernel<true, false, false>
+      byte_v2_commit_raw_staging_to_cache_kernel<true, false, false, false>
           <<<grid, kThreads, 0, stream>>>(
               reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
               reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
-              staging_to_physical_block.const_data_ptr<int32_t>(),
-              valid_rows.const_data_ptr<int32_t>(), num_staging_slots,
-              raw_staging.stride(0), kv_cache.stride(0));
+              staging_to_physical_block.mutable_data_ptr<int32_t>(),
+              valid_rows.mutable_data_ptr<int32_t>(), num_staging_slots,
+              raw_staging.stride(0), kv_cache.stride(0), nullptr, nullptr,
+              nullptr, nullptr, 0);
     }
   } else {
     constexpr int kClearThreads = 256;
@@ -8433,18 +8666,66 @@ static void byte_v2_commit_raw_staging_to_cache_impl(
         reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
         staging_to_physical_block.const_data_ptr<int32_t>(), num_staging_slots,
         kv_cache.stride(0));
-    byte_v2_commit_raw_staging_to_cache_kernel<false, false, false>
+    byte_v2_commit_raw_staging_to_cache_kernel<false, false, false, false>
         <<<grid, kThreads, 0, stream>>>(
             reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
             reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
-            staging_to_physical_block.const_data_ptr<int32_t>(),
-            valid_rows.const_data_ptr<int32_t>(), num_staging_slots,
-            raw_staging.stride(0), kv_cache.stride(0));
+            staging_to_physical_block.mutable_data_ptr<int32_t>(),
+            valid_rows.mutable_data_ptr<int32_t>(), num_staging_slots,
+            raw_staging.stride(0), kv_cache.stride(0), nullptr, nullptr,
+            nullptr, nullptr, 0);
   }
   const cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess,
                   "byte_v2_commit_raw_staging_to_cache kernel launch failed: ",
                   cudaGetErrorString(err));
+}
+
+static void byte_v2_commit_single_token_raw_staging_and_release_impl(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& block_to_staging_slot,
+    torch::stable::Tensor& staging_to_physical_block,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
+    torch::stable::Tensor& completion_counter,
+    torch::stable::Tensor& page_unsafe_flags, bool metadata_already_cleared) {
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      raw_staging.get_device_index());
+  const cudaStream_t stream =
+      get_current_cuda_stream(raw_staging.get_device_index());
+
+  constexpr int kClearThreads = 256;
+  constexpr int kClearBlocks =
+      (ByteV2DefaultLayout::AlignedMetadataBytes + kClearThreads - 1) /
+      kClearThreads;
+  if (!metadata_already_cleared) {
+    byte_v2_clear_page_metadata_from_staging_kernel<<<
+        kClearBlocks, kClearThreads, 0, stream>>>(
+        reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+        staging_to_physical_block.const_data_ptr<int32_t>(), 1,
+        kv_cache.stride(0));
+  }
+
+  constexpr int kThreads = ByteV2DefaultPolicy::CodecPackedElems;
+  constexpr int kHistogramBytes = 128 * sizeof(int);
+  const dim3 grid(
+      1,
+      2 * ByteV2DefaultLayout::NumKvHeadsValue * ByteV2DefaultPolicy::KDimTiles,
+      1);
+  byte_v2_commit_raw_staging_to_cache_kernel<true, false, true, true>
+      <<<grid, kThreads, kHistogramBytes, stream>>>(
+          reinterpret_cast<const uint8_t*>(raw_staging.const_data_ptr()),
+          reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+          staging_to_physical_block.mutable_data_ptr<int32_t>(),
+          valid_rows.mutable_data_ptr<int32_t>(), 1, raw_staging.stride(0),
+          kv_cache.stride(0), block_to_staging_slot.mutable_data_ptr<int32_t>(),
+          next_staging_slot.mutable_data_ptr<int32_t>(),
+          completion_counter.mutable_data_ptr<int32_t>(),
+          page_unsafe_flags.mutable_data_ptr<int32_t>(), kv_cache.size(0));
+  const cudaError_t err = cudaGetLastError();
+  STD_TORCH_CHECK(
+      err == cudaSuccess,
+      "byte_v2 fused single-token commit/release kernel launch failed: ",
+      cudaGetErrorString(err));
 }
 
 void byte_v2_commit_raw_staging_to_cache(
@@ -8467,7 +8748,11 @@ void byte_v2_update_cache_raw_staging(
     torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
     torch::stable::Tensor& overflow, torch::stable::Tensor& page_unsafe_flags,
     const std::vector<int64_t>& tile_policy, bool fuse_metadata_clear,
-    bool bypass_serial_metadata, bool warp_parallel_histogram) {
+    bool bypass_serial_metadata, bool warp_parallel_histogram,
+    bool fuse_single_token_staging, bool fuse_single_token_commit_release,
+    bool fuse_single_token_stage_metadata_clear) {
+  using torch::headeronly::ScalarType;
+
   check_byte_v2_tile_policy(tile_policy);
   STD_TORCH_CHECK(page_unsafe_flags.dim() == 1,
                   "page_unsafe_flags must be a 1D tensor");
@@ -8477,6 +8762,167 @@ void byte_v2_update_cache_raw_staging(
   const int64_t codec_token_block = tile_policy[0];
   const int64_t codec_dim_block = tile_policy[1];
   const int64_t alloc_block_tokens = tile_policy[2];
+  if (fuse_single_token_staging && slot_mapping.dim() == 1 &&
+      slot_mapping.size(0) == 1) {
+    STD_TORCH_CHECK(
+        tile_policy[0] == ByteV2DefaultPolicy::CodecTokenBlock &&
+            tile_policy[1] == ByteV2DefaultPolicy::CodecDimBlock &&
+            tile_policy[2] == ByteV2DefaultPolicy::AllocBlockTokens &&
+            tile_policy[4] == ByteV2DefaultPolicy::HeadDim &&
+            tile_policy[5] == ByteV2DefaultPolicy::HeadDimV,
+        "ByteV2 fused single-token staging supports only the default V5 "
+        "layout");
+    STD_TORCH_CHECK(!bypass_serial_metadata || fuse_metadata_clear,
+                    "ByteV2 serial-metadata bypass requires fused metadata "
+                    "clear");
+    STD_TORCH_CHECK(!warp_parallel_histogram || fuse_metadata_clear,
+                    "ByteV2 warp-parallel histogram requires fused metadata "
+                    "clear");
+    STD_TORCH_CHECK(!bypass_serial_metadata || !warp_parallel_histogram,
+                    "ByteV2 serial-metadata bypass and warp-parallel histogram "
+                    "are mutually exclusive");
+    STD_TORCH_CHECK(key.device().is_cuda(), "key must be a CUDA tensor");
+    STD_TORCH_CHECK(key.device() == value.device() &&
+                        key.device() == raw_staging.device() &&
+                        key.device() == kv_cache.device() &&
+                        key.device() == slot_mapping.device() &&
+                        key.device() == block_to_staging_slot.device() &&
+                        key.device() == staging_to_physical_block.device() &&
+                        key.device() == valid_rows.device() &&
+                        key.device() == next_staging_slot.device() &&
+                        key.device() == overflow.device() &&
+                        key.device() == page_unsafe_flags.device(),
+                    "ByteV2 fused single-token staging tensors must be on "
+                    "the same device");
+    STD_TORCH_CHECK(key.scalar_type() == ScalarType::BFloat16 &&
+                        value.scalar_type() == ScalarType::BFloat16,
+                    "ByteV2 fused single-token staging requires bf16 K/V");
+    STD_TORCH_CHECK(raw_staging.scalar_type() == ScalarType::Byte &&
+                        kv_cache.scalar_type() == ScalarType::Byte,
+                    "ByteV2 fused single-token staging requires uint8 "
+                    "staging and cache tensors");
+    STD_TORCH_CHECK(slot_mapping.scalar_type() == ScalarType::Long,
+                    "slot_mapping must be int64");
+    STD_TORCH_CHECK(
+        block_to_staging_slot.scalar_type() == ScalarType::Int &&
+            staging_to_physical_block.scalar_type() == ScalarType::Int &&
+            valid_rows.scalar_type() == ScalarType::Int &&
+            next_staging_slot.scalar_type() == ScalarType::Int &&
+            overflow.scalar_type() == ScalarType::Int &&
+            page_unsafe_flags.scalar_type() == ScalarType::Int,
+        "ByteV2 fused single-token staging metadata must be "
+        "int32");
+    STD_TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+                    "key and value must be [tokens, heads, head_dim]");
+    STD_TORCH_CHECK(key.size(0) == 1 && value.size(0) == 1 &&
+                        key.size(1) == ByteV2DefaultLayout::NumKvHeadsValue &&
+                        value.size(1) == key.size(1) &&
+                        key.size(2) == ByteV2DefaultPolicy::HeadDim &&
+                        value.size(2) == ByteV2DefaultPolicy::HeadDimV,
+                    "ByteV2 fused single-token staging requires one "
+                    "8-head D128 K/V token");
+    STD_TORCH_CHECK(slot_mapping.dim() == 1 && slot_mapping.size(0) == 1 &&
+                        slot_mapping.stride(0) == 1,
+                    "slot_mapping must contain one token");
+    STD_TORCH_CHECK(raw_staging.dim() == 2 && raw_staging.size(0) == 1 &&
+                        raw_staging.size(1) >=
+                            ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+                        raw_staging.stride(0) >=
+                            ByteV2DefaultRawStagingLayout::SlotSizeBytes &&
+                        raw_staging.stride(1) == 1,
+                    "raw_staging must contain one contiguous V5 raw page");
+    STD_TORCH_CHECK(
+        kv_cache.dim() == 2 && kv_cache.stride(1) == 1 &&
+            kv_cache.size(1) >= ByteV2DefaultLayout::PageSizeBytes &&
+            kv_cache.stride(0) >= ByteV2DefaultLayout::PageSizeBytes,
+        "kv_cache must use the contiguous ByteV2 V5 layout");
+    STD_TORCH_CHECK(
+        block_to_staging_slot.dim() == 1 &&
+            block_to_staging_slot.size(0) == kv_cache.size(0) &&
+            block_to_staging_slot.stride(0) == 1 &&
+            staging_to_physical_block.dim() == 1 &&
+            staging_to_physical_block.size(0) == 1 &&
+            staging_to_physical_block.stride(0) == 1 && valid_rows.dim() == 1 &&
+            valid_rows.size(0) == 1 && valid_rows.stride(0) == 1 &&
+            next_staging_slot.dim() == 1 && next_staging_slot.size(0) >= 1 &&
+            next_staging_slot.stride(0) == 1 && overflow.dim() == 1 &&
+            overflow.size(0) >= 1 && overflow.stride(0) == 1 &&
+            page_unsafe_flags.size(0) >= kv_cache.size(0) &&
+            page_unsafe_flags.stride(0) == 1,
+        "ByteV2 fused single-token staging metadata shapes are "
+        "invalid");
+
+    const torch::stable::accelerator::DeviceGuard device_guard(
+        key.get_device_index());
+    const cudaStream_t stream = get_current_cuda_stream(key.get_device_index());
+    constexpr int kThreads = 256;
+    constexpr int64_t kWorkItems = 2 * ByteV2DefaultLayout::NumKvHeadsValue *
+                                   ByteV2DefaultPolicy::AllocBlockTokens *
+                                   ByteV2DefaultPolicy::HeadDim;
+    constexpr int kBlocks =
+        static_cast<int>((kWorkItems + kThreads - 1) / kThreads);
+    const bool use_fused_commit_release =
+        fuse_single_token_commit_release && fuse_metadata_clear &&
+        !bypass_serial_metadata && warp_parallel_histogram;
+    const bool use_fused_stage_metadata_clear =
+        use_fused_commit_release && fuse_single_token_stage_metadata_clear;
+    int32_t* fused_release_page_unsafe_flags =
+        use_fused_commit_release ? page_unsafe_flags.mutable_data_ptr<int32_t>()
+                                 : nullptr;
+    if (use_fused_stage_metadata_clear) {
+      byte_v2_hydrate_append_single_token_raw_staging_kernel<true>
+          <<<kBlocks, kThreads, 0, stream>>>(
+              reinterpret_cast<const uint16_t*>(key.const_data_ptr()),
+              reinterpret_cast<const uint16_t*>(value.const_data_ptr()),
+              reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()),
+              reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+              slot_mapping.const_data_ptr<int64_t>(),
+              block_to_staging_slot.mutable_data_ptr<int32_t>(),
+              staging_to_physical_block.mutable_data_ptr<int32_t>(),
+              valid_rows.mutable_data_ptr<int32_t>(),
+              next_staging_slot.mutable_data_ptr<int32_t>(),
+              overflow.mutable_data_ptr<int32_t>(),
+              fused_release_page_unsafe_flags, key.stride(1), key.stride(2),
+              value.stride(1), value.stride(2), kv_cache.size(0),
+              kv_cache.stride(0));
+    } else {
+      byte_v2_hydrate_append_single_token_raw_staging_kernel<false>
+          <<<kBlocks, kThreads, 0, stream>>>(
+              reinterpret_cast<const uint16_t*>(key.const_data_ptr()),
+              reinterpret_cast<const uint16_t*>(value.const_data_ptr()),
+              reinterpret_cast<uint8_t*>(raw_staging.mutable_data_ptr()),
+              reinterpret_cast<uint8_t*>(kv_cache.mutable_data_ptr()),
+              slot_mapping.const_data_ptr<int64_t>(),
+              block_to_staging_slot.mutable_data_ptr<int32_t>(),
+              staging_to_physical_block.mutable_data_ptr<int32_t>(),
+              valid_rows.mutable_data_ptr<int32_t>(),
+              next_staging_slot.mutable_data_ptr<int32_t>(),
+              overflow.mutable_data_ptr<int32_t>(),
+              fused_release_page_unsafe_flags, key.stride(1), key.stride(2),
+              value.stride(1), value.stride(2), kv_cache.size(0),
+              kv_cache.stride(0));
+    }
+    const cudaError_t stage_err = cudaGetLastError();
+    STD_TORCH_CHECK(stage_err == cudaSuccess,
+                    "byte_v2 fused single-token staging kernel launch failed: ",
+                    cudaGetErrorString(stage_err));
+    if (use_fused_commit_release) {
+      byte_v2_commit_single_token_raw_staging_and_release_impl(
+          raw_staging, kv_cache, block_to_staging_slot,
+          staging_to_physical_block, valid_rows, next_staging_slot, overflow,
+          page_unsafe_flags, use_fused_stage_metadata_clear);
+    } else {
+      byte_v2_commit_raw_staging_to_cache_impl(
+          raw_staging, kv_cache, staging_to_physical_block, valid_rows,
+          codec_token_block, codec_dim_block, alloc_block_tokens,
+          fuse_metadata_clear, bypass_serial_metadata, warp_parallel_histogram);
+      byte_v2_release_raw_staging_and_update_flags(
+          block_to_staging_slot, staging_to_physical_block, valid_rows,
+          next_staging_slot, overflow, page_unsafe_flags, kv_cache,
+          tile_policy);
+    }
+    return;
+  }
   byte_v2_prepare_raw_staging(slot_mapping, block_to_staging_slot,
                               staging_to_physical_block, valid_rows,
                               next_staging_slot, overflow, alloc_block_tokens);

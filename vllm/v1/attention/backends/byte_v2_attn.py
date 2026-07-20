@@ -158,6 +158,34 @@ def _native_raw_staging_update_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _native_single_token_update_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_NATIVE_SINGLE_TOKEN_UPDATE")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _fused_single_token_staging_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_FUSED_SINGLE_TOKEN_STAGING")
+    if value is None:
+        return True
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _fused_single_token_commit_release_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_FUSED_SINGLE_TOKEN_COMMIT_RELEASE")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _fused_single_token_stage_metadata_clear_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_FUSED_SINGLE_TOKEN_STAGE_METADATA_CLEAR")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 def _fused_commit_metadata_clear_enabled() -> bool:
     value = os.environ.get("BYTE_V2_FUSED_COMMIT_METADATA_CLEAR")
     if value is None:
@@ -583,7 +611,11 @@ class ByteV2RawStagingManager:
     ) -> tuple[bool, bool]:
         if slot_mapping.shape[0] == 0:
             return True, False
-        if slot_mapping.shape[0] == 1 and slot_mapping.is_cuda:
+        if (
+            slot_mapping.shape[0] == 1
+            and slot_mapping.is_cuda
+            and _native_single_token_update_enabled()
+        ):
             try:
                 byte_v2_update_cache_single_token(
                     key,
@@ -646,6 +678,13 @@ class ByteV2RawStagingManager:
                     ),
                     fuse_metadata_clear=_fused_commit_metadata_clear_enabled(),
                     warp_parallel_histogram=(_warp_parallel_commit_histogram_enabled()),
+                    fuse_single_token_staging=(_fused_single_token_staging_enabled()),
+                    fuse_single_token_commit_release=(
+                        _fused_single_token_commit_release_enabled()
+                    ),
+                    fuse_single_token_stage_metadata_clear=(
+                        _fused_single_token_stage_metadata_clear_enabled()
+                    ),
                 )
                 return True, True
             except NotImplementedError:
@@ -2333,6 +2372,14 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 or self.speculative_verify_ragged_q4
                 or self.cached_prefix_q16
             )
+            and kv_cache.is_cuda
+            and slot_mapping.is_cuda
+        ):
+            page_unsafe_flags = self._get_decode_page_unsafe_flags(kv_cache)
+        if (
+            page_unsafe_flags is None
+            and _fused_single_token_staging_enabled()
+            and slot_mapping.shape[0] == 1
             and kv_cache.is_cuda
             and slot_mapping.is_cuda
         ):

@@ -357,6 +357,9 @@ def byte_v2_update_cache_raw_staging(
     fuse_metadata_clear: bool = False,
     bypass_serial_metadata: bool = False,
     warp_parallel_histogram: bool = False,
+    fuse_single_token_staging: bool = False,
+    fuse_single_token_commit_release: bool = False,
+    fuse_single_token_stage_metadata_clear: bool = False,
 ) -> None:
     """Run the raw-staging cache update through one native dispatcher call."""
     _require_op("_C_cache_ops", "byte_v2_update_cache_raw_staging")(
@@ -375,6 +378,9 @@ def byte_v2_update_cache_raw_staging(
         fuse_metadata_clear,
         bypass_serial_metadata,
         warp_parallel_histogram,
+        fuse_single_token_staging,
+        fuse_single_token_commit_release,
+        fuse_single_token_stage_metadata_clear,
     )
 
 

@@ -935,7 +935,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                           int[] tile_policy,"
       "                           bool fuse_metadata_clear,"
       "                           bool bypass_serial_metadata,"
-      "                           bool warp_parallel_histogram) -> ()");
+      "                           bool warp_parallel_histogram,"
+      "                           bool fuse_single_token_staging=False,"
+      "                           bool fuse_single_token_commit_release=False,"
+      "                           bool fuse_single_token_stage_metadata_clear="
+      "False)"
+      "                           -> ()");
 
   ops.def(
       "byte_v2_collect_cache_stats("

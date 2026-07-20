@@ -1789,3 +1789,204 @@ Artifacts:
 - `profile/bytev2-fa2-kv-alias-a40-20260719/analysis/nsys_ab_summary.txt`
 - `profile/bytev2-fa2-kv-alias-a40-20260719/analysis/validation_summary.txt`
 - `profile/bytev2-fa2-kv-alias-a40-20260719/analysis/e2e_fa2_summary.txt`
+
+## Safe Fused Single-Token Staging Update (2026-07-19)
+
+The old in-place n=1 updater is now disabled by default. It freezes each
+tile's base from row 0 and allocates replacement pooled-outlier segments
+without reclaiming the old segment during growth. In the full-FA2 long-output
+workload this eventually exceeds the 1,024-entry page pool and traps after
+roughly 75 generated tokens.
+
+The retained replacement keeps the safe full-page rebase/compaction semantics
+but reduces its launch chain. One CUDA kernel reads the device-side slot,
+initializes staging slot zero, decodes the existing page prefix, and copies the
+new BF16 row. It then reuses the existing metadata clear, warp-histogram
+commit, and release-plus-flags kernels. QK, softmax, PV, split selection, and
+the original FA2 combine remain unchanged.
+
+The complete n=1 update changes from seven traced GPU operations to four.
+Across target rows 0, 1, 4, 8, 12, and 15, a same-process alternating A/B
+reduces CUDA-event medians from 34.99--35.82 us to 25.32--25.83 us, or
+27.0%--28.3%. Nsight Systems row 8 reduces projected traced time from 59.21 to
+40.02 us/update (-32.42%). The unchanged commit remains the largest active
+kernel at about 8.38 us; the new combined hydrate/append stage takes about
+2.15 us.
+
+NCU confirms that the commit is a tiny-grid latency kernel rather than a
+bandwidth or spill bottleneck: 128 CTAs, 0.127 waves/SM, 12.15% achieved
+occupancy, 2.14% SM throughput, 0.754% peak DRAM-read throughput, 40
+registers/thread, and no local spill. This supports removing orchestration
+rather than another histogram rewrite.
+
+Generic Q1 decode does not otherwise consume page-unsafe flags, so an initial
+E2E attempt did not hit the native operation: an engine trace showed 192
+prepare/hydrate/append launches and zero fused launches. When the new safe
+mode is enabled, the cache-update caller now provides the existing internal
+flags buffer for n=1. A second trace records the fused stage,
+warp-histogram commit, and release-with-flags path; padded compile-warmup
+shapes continue to use the general implementation.
+
+Compiled/CUDA-graph E2E at context 4,096, batch 1, and no speculation gives:
+
+| Outputs | Mode | ByteV2 | Raw FA2 | Paired throughput gap | Token result |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 128 | Previous native-safe | 3.9955 s | 3.9032 s | -2.31% | exact |
+| 128 | Default safe fused staging | 3.9721 s | 3.9029 s | -1.74% | exact |
+| 256 | Fresh generic-safe median | 34.0737 tok/s | 35.1655 tok/s | -3.10% | exact |
+| 256 | Safe fused staging median | 34.6984 tok/s | 35.1675 tok/s | -1.33% | exact |
+
+The three 256-output candidate walls are 7.3779, 7.3684, and 7.4006 seconds.
+Compared with fresh generic-safe runs, median E2E throughput improves about
+1.83%. The previously recorded native-safe control is stricter and faster
+than those fresh generic-safe runs; against it, the candidate still reduces
+wall time by 0.68% and closes about 0.73 percentage point of the raw gap.
+
+Correctness covers random, low-outlier, overlay, and non-contiguous K/V
+inputs; rows 0/1/8/15; invalid negative and positive slots; old Torch schema
+arity; preflight fail-before-mutation; and 32 CUDA Graph replays spanning two
+physical pages. Memcheck, synccheck, and racecheck report zero errors or
+hazards. The complete attention test reports 217 passed and one skipped. All
+saved 128/256 ByteV2 and raw FA2 output tokens match exactly.
+
+The safe fused staging mode is therefore enabled by default through
+`BYTE_V2_FUSED_SINGLE_TOKEN_STAGING`, with `0` retaining the general path for
+controlled comparison. `BYTE_V2_NATIVE_SINGLE_TOKEN_UPDATE` remains
+default-off.
+
+Artifacts:
+
+- `profile/byte-v2-safe-n1-update-baseline-a40-20260719/REPORT.md`
+- `profile/byte-v2-safe-n1-update-baseline-a40-20260719/reports/full_commit_row8.ncu-rep`
+- `profile/byte-v2-safe-n1-update-baseline-a40-20260719/reports/source_commit_row8.ncu-rep`
+- `profile/byte-v2-safe-n1-update-baseline-a40-20260719/reports/nsys_fused_row8.nsys-rep`
+- `profile/byte-v2-safe-n1-update-baseline-a40-20260719/reports/nsys_engine_fused_hit_out2.nsys-rep`
+
+## Safe Single-Token Two-Kernel Update Experiment (2026-07-20)
+
+The next launch-reduction experiment folds the four-kernel safe n=1 update
+into two kernels while preserving the full-page V5 rebase/compaction
+semantics. It does not restore the rejected in-place updater.
+
+The first fusion moves page-unsafe-flag aggregation and allocator release into
+the existing warp-histogram commit. The 128 tile CTAs use the existing
+`overflow[0]` word as a completion counter, atomically OR exact K/V unsafe
+bits, and let the last CTA release staging state. Invalid padding and
+out-of-range slots participate in the completion protocol but preserve valid
+page flags. This changes four launches to three.
+
+The second fusion moves metadata clear into the hydrate/append stage. Its 128
+CTAs temporarily use `next_staging_slot[0]` as a completion counter. Once all
+old-page reads finish, the last CTA clears the destination metadata and
+publishes the staging slot. Commit then runs unchanged on the same stream and
+also performs the fused release. This changes three launches to two.
+
+At target row 8, same-process alternating tests use 21 trials of 500 updates:
+
+| Complete n=1 update | Baseline event | Candidate event | Change | Baseline wall | Candidate wall | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Commit/release fusion, 4 to 3 | 27.1176 us | 21.9566 us | -19.03% | 27.1500 us | 21.9866 us | -19.02% |
+| Stage/clear fusion, 3 to 2 | 22.3949 us | 19.4744 us | -13.04% | 22.4259 us | 19.5052 us | -13.02% |
+
+The final isolated Nsys trace contains only the fused stage/clear and
+commit/release kernels, averaging 2.650 and 8.846 us over 300 updates. No
+standalone clear or release remains.
+
+An output-8 engine trace initially appears to contain both fused and generic
+chains. Timestamp and CUDA Graph attribution resolves the ambiguity: the 96
+generic instances are three 32-layer passes during compilation, per-layer
+graph construction and validation. Their final launch precedes real prefill
+by 1.618 seconds. Real 4,096-token prefill uses the direct writer, while
+measured and profiler decode each execute seven replays of full-model Graph
+199 captured immediately after a fused n=1 pass. The serving path therefore
+does hit the candidate; generic kernels are not residual steady-decode work.
+
+The decisive same-native-binary E2E comparison uses context 4,096, batch 1,
+256 output tokens, no speculation and compiled CUDA Graph execution:
+
+| Mode | Median ByteV2 | Median paired gap to raw | Token result |
+| --- | ---: | ---: | --- |
+| Existing four-kernel safe update | 34.6127 tok/s | -1.4619% | 256 exact in all three runs |
+| Two-kernel candidate | 34.7125 tok/s | -1.2012% | 256 exact in all three runs |
+
+The candidate reduces median ByteV2 wall time by 21.262 ms, improves
+throughput by 0.2883%, and closes 0.2606 percentage point of the paired raw
+gap. That is below the declared 0.5% E2E retention gate. The two new controls
+therefore default to off; `BYTE_V2_FUSED_SINGLE_TOKEN_STAGING` remains on, so
+the production default is the already-validated four-kernel path. The tested
+three- and two-kernel implementations remain available for controlled
+experiments through:
+
+```text
+BYTE_V2_FUSED_SINGLE_TOKEN_COMMIT_RELEASE=1
+BYTE_V2_FUSED_SINGLE_TOKEN_STAGE_METADATA_CLEAR=1
+```
+
+Correctness covers both three- and two-kernel combinations; rows 0/1/8/15;
+random, low-outlier and strided inputs; exact flags 0/3/5/7 against an
+independent scan; invalid slots; preflight failure; and 32 cross-page CUDA
+Graph replays. The focused final selection reports 33 passed. Two-kernel
+memcheck, synccheck, racecheck and graph memcheck all report zero issues. All
+six saved E2E token sequences are mutually exact. The complete attention test
+reports 236 passed and one skipped.
+
+The result places a data-backed ceiling on further local update-tail work:
+removing half its graph nodes moves complete E2E by less than 0.3%. Attention
+main plus the original combine is already approximately tied with raw (44.432
+versus 44.709 us). The next optimization should first attribute the remaining
+step-level raw/ByteV2 residual outside attention and then target the dominant
+graph, cache-update or scheduler interval rather than another small update
+kernel rewrite.
+
+Artifacts:
+
+- `profile/byte-v2-safe-n1-commit-release-a40-20260720/REPORT.md`
+- `profile/byte-v2-safe-n1-stage-clear-a40-20260720/REPORT.md`
+- `profile/byte-v2-safe-n1-stage-clear-a40-20260720/analysis/e2e_summary.json`
+- `profile/byte-v2-safe-n1-stage-clear-a40-20260720/reports/nsys_engine_out8.nsys-rep`
+- `profile/byte-v2-safe-n1-stage-clear-a40-20260720/reports/nsys_fused_stage_clear_row8.nsys-rep`
+
+## Short-Context Two-Kernel E2E Retention (2026-07-20)
+
+The existing two-kernel n=1 update candidate was retested at contexts 128,
+512, and 1,024 using a short-capacity compiled engine, batch 1, no
+speculation, and 256 generated tokens. Four-kernel, two-kernel, and raw FA2
+engines were ordered as a three-round cyclic Latin square. Both ByteV2 modes
+used the same native binary and FA2-template decode; only the two optional
+single-token fusion controls differed.
+
+The paired two-kernel/four-kernel throughput changes are:
+
+| Context | Round 1 | Round 2 | Round 3 | Median | +0.5% gate |
+| ---: | ---: | ---: | ---: | ---: | :---: |
+| 128 | -1.0256% | +0.3699% | -0.6062% | -0.6062% | Fail |
+| 512 | -0.9391% | +0.2957% | -0.3174% | -0.3174% | Fail |
+| 1,024 | -0.2695% | +0.1969% | +0.0762% | +0.0762% | Fail |
+
+None of the nine individual pairs reaches +0.5%; the largest is +0.3699%.
+The 128/512 signs change across rounds, so the negative medians are not treated
+as precise regressions, but the absence of a retainable improvement is clear.
+The four-kernel median paired gaps to raw are -1.0778%, -1.3578%, and -2.0363%
+at 128/512/1,024; the two-kernel gaps are -1.5841%, -1.6708%, and -2.1322%.
+
+All 27 measured requests produce 256 tokens. At each context, all four-kernel,
+two-kernel, and raw token lists are elementwise identical across every round;
+all instrumented replays also report exact agreement with their measured
+request. The candidate remains available for diagnostics but defaults stay
+off, leaving the safe four-kernel path in production.
+
+This short-context result strengthens the ceiling on update-tail launch work:
+removing two Graph nodes does not recover the E2E gap. The next trace should
+re-attribute the short-shape 1K Graph residual. If cache update is still the
+largest component, the next structural design should reduce complete active-
+page hydrate/re-encode work, not remove another clear/release launch. A
+persistent authoritative raw tail page with compression on page closure is a
+candidate, but it requires a real BF16 sidecar and explicit page mode; V5's
+current overflow/unsafe markers are not recoverable storage.
+
+Artifacts:
+
+- `profile/byte-v2-short-context-two-kernel-e2e-a40-20260720/REPORT.md`
+- `profile/byte-v2-short-context-two-kernel-e2e-a40-20260720/analysis/e2e_ab_summary.json`
+- `profile/byte-v2-short-context-two-kernel-e2e-a40-20260720/analysis/e2e_ab_summary.csv`
+- `profile/byte-v2-short-context-two-kernel-e2e-a40-20260720/reports/run{1,2,3}_{four_kernel,two_kernel,raw}.jsonl`

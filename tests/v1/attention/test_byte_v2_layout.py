@@ -1260,6 +1260,46 @@ def test_byte_v2_native_raw_staging_update_defaults_on(monkeypatch):
     assert byte_v2_attn_module._native_raw_staging_update_enabled() is False
 
 
+def test_byte_v2_native_single_token_update_defaults_off(monkeypatch):
+    env_name = "BYTE_V2_NATIVE_SINGLE_TOKEN_UPDATE"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._native_single_token_update_enabled() is False
+
+    monkeypatch.setenv(env_name, "1")
+    assert byte_v2_attn_module._native_single_token_update_enabled() is True
+
+
+def test_byte_v2_fused_single_token_staging_defaults_on(monkeypatch):
+    env_name = "BYTE_V2_FUSED_SINGLE_TOKEN_STAGING"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._fused_single_token_staging_enabled() is True
+
+    monkeypatch.setenv(env_name, "0")
+    assert byte_v2_attn_module._fused_single_token_staging_enabled() is False
+
+
+def test_byte_v2_fused_single_token_commit_release_defaults_off(monkeypatch):
+    env_name = "BYTE_V2_FUSED_SINGLE_TOKEN_COMMIT_RELEASE"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._fused_single_token_commit_release_enabled() is False
+
+    monkeypatch.setenv(env_name, "1")
+    assert byte_v2_attn_module._fused_single_token_commit_release_enabled() is True
+
+
+def test_byte_v2_fused_single_token_stage_metadata_clear_defaults_off(monkeypatch):
+    env_name = "BYTE_V2_FUSED_SINGLE_TOKEN_STAGE_METADATA_CLEAR"
+    monkeypatch.delenv(env_name, raising=False)
+    assert (
+        byte_v2_attn_module._fused_single_token_stage_metadata_clear_enabled() is False
+    )
+
+    monkeypatch.setenv(env_name, "1")
+    assert (
+        byte_v2_attn_module._fused_single_token_stage_metadata_clear_enabled() is True
+    )
+
+
 def test_byte_v2_fused_commit_metadata_clear_defaults_on(monkeypatch):
     env_name = "BYTE_V2_FUSED_COMMIT_METADATA_CLEAR"
     monkeypatch.delenv(env_name, raising=False)
@@ -2046,7 +2086,10 @@ def test_byte_v2_ops_fail_cleanly_without_registered_kernels():
 
     key = torch.empty((1, 1, 128), dtype=torch.bfloat16)
     value = torch.empty_like(key)
-    kv_cache = torch.empty((1, ByteV2PageLayoutV5().page_size_bytes), dtype=torch.uint8)
+    kv_cache = torch.empty(
+        (1, ByteV2PageLayoutV5().page_size_bytes),
+        dtype=torch.uint8,
+    )
     slot_mapping = torch.zeros((1,), dtype=torch.int64)
     raw_staging = torch.empty(
         (1, ByteV2RawStagingLayout().slot_size_bytes), dtype=torch.uint8
@@ -2365,8 +2408,117 @@ def test_byte_v2_kv_cache_update_uses_and_reuses_raw_staging(monkeypatch):
     assert impl.raw_staging_manager.raw_staging is first_staging_buffer
 
 
+def test_byte_v2_raw_staging_manager_native_single_token_update_is_opt_in(
+    monkeypatch,
+):
+    calls = []
+
+    def single_token_update(*args, **kwargs):
+        del args, kwargs
+        calls.append("single_token")
+
+    def raw_staging_update(*args, **kwargs):
+        del args, kwargs
+        calls.append("raw_staging")
+
+    env_name = "BYTE_V2_NATIVE_SINGLE_TOKEN_UPDATE"
+    monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("BYTE_V2_NATIVE_RAW_STAGING_UPDATE", "1")
+    monkeypatch.setenv("BYTE_V2_FUSED_STAGING_RELEASE_FLAGS", "1")
+    monkeypatch.delenv("BYTE_V2_DEBUG_WARMUP", raising=False)
+    monkeypatch.delenv("VLLM_BYTE_V2_DEBUG_WARMUP", raising=False)
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_update_cache_single_token",
+        single_token_update,
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_update_cache_raw_staging",
+        raw_staging_update,
+    )
+
+    manager = byte_v2_attn_module.ByteV2RawStagingManager(
+        tile_policy=DEFAULT_BYTE_V2_TILE_POLICY,
+        num_kv_heads=8,
+    )
+    key = torch.empty((1, 8, 128), dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    kv_cache = torch.empty(
+        (1, ByteV2PageLayoutV5().page_size_bytes),
+        dtype=torch.uint8,
+    )
+    slot_mapping = SimpleNamespace(shape=(1,), is_cuda=True)
+    page_unsafe_flags = torch.zeros((1,), dtype=torch.int32)
+
+    result = manager.update(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        page_unsafe_flags=page_unsafe_flags,
+    )
+    assert result == (True, True)
+    assert calls == ["raw_staging"]
+
+    calls.clear()
+    monkeypatch.setenv(env_name, "1")
+    result = manager.update(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        page_unsafe_flags=page_unsafe_flags,
+    )
+    assert result == (True, True)
+    assert calls == ["single_token"]
+
+
+@pytest.mark.parametrize("fused_stage", [False, True])
+def test_byte_v2_kv_update_supplies_flags_for_fused_single_token_staging(
+    monkeypatch,
+    fused_stage,
+):
+    env_name = "BYTE_V2_FUSED_SINGLE_TOKEN_STAGING"
+    if fused_stage:
+        monkeypatch.setenv(env_name, "1")
+    else:
+        monkeypatch.setenv(env_name, "0")
+
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=8,
+    )
+    impl.decode_page_unsafe_flags = False
+    supplied_flags = []
+    flags = object()
+
+    def get_flags(kv_cache):
+        del kv_cache
+        return flags
+
+    def update(**kwargs):
+        supplied_flags.append(kwargs["page_unsafe_flags"])
+        return True, kwargs["page_unsafe_flags"] is not None
+
+    monkeypatch.setattr(impl, "_get_decode_page_unsafe_flags", get_flags)
+    monkeypatch.setattr(impl.raw_staging_manager, "update", update)
+    key = SimpleNamespace(shape=(1, 8, 128))
+    value = SimpleNamespace(shape=(1, 8, 128))
+    kv_cache = SimpleNamespace(shape=(4, 1), is_cuda=True)
+    slot_mapping = SimpleNamespace(shape=(1,), is_cuda=True)
+
+    impl.do_kv_cache_update(None, key, value, kv_cache, slot_mapping)
+
+    assert supplied_flags == ([flags] if fused_stage else [None])
+
+
 def test_byte_v2_raw_staging_manager_uses_native_update_with_flags(monkeypatch):
     calls = []
+    monkeypatch.delenv("BYTE_V2_FUSED_SINGLE_TOKEN_COMMIT_RELEASE", raising=False)
+    monkeypatch.delenv("BYTE_V2_FUSED_SINGLE_TOKEN_STAGE_METADATA_CLEAR", raising=False)
 
     def native_update(
         key,
@@ -2384,6 +2536,9 @@ def test_byte_v2_raw_staging_manager_uses_native_update_with_flags(monkeypatch):
         tile_policy,
         fuse_metadata_clear,
         warp_parallel_histogram,
+        fuse_single_token_staging,
+        fuse_single_token_commit_release,
+        fuse_single_token_stage_metadata_clear,
     ):
         del key, value, kv_cache, slot_mapping, page_unsafe_flags
         calls.append(
@@ -2392,6 +2547,9 @@ def test_byte_v2_raw_staging_manager_uses_native_update_with_flags(monkeypatch):
                 tuple(tile_policy),
                 fuse_metadata_clear,
                 warp_parallel_histogram,
+                fuse_single_token_staging,
+                fuse_single_token_commit_release,
+                fuse_single_token_stage_metadata_clear,
             )
         )
         block_to_staging_slot.fill_(-1)
@@ -2425,7 +2583,7 @@ def test_byte_v2_raw_staging_manager_uses_native_update_with_flags(monkeypatch):
 
     assert handled is True
     assert flags_updated is True
-    assert calls == [(2, (16, 16, 16, 64, 128, 128), True, True)]
+    assert calls == [(2, (16, 16, 16, 64, 128, 128), True, True, True, False, False)]
 
 
 def test_byte_v2_kv_cache_update_falls_back_when_raw_staging_is_missing(monkeypatch):
@@ -4053,6 +4211,475 @@ def test_byte_v2_native_raw_staging_update_matches_chained_ops(
     )
     for native_tensor, chained_tensor in zip(native_state[1:], chained_state[1:]):
         torch.testing.assert_close(native_tensor, chained_tensor, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("row", [0, 1, 8, 15])
+@pytest.mark.parametrize("update_pattern", ["random", "safe", "strided"])
+@pytest.mark.parametrize("stage_metadata_clear", [False, True])
+def test_byte_v2_fused_single_token_staging_matches_safe_update(
+    row,
+    update_pattern,
+    stage_metadata_clear,
+):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_raw_staging"):
+        pytest.skip("ByteV2 native raw staging update op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    torch.manual_seed(20260719 + row)
+    baseline_cache = torch.zeros(
+        (1, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    if row:
+        initial_key = torch.randn(
+            row,
+            8,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        initial_value = torch.randn_like(initial_key)
+        initial_slots = torch.arange(row, dtype=torch.int64, device="cuda")
+        byte_v2_reshape_and_cache(
+            initial_key,
+            initial_value,
+            baseline_cache,
+            initial_slots,
+            codec_token_block=16,
+            codec_dim_block=16,
+            alloc_block_tokens=16,
+        )
+    candidate_cache = baseline_cache.clone()
+
+    if update_pattern == "random":
+        key = torch.randn(1, 8, 128, dtype=torch.bfloat16, device="cuda")
+        value = torch.randn_like(key)
+    elif update_pattern == "safe":
+        key = torch.ones(1, 8, 128, dtype=torch.bfloat16, device="cuda")
+        value = torch.full_like(key, 0.5)
+    else:
+        key = torch.randn(1, 8, 256, dtype=torch.bfloat16, device="cuda")[..., ::2]
+        value = torch.randn(1, 8, 256, dtype=torch.bfloat16, device="cuda")[..., 1::2]
+        assert key.stride(2) == value.stride(2) == 2
+    slot_mapping = torch.tensor([row], dtype=torch.int64, device="cuda")
+
+    def make_state():
+        return (
+            torch.empty(
+                (1, staging_layout.slot_size_bytes),
+                dtype=torch.uint8,
+                device="cuda",
+            ),
+            torch.full((1,), -1, dtype=torch.int32, device="cuda"),
+            torch.full((1,), -1, dtype=torch.int32, device="cuda"),
+            torch.zeros((1,), dtype=torch.int32, device="cuda"),
+            torch.zeros((1,), dtype=torch.int32, device="cuda"),
+            torch.zeros((1,), dtype=torch.int32, device="cuda"),
+            torch.zeros((1,), dtype=torch.int32, device="cuda"),
+        )
+
+    baseline_state = make_state()
+    candidate_state = make_state()
+
+    def update(cache, state, *, fused_stage):
+        (
+            raw_staging,
+            block_to_slot,
+            slot_to_block,
+            valid_rows,
+            next_slot,
+            overflow,
+            flags,
+        ) = state
+        byte_v2_update_cache_raw_staging(
+            key,
+            value,
+            raw_staging,
+            cache,
+            slot_mapping,
+            block_to_slot,
+            slot_to_block,
+            valid_rows,
+            next_slot,
+            overflow,
+            flags,
+            tile_policy=(16, 16, 16, 64, 128, 128),
+            fuse_metadata_clear=True,
+            warp_parallel_histogram=True,
+            fuse_single_token_staging=fused_stage,
+            fuse_single_token_commit_release=fused_stage,
+            fuse_single_token_stage_metadata_clear=(
+                fused_stage and stage_metadata_clear
+            ),
+        )
+
+    update(baseline_cache, baseline_state, fused_stage=False)
+    update(candidate_cache, candidate_state, fused_stage=True)
+    torch.accelerator.synchronize()
+
+    _assert_byte_v2_caches_decode_equal(
+        candidate_cache,
+        baseline_cache,
+        layout,
+        num_tokens=row + 1,
+    )
+    for candidate_tensor, baseline_tensor in zip(
+        candidate_state[1:], baseline_state[1:]
+    ):
+        torch.testing.assert_close(candidate_tensor, baseline_tensor, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("unsafe_sides", "expected_flag"),
+    [
+        ("none", 0),
+        ("k", 3),
+        ("v", 5),
+        ("kv", 7),
+    ],
+)
+def test_byte_v2_fused_single_token_commit_release_updates_exact_flags(
+    unsafe_sides,
+    expected_flag,
+):
+    required_ops = (
+        "byte_v2_update_cache_raw_staging",
+        "byte_v2_update_cache_unsafe_flags",
+    )
+    if not all(_has_torch_op("_C_cache_ops", name) for name in required_ops):
+        pytest.skip("ByteV2 native update and flag ops are not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    clean_bits = 0x3F80
+    outlier_bits = 0x5F80
+    key_bits = torch.full((1, 8, 128), clean_bits, dtype=torch.int16, device="cuda")
+    value_bits = torch.full_like(key_bits, clean_bits)
+    if "k" in unsafe_sides:
+        key_bits[0, 0, 0] = outlier_bits
+    if "v" in unsafe_sides:
+        value_bits[0, 0, 0] = outlier_bits
+    key = key_bits.view(torch.bfloat16)
+    value = value_bits.view(torch.bfloat16)
+
+    kv_cache = torch.zeros(
+        (1, layout.page_size_bytes), dtype=torch.uint8, device="cuda"
+    )
+    raw_staging = torch.empty(
+        (1, staging_layout.slot_size_bytes), dtype=torch.uint8, device="cuda"
+    )
+    slot_mapping = torch.zeros((1,), dtype=torch.int64, device="cuda")
+    block_to_slot = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    slot_to_block = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    valid_rows = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    next_slot = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    overflow = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    flags = torch.full((1,), 7, dtype=torch.int32, device="cuda")
+
+    byte_v2_update_cache_raw_staging(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        slot_mapping,
+        block_to_slot,
+        slot_to_block,
+        valid_rows,
+        next_slot,
+        overflow,
+        flags,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+        fuse_metadata_clear=True,
+        warp_parallel_histogram=True,
+        fuse_single_token_staging=True,
+        fuse_single_token_commit_release=True,
+        fuse_single_token_stage_metadata_clear=True,
+    )
+    oracle_flags = torch.full_like(flags, -1)
+    byte_v2_update_cache_unsafe_flags(
+        oracle_flags,
+        kv_cache,
+        slot_mapping,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+    torch.accelerator.synchronize()
+
+    assert flags.item() == expected_flag
+    torch.testing.assert_close(flags, oracle_flags, atol=0, rtol=0)
+    torch.testing.assert_close(block_to_slot, torch.full_like(block_to_slot, -1))
+    torch.testing.assert_close(slot_to_block, torch.full_like(slot_to_block, -1))
+    torch.testing.assert_close(valid_rows, torch.zeros_like(valid_rows))
+    torch.testing.assert_close(next_slot, torch.zeros_like(next_slot))
+    torch.testing.assert_close(overflow, torch.zeros_like(overflow))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("slot", [-1, 16])
+def test_byte_v2_fused_single_token_staging_ignores_invalid_slot(slot):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_raw_staging"):
+        pytest.skip("ByteV2 native raw staging update op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    key = torch.randn(1, 8, 128, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    kv_cache = torch.randint(
+        0,
+        256,
+        (1, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    original_cache = kv_cache.clone()
+    raw_staging = torch.empty(
+        (1, staging_layout.slot_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_to_slot = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    slot_to_block = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    valid_rows = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    next_slot = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    overflow = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    flags = torch.full((1,), 7, dtype=torch.int32, device="cuda")
+
+    byte_v2_update_cache_raw_staging(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        torch.tensor([slot], dtype=torch.int64, device="cuda"),
+        block_to_slot,
+        slot_to_block,
+        valid_rows,
+        next_slot,
+        overflow,
+        flags,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+        fuse_metadata_clear=True,
+        warp_parallel_histogram=True,
+        fuse_single_token_staging=True,
+        fuse_single_token_commit_release=True,
+        fuse_single_token_stage_metadata_clear=True,
+    )
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(kv_cache, original_cache, atol=0, rtol=0)
+    torch.testing.assert_close(block_to_slot, torch.full_like(block_to_slot, -1))
+    torch.testing.assert_close(slot_to_block, torch.full_like(slot_to_block, -1))
+    torch.testing.assert_close(valid_rows, torch.zeros_like(valid_rows))
+    torch.testing.assert_close(next_slot, torch.zeros_like(next_slot))
+    torch.testing.assert_close(overflow, torch.zeros_like(overflow))
+    torch.testing.assert_close(flags, torch.full_like(flags, 7))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_staging_schema_keeps_old_call_signature():
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_raw_staging"):
+        pytest.skip("ByteV2 native raw staging update op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    key = torch.zeros(1, 8, 128, dtype=torch.bfloat16, device="cuda")
+    value = torch.zeros_like(key)
+    kv_cache = torch.zeros(
+        (1, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    raw_staging = torch.empty(
+        (1, staging_layout.slot_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_to_slot = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    slot_to_block = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    valid_rows = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    next_slot = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    overflow = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    flags = torch.zeros((1,), dtype=torch.int32, device="cuda")
+
+    torch.ops._C_cache_ops.byte_v2_update_cache_raw_staging(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        torch.tensor([-1], dtype=torch.int64, device="cuda"),
+        block_to_slot,
+        slot_to_block,
+        valid_rows,
+        next_slot,
+        overflow,
+        flags,
+        [16, 16, 16, 64, 128, 128],
+        True,
+        False,
+        True,
+    )
+    torch.accelerator.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    (
+        "key_tokens",
+        "tile_policy",
+        "fuse_metadata_clear",
+        "warp_parallel_histogram",
+    ),
+    [
+        (1, (16, 16, 32, 64, 128, 128), True, True),
+        (1, (16, 16, 16, 64, 128, 128), False, True),
+        (2, (16, 16, 16, 64, 128, 128), True, True),
+    ],
+)
+def test_byte_v2_fused_single_token_staging_preflight_does_not_mutate(
+    key_tokens,
+    tile_policy,
+    fuse_metadata_clear,
+    warp_parallel_histogram,
+):
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_raw_staging"):
+        pytest.skip("ByteV2 native raw staging update op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    tensors = [
+        torch.zeros(key_tokens, 8, 128, dtype=torch.bfloat16, device="cuda"),
+        torch.zeros(key_tokens, 8, 128, dtype=torch.bfloat16, device="cuda"),
+        torch.zeros(
+            (1, staging_layout.slot_size_bytes),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        torch.zeros(
+            (1, layout.page_size_bytes),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        torch.zeros((1,), dtype=torch.int64, device="cuda"),
+        torch.full((1,), -1, dtype=torch.int32, device="cuda"),
+        torch.full((1,), -1, dtype=torch.int32, device="cuda"),
+        torch.zeros((1,), dtype=torch.int32, device="cuda"),
+        torch.zeros((1,), dtype=torch.int32, device="cuda"),
+        torch.zeros((1,), dtype=torch.int32, device="cuda"),
+        torch.zeros((1,), dtype=torch.int32, device="cuda"),
+    ]
+    snapshots = [tensor.clone() for tensor in tensors]
+
+    with pytest.raises(RuntimeError):
+        byte_v2_update_cache_raw_staging(
+            *tensors,
+            tile_policy=tile_policy,
+            fuse_metadata_clear=fuse_metadata_clear,
+            warp_parallel_histogram=warp_parallel_histogram,
+            fuse_single_token_staging=True,
+            fuse_single_token_commit_release=True,
+            fuse_single_token_stage_metadata_clear=True,
+        )
+    torch.accelerator.synchronize()
+
+    for tensor, snapshot in zip(tensors, snapshots):
+        torch.testing.assert_close(tensor, snapshot, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_fused_single_token_staging_cuda_graph_cross_page():
+    if not _has_torch_op("_C_cache_ops", "byte_v2_update_cache_raw_staging"):
+        pytest.skip("ByteV2 native raw staging update op is not registered")
+
+    layout = ByteV2PageLayoutV5()
+    staging_layout = ByteV2RawStagingLayout()
+    torch.manual_seed(20260719)
+    all_key = torch.randn(32, 8, 128, dtype=torch.bfloat16, device="cuda")
+    all_value = torch.randn_like(all_key)
+    all_slots = torch.arange(32, dtype=torch.int64, device="cuda")
+    reference_cache = torch.zeros(
+        (2, layout.page_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    byte_v2_reshape_and_cache(
+        all_key,
+        all_value,
+        reference_cache,
+        all_slots,
+        codec_token_block=16,
+        codec_dim_block=16,
+        alloc_block_tokens=16,
+    )
+
+    candidate_cache = torch.zeros_like(reference_cache)
+    key = torch.empty_like(all_key[:1])
+    value = torch.empty_like(all_value[:1])
+    slot_mapping = torch.full((1,), -1, dtype=torch.int64, device="cuda")
+    raw_staging = torch.empty(
+        (1, staging_layout.slot_size_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    block_to_slot = torch.full((2,), -1, dtype=torch.int32, device="cuda")
+    slot_to_block = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+    valid_rows = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    next_slot = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    overflow = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    flags = torch.zeros((2,), dtype=torch.int32, device="cuda")
+
+    def update():
+        byte_v2_update_cache_raw_staging(
+            key,
+            value,
+            raw_staging,
+            candidate_cache,
+            slot_mapping,
+            block_to_slot,
+            slot_to_block,
+            valid_rows,
+            next_slot,
+            overflow,
+            flags,
+            tile_policy=(16, 16, 16, 64, 128, 128),
+            fuse_metadata_clear=True,
+            warp_parallel_histogram=True,
+            fuse_single_token_staging=True,
+            fuse_single_token_commit_release=True,
+            fuse_single_token_stage_metadata_clear=True,
+        )
+
+    update()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        update()
+
+    for token_idx in range(32):
+        key.copy_(all_key[token_idx : token_idx + 1])
+        value.copy_(all_value[token_idx : token_idx + 1])
+        slot_mapping.fill_(token_idx)
+        graph.replay()
+    torch.accelerator.synchronize()
+
+    _assert_byte_v2_caches_decode_equal(
+        candidate_cache,
+        reference_cache,
+        layout,
+        num_tokens=32,
+    )
+    torch.testing.assert_close(block_to_slot, torch.full_like(block_to_slot, -1))
+    torch.testing.assert_close(slot_to_block, torch.full_like(slot_to_block, -1))
+    torch.testing.assert_close(valid_rows, torch.zeros_like(valid_rows))
+    torch.testing.assert_close(next_slot, torch.zeros_like(next_slot))
+    torch.testing.assert_close(overflow, torch.zeros_like(overflow))
+
+    completed_cache = candidate_cache.clone()
+    slot_mapping.fill_(-1)
+    graph.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(candidate_cache, completed_cache, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

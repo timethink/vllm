@@ -577,7 +577,9 @@ void byte_v2_update_cache_raw_staging(
     torch::stable::Tensor& valid_rows, torch::stable::Tensor& next_staging_slot,
     torch::stable::Tensor& overflow, torch::stable::Tensor& page_unsafe_flags,
     const std::vector<int64_t>& tile_policy, bool fuse_metadata_clear,
-    bool bypass_serial_metadata, bool warp_parallel_histogram);
+    bool bypass_serial_metadata, bool warp_parallel_histogram,
+    bool fuse_single_token_staging, bool fuse_single_token_commit_release,
+    bool fuse_single_token_stage_metadata_clear);
 
 void byte_v2_collect_cache_stats(torch::stable::Tensor& stats,
                                  torch::stable::Tensor& kv_cache,
