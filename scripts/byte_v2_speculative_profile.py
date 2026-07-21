@@ -92,6 +92,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help=(
+            "Generate exactly --max-tokens per request instead of treating "
+            "it only as an upper bound."
+        ),
+    )
+    parser.add_argument(
         "--capture-logprobs",
         type=int,
         default=0,
@@ -1169,6 +1177,20 @@ def _prompt_token_ids_sha256(prompt_token_ids: list[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _validate_exact_decode_lengths(
+    token_ids: list[list[int]],
+    *,
+    expected_tokens: int,
+    label: str,
+) -> None:
+    actual_lengths = [len(tokens) for tokens in token_ids]
+    if any(length != expected_tokens for length in actual_lengths):
+        raise RuntimeError(
+            f"{label} did not produce exactly {expected_tokens} tokens per "
+            f"request: {actual_lengths}"
+        )
+
+
 def _serialize_sample_logprobs(outputs) -> list[list[list[dict[str, Any]]]] | None:
     if not outputs or outputs[0].outputs[0].logprobs is None:
         return None
@@ -1333,6 +1355,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         max_tokens=args.max_tokens,
         temperature=0.0,
         logprobs=args.capture_logprobs or None,
+        ignore_eos=args.ignore_eos,
     )
     cache_fill_params = SamplingParams(max_tokens=1, temperature=0.0)
 
@@ -1390,6 +1413,12 @@ def _run_worker(args: argparse.Namespace) -> None:
                 prompts,
                 sampling_params,
             )
+            if args.ignore_eos:
+                _validate_exact_decode_lengths(
+                    token_ids,
+                    expected_tokens=args.max_tokens,
+                    label="measured generation",
+                )
             measured_metrics = _metric_diff(before, _metric_snapshot(llm))
             forced_raw_measured_reset = (
                 _reset_forced_raw_pages_through_runner(llm)
@@ -1423,6 +1452,12 @@ def _run_worker(args: argparse.Namespace) -> None:
                         verify_query_len=spec_tokens + 1,
                     )
                 )
+                if args.ignore_eos:
+                    _validate_exact_decode_lengths(
+                        profile_token_ids,
+                        expected_tokens=args.max_tokens,
+                        label="profile replay",
+                    )
             finally:
                 if profile_instrumentation_installed:
                     collector.restore()
@@ -1498,6 +1533,7 @@ def _run_worker(args: argparse.Namespace) -> None:
                 ),
                 "batch_size": args.batch_size,
                 "max_tokens": args.max_tokens,
+                "ignore_eos": args.ignore_eos,
                 "enforce_eager": args.enforce_eager,
                 "compile_size_specialization": (args.compile_size_specialization),
                 "performance_valid_for_tps": (
@@ -1604,6 +1640,8 @@ def _run_child(
             )
     if args.disable_prefix_caching:
         cmd.append("--disable-prefix-caching")
+    if args.ignore_eos:
+        cmd.append("--ignore-eos")
     if args.diagnose_outlier_pool:
         cmd.append("--diagnose-outlier-pool")
     if args.collect_hybrid_state:

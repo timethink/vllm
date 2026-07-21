@@ -314,6 +314,32 @@ def test_speculative_forced_raw_cli_is_explicit_and_diagnostic_only(monkeypatch)
     assert args.collect_hybrid_state is True
 
 
+def test_speculative_ignore_eos_cli_and_exact_length_validation(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "byte_v2_speculative_profile.py",
+            "--ignore-eos",
+        ],
+    )
+
+    args = byte_v2_speculative_profile.parse_args()
+
+    assert args.ignore_eos is True
+    byte_v2_speculative_profile._validate_exact_decode_lengths(
+        [[1, 2], [3, 4]],
+        expected_tokens=2,
+        label="test generation",
+    )
+    with pytest.raises(RuntimeError, match=r"test generation.*\[2, 1\]"):
+        byte_v2_speculative_profile._validate_exact_decode_lengths(
+            [[1, 2], [3]],
+            expected_tokens=2,
+            label="test generation",
+        )
+
+
 def test_speculative_prompt_hash_is_stable_and_order_sensitive():
     first = byte_v2_speculative_profile._prompt_token_ids_sha256([1, 2, 3])
     repeated = byte_v2_speculative_profile._prompt_token_ids_sha256([1, 2, 3])

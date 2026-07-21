@@ -2638,3 +2638,102 @@ capacity, the complete hybrid allocation is 4,985,575,100 bytes, or 19.8456%,
 smaller than raw BF16. This E2E result validates the current small-batch path
 against raw FA2; it does not isolate the adaptive-shard gain from the prior
 fixed-eight-CTA implementation.
+
+### Fixed Decode-Length and Batch Matrix
+
+The earlier ShareGPT runs treated `max_tokens` as an upper bound. In
+particular, the batch-8, 64-token workload generated
+`[64, 64, 64, 64, 64, 64, 34, 64]` tokens because one request stopped at EOS.
+That result measures a real stopping workload, but it also includes a dynamic
+batch shrink and is not a fixed decode-length comparison. The profiler now
+has an explicit `--ignore-eos` mode that fails closed unless every measured
+and replayed request produces exactly `max_tokens` tokens.
+
+The fixed-length matrix used compiled CUDA Graph execution, speculation
+disabled, prefix caching disabled, separate hybrid/raw engines, and three
+paired rounds ordered hybrid/raw, raw/hybrid, and hybrid/raw. The batch sizes
+were 1, 2, 4, and 8, and the decode lengths were 16, 64, and 256. Every batch
+uses a prefix of the same ShareGPT prompt set with lengths
+`[512, 768, 1024, 1279, 1506, 2072, 2925, 3796]`.
+
+All cells keep `max_model_len=max_num_batched_tokens=16,456`. Because the
+profiler derives this value as `context_len + max_tokens + 8`, the context
+caps are 16,432, 16,384, and 16,192 for decode lengths 16, 64, and 256. The
+caps only select the fixed prompts; they are not the actual prompt lengths.
+This avoids changing engine capacity, staging planning, or chunked-prefill
+behavior as decode length changes. The four batch subsets ran concurrently on
+four otherwise idle A40 GPUs, while every paired hybrid/raw cell stayed on the
+same GPU and executed back to back.
+
+The main result uses the median of the three per-round hybrid/raw TPS ratios;
+it does not divide two independently computed TPS medians:
+
+| Batch | Decode | Hybrid tok/s | Raw tok/s | Paired gap | Wall excess | Exact requests |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 32.720 | 34.064 | -3.9576% | +19.33 ms | 1/1 |
+| 1 | 64 | 36.115 | 37.235 | -2.8440% | +50.20 ms | 1/1 |
+| 1 | 256 | 36.933 | 37.839 | -2.3570% | +163.38 ms | 1/1 |
+| 2 | 16 | 49.627 | 51.496 | -3.6293% | +23.40 ms | 2/2 |
+| 2 | 64 | 60.568 | 62.342 | -2.8399% | +60.01 ms | 2/2 |
+| 2 | 256 | 64.042 | 65.707 | -2.5344% | +202.62 ms | 2/2 |
+| 4 | 16 | 70.405 | 74.726 | -5.7369% | +52.11 ms | 4/4 |
+| 4 | 64 | 116.806 | 122.738 | -4.8335% | +105.94 ms | 4/4 |
+| 4 | 256 | 139.687 | 146.173 | -4.4345% | +325.08 ms | 2/4 |
+| 8 | 16 | 48.279 | 52.357 | -7.5624% | +200.50 ms | 8/8 |
+| 8 | 64 | 118.138 | 126.745 | -6.7913% | +294.33 ms | 7/8 |
+| 8 | 256 | 184.493 | 196.298 | -5.9733% | +663.20 ms | 2/8 |
+
+The B2/D16 first round is a cold slow sample at -9.6531%; the other two
+rounds are -3.6293% and -3.5483%, so the all-round median remains stable.
+No sample was removed. All other cells have a per-round gap range narrower
+than 1.08 percentage points.
+
+An isolated fourth D64 round ran every batch sequentially on GPU 0 with raw
+before hybrid. It reports -2.9332%, -2.8650%, -4.2551%, and -6.9189% for
+batches 1, 2, 4, and 8. This same-GPU calibration reproduces the matrix trend
+and completes an ABBA backend-order check at the representative decode length.
+
+The absolute wall gap grows nearly linearly with decode length. A linear fit
+to wall excess versus requested decode steps gives incremental hybrid overhead
+of 0.597, 0.746, 1.139, and 1.926 ms per additional decode step for batches
+1, 2, 4, and 8. The independently measured writer excess accounts for about
+0%, 13%, 23%, and 29% of those slopes, respectively. The relative TPS gap
+narrows for longer generation because fixed prefill and graph overhead is
+amortized, but the absolute decode cost continues to accumulate. The writer
+therefore remains relevant at larger batches, but it is not the majority of
+the remaining E2E gap; Q1 compact decode/loading and the batch-8 fixed
+prefill/graph component remain the primary attribution targets.
+
+Every one of the 72 main-matrix rows and eight isolated-calibration rows has
+the requested output length, matching measured/profile-replay tokens, a valid
+TPS flag, and stable prompt hashes. All hybrid runs finish with `fatal=0`, no
+raw pages, and every sidecar slot free. At the measured plans, the complete
+hybrid allocation saves 20.085% to 20.088% at equal block capacity and exposes
+25.141% to 25.143% more blocks under the approximately fixed budget.
+
+Cross-backend token exactness has a separate qualification. Decode lengths 16
+and 64 are exact through batch 4. At batch 8 and length 64, request index 5
+first differs at generated-token offset 28, reproducing the previously known
+compiled near-tie. At length 256, batch 4 differs for request indices 1 and 2,
+first at offsets 232 and 104. Batch 8 differs for indices 1, 2, 4, 5, 6, and
+7, first at offsets 232, 104, 124, 28, 86, and 90. Each backend is internally
+identical across all three rounds, and each shorter output is an exact prefix
+of its longer output for the same backend. These are deterministic compiled
+cross-backend trajectory splits, not replay failure or run-to-run allocator
+nondeterminism. The longer continuation creates more opportunities for a
+small logits difference to cross a greedy decision boundary and then amplify
+autoregressively. The new data do not by themselves prove that every first
+split is a near-tie, so top-logprob or eager diagnostics are still required
+before attributing the later offsets as precisely as the known offset-28
+case.
+
+For performance, forcing generation beyond EOS is useful because both arms do
+identical work. It is not a claim about user-visible generation quality. The
+compiled token mismatches also mean this matrix cannot establish bitwise E2E
+losslessness, even though the direct cache and attention comparisons remain
+bitwise and the fixed-length performance samples are structurally valid.
+
+Artifacts:
+
+- `profile/byte-v2-e2e-batch-decode-matrix-a40-20260721/b{1,2,4,8}/r{1,2,3}_*.jsonl`
+- `profile/byte-v2-e2e-batch-decode-matrix-a40-20260721/b{1,2,4,8}/r4_*_d64_*.jsonl`
