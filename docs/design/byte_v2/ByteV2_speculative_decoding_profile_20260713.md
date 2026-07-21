@@ -2737,3 +2737,116 @@ Artifacts:
 
 - `profile/byte-v2-e2e-batch-decode-matrix-a40-20260721/b{1,2,4,8}/r{1,2,3}_*.jsonl`
 - `profile/byte-v2-e2e-batch-decode-matrix-a40-20260721/b{1,2,4,8}/r4_*_d64_*.jsonl`
+
+### Fixed-Budget Memory-Pressure Decode
+
+The fixed-length matrix above did not exercise the capacity advantage: its
+largest live request set was still well below the raw BF16 cache limit. The
+memory-pressure experiment therefore decouples the engine limit from each
+workload length and fixes the usable KV-cache budget directly. All runs use
+one A40, Llama-3.1-8B-Instruct in BF16, compiled CUDA Graph execution,
+speculation disabled, prefix caching disabled, exact decode lengths, and
+`max_model_len=max_num_batched_tokens=16,384`. The cache budget is exactly
+20,000,000,000 bytes for both backends. Long screening cells skip the
+instrumented replay so the clean workload is not executed twice.
+
+The resulting plans are:
+
+| Backend | Planned bytes | Blocks | Capacity tokens | Bytes/capacity token |
+| --- | ---: | ---: | ---: | ---: |
+| ByteV2 hybrid | 19,999,610,108 | 11,933 | 190,928 | 104,749.5 |
+| Raw BF16 FA2 | 19,998,441,472 | 9,536 | 152,576 | 131,072.0 |
+
+At the same approximately 20 GB budget, ByteV2 exposes 25.1363% more token
+capacity. Equivalently, its complete allocation, including the persistent raw
+sidecar and shared staging workspace, uses 20.0825% fewer bytes per unit of
+capacity. The peak demand below is computed per request as
+`ceil((prompt + output - 1) / 16)` blocks. The final sampled token has no
+subsequent forward pass and is therefore not resident in KV cache.
+
+The first sweep fixes batch 32 and a 4,096-token prompt, then increases the
+decode length across the raw-only and both-backends pressure boundaries:
+
+| Decode | Peak blocks | ByteV2 pressure / preempt | Raw pressure / preempt | ByteV2 tok/s | Raw tok/s | ByteV2/raw |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 8,704 | 0.7294 / 0 | 0.9128 / 0 | 173.742 | 233.394 | -25.5587% |
+| 1,024 | 10,240 | 0.8581 / 0 | 1.0738 / 3 | 256.594 | 334.570 | -23.3065% |
+| 1,536 | 11,264 | 0.9439 / 0 | 1.1812 / 5 | 279.684 | 375.256 | -25.4680% |
+| 2,048 | 12,288 | 1.0297 / 1 | 1.2886 / 8 | 264.089 | 319.630 | -17.3765% |
+
+Raw preemption increases monotonically and the relative gap narrows once both
+backends cross their capacity limits, but the current batch-32 ByteV2 path
+does not overtake raw even after avoiding three to five recomputations. The
+batch-32/decode-1,024 point was repeated in reverse backend order on the same
+GPU. It reports -23.9823%, versus -23.3065% in the forward order; ByteV2 and
+raw TPS individually change by only -0.5805% and +0.3033%. The large negative
+result is consequently not a backend-order artifact.
+
+The second sweep fixes total prompt tokens at 131,072, total output tokens at
+32,768, and padded peak demand at 10,240 blocks, while exchanging batch width
+for sequence length:
+
+| Batch | Prompt | Decode | ByteV2 tok/s / preempt | Raw tok/s / preempt | ByteV2/raw |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 8,192 | 2,048 | 220.610 / 0 | 190.705 / 2 | +15.6812% |
+| 32 | 4,096 | 1,024 | 256.594 / 0 | 334.570 / 3 | -23.3065% |
+| 64 | 2,048 | 512 | 437.289 / 0 | 554.604 / 5 | -21.1529% |
+| 128 | 1,024 | 256 | 689.543 / 0 | 833.568 / 9 | -17.2781% |
+
+The positive batch-16 result is repeatable. A same-GPU reverse-order run gives
+218.978 tok/s for ByteV2 and 190.778 tok/s for raw, or +14.7817%, while the
+wall time falls by 22.1195 seconds. Raw has two preemptions and ByteV2 has zero
+in both orders. Across the two observations, raw TPS changes by 0.0380% and
+ByteV2 TPS by -0.7399%. A same-shape batch-16/prompt-8,192/decode-256 control
+keeps both backends below capacity and reports 101.500 versus 113.463 tok/s,
+or -10.5434%. The transition from -10.54% without pressure to approximately
++15% under raw-only pressure demonstrates that the win comes from avoiding
+the raw capacity/recompute cliff, not from a generally faster ByteV2 kernel.
+
+One raw batch-32/prompt-4,096/decode-1,024 diagnostic retains the replay and
+samples scheduler state after every step. The measured counter, replay
+counter, and direct scheduler wrapper each record exactly three preemptions.
+They discard 14,732 already-computed KV tokens in total, reach 100% peak KV
+usage, and leave as many as 28 requests waiting for capacity. The replay
+records seven chunked-prefill steps and reproduces all measured tokens. This
+is direct evidence of KV release and recomputation rather than a conclusion
+drawn only from a static pressure ratio.
+
+The batch-shape discontinuity coincides with two code-level path changes that
+are the leading attribution candidates. The steady attention reader at batch
+32 is still the hybrid Q1 FA2 kernel; it does not fall back to the legacy
+paged-decode implementation. The cache writer, however, uses the cooperative
+small path only for at most 16 tokens/staging pages. Batch 16 launches 128
+hydrate CTAs, whereas batch 32 falls back to two generic owner CTAs that
+serially process roughly 16 candidate pages each. Independently, the
+inherited FA2 split heuristic crosses its A40 occupancy threshold between
+batch 16 and 17. Batch 16 normally uses a split kernel with the 48 KiB K/V
+alias and two resident CTAs per SM; batch 32 uses the approximately 80 KiB
+nonsplit kernel and one resident CTA per SM. The raw path sees the same split
+decision, but the ByteV2 loader's decode and metadata work makes lower
+residency a plausible backend-specific cost. Dedicated A/B experiments are
+still required to quantify each contribution.
+
+Every screening and confirmation request produces its exact requested length.
+All 16, 32, 64, and 128-request cross-backend comparisons are elementwise
+token-identical. Every hybrid run ends with all 32 layers initialized,
+`fatal=0`, no mapped raw pages, and all 1,472 sidecar slots free. These
+synthetic greedy results establish structural correctness for this matrix;
+they do not replace broad task-accuracy evaluation.
+
+The E2E conclusion is therefore conditional but useful: under the same memory
+budget, ByteV2's 25.14% capacity increase can become a stable approximately
+15% throughput win when raw crosses its KV limit, as demonstrated at batch 16
+with long sequences. It is not yet a general win at larger batches because
+the avoided recomputation is smaller than the observed ByteV2 overhead there.
+The next optimization should first measure a two-wave cooperative writer for
+batch 32, then test a nonsplit 48 KiB K/V-alias specialization that preserves
+the original FA2 reduction order. QK, softmax, PV, split reduction, and
+combine should remain unchanged.
+
+Artifacts:
+
+- `profile/byte-v2-memory-pressure-a40-20260721/capacity/`
+- `profile/byte-v2-memory-pressure-a40-20260721/screening/`
+- `profile/byte-v2-memory-pressure-a40-20260721/screening_confirm/`
+- `profile/byte-v2-memory-pressure-a40-20260721/diagnostic/`

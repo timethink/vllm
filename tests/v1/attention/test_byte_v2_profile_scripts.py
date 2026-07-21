@@ -171,6 +171,8 @@ def test_collect_speculative_profile_kv_cache_plan():
     assert result == {
         "available": True,
         "num_blocks": 512,
+        "block_size": 16,
+        "capacity_tokens": 8192,
         "compact_tensor_bytes": 300,
         "raw_fallback_sidecar_bytes": 30,
         "raw_staging_workspace_bytes": 40,
@@ -178,6 +180,111 @@ def test_collect_speculative_profile_kv_cache_plan():
         "num_byte_v2_layers": 2,
         "raw_fallback_slots_per_layer": 3,
         "raw_staging_slots": 128,
+    }
+
+
+def test_speculative_profile_engine_limits_and_kv_demand():
+    args = SimpleNamespace(
+        context_lens=[4096],
+        max_tokens=1024,
+        engine_max_model_len=16384,
+        max_num_batched_tokens=8192,
+    )
+
+    assert byte_v2_speculative_profile._resolve_engine_limits(args, 0) == (
+        16384,
+        8192,
+    )
+    demand = byte_v2_speculative_profile._workload_kv_demand(
+        [[1] * 16, [2] * 32],
+        [[3] * 17, [4]],
+        {"block_size": 16, "num_blocks": 5},
+    )
+    assert demand == {
+        "logical_prompt_tokens": 48,
+        "logical_output_tokens": 18,
+        "peak_resident_kv_tokens": 64,
+        "peak_resident_kv_blocks": 4,
+        "planned_kv_blocks": 5,
+        "block_size": 16,
+        "pressure_ratio": 0.8,
+    }
+
+    args.engine_max_model_len = 5000
+    with pytest.raises(ValueError, match="smaller than the requested"):
+        byte_v2_speculative_profile._resolve_engine_limits(args, 0)
+
+
+def test_speculative_profile_scheduler_trace():
+    preempt_calls = []
+
+    def preempt(request, timestamp):
+        preempt_calls.append((request.request_id, timestamp))
+
+    scheduler = SimpleNamespace(
+        _preempt_request=preempt,
+        running=[
+            SimpleNamespace(request_id="0", is_prefill_chunk=True),
+            SimpleNamespace(request_id="1", is_prefill_chunk=False),
+        ],
+        waiting=[object(), object(), object()],
+        skipped_waiting=[object()],
+        kv_cache_manager=SimpleNamespace(usage=0.75),
+    )
+    llm = SimpleNamespace(
+        llm_engine=SimpleNamespace(
+            engine_core=SimpleNamespace(
+                engine_core=SimpleNamespace(scheduler=scheduler)
+            )
+        )
+    )
+    trace = byte_v2_speculative_profile.SchedulerTrace()
+    trace.install(llm)
+    trace.observe()
+    request = SimpleNamespace(request_id="1", num_computed_tokens=123)
+    scheduler._preempt_request(request, 4.0)
+    trace.restore()
+
+    assert preempt_calls == [("1", 4.0)]
+    assert scheduler._preempt_request is preempt
+    assert trace.result() == {
+        "available": True,
+        "peak_running_requests": 2,
+        "peak_waiting_capacity_requests": 3,
+        "peak_waiting_deferred_requests": 1,
+        "peak_kv_cache_usage": 0.75,
+        "steps_with_chunked_prefill": 1,
+        "prefill_chunk_request_steps": 1,
+        "preemption_count": 1,
+        "discarded_kv_tokens": 123,
+        "preempted_request_count": 1,
+        "preempted_request_ids": ["1"],
+    }
+
+
+def test_speculative_profile_scheduler_counter_snapshot():
+    llm = SimpleNamespace(
+        get_metrics=lambda: [
+            SimpleNamespace(name="vllm:num_preemptions", value=3),
+            SimpleNamespace(name="vllm:prompt_tokens", value=100),
+            SimpleNamespace(name="vllm:generation_tokens", value=20),
+            SimpleNamespace(name="vllm:kv_cache_usage_perc", value=0.9),
+            SimpleNamespace(name="vllm:spec_decode_num_drafts", value=4),
+        ]
+    )
+
+    snapshot = byte_v2_speculative_profile._metric_snapshot(llm)
+
+    assert snapshot == {
+        "vllm:num_preemptions": 3,
+        "vllm:prompt_tokens": 100,
+        "vllm:generation_tokens": 20,
+        "vllm:spec_decode_num_drafts": 4,
+    }
+    assert byte_v2_speculative_profile._scheduler_counter_result(snapshot) == {
+        "generation_tokens": 20.0,
+        "num_preemptions": 3.0,
+        "prompt_tokens": 100.0,
     }
 
 
@@ -338,6 +445,30 @@ def test_speculative_ignore_eos_cli_and_exact_length_validation(monkeypatch):
             expected_tokens=2,
             label="test generation",
         )
+
+
+def test_speculative_memory_pressure_cli(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "byte_v2_speculative_profile.py",
+            "--engine-max-model-len",
+            "16384",
+            "--max-num-batched-tokens",
+            "8192",
+            "--kv-cache-memory-bytes",
+            "20000000000",
+            "--e2e-only",
+        ],
+    )
+
+    args = byte_v2_speculative_profile.parse_args()
+
+    assert args.engine_max_model_len == 16384
+    assert args.max_num_batched_tokens == 8192
+    assert args.kv_cache_memory_bytes == 20_000_000_000
+    assert args.e2e_only is True
 
 
 def test_speculative_prompt_hash_is_stable_and_order_sensitive():

@@ -54,6 +54,14 @@ _BYTE_V2_PROFILE_OP_NAMES = (
     "byte_v2_speculative_verify_ragged_q4",
 )
 
+_SCHEDULER_COUNTER_METRICS = frozenset(
+    {
+        "vllm:num_preemptions",
+        "vllm:prompt_tokens",
+        "vllm:generation_tokens",
+    }
+)
+
 
 def _prepend_venv_bin_to_path() -> None:
     repo_root = Path(__file__).resolve().parents[1]
@@ -92,11 +100,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument(
+        "--engine-max-model-len",
+        type=int,
+        help=(
+            "Set the engine sequence limit independently of prompt and decode "
+            "lengths. The default remains max(context)+max_tokens+spec+8."
+        ),
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        help=(
+            "Set the scheduler token budget independently of max_model_len. "
+            "The default remains max_model_len."
+        ),
+    )
+    parser.add_argument(
+        "--kv-cache-memory-bytes",
+        type=int,
+        help=(
+            "Use an exact per-GPU KV-cache byte budget instead of deriving it "
+            "from --gpu-memory-utilization."
+        ),
+    )
+    parser.add_argument(
         "--ignore-eos",
         action="store_true",
         help=(
             "Generate exactly --max-tokens per request instead of treating "
             "it only as an upper bound."
+        ),
+    )
+    parser.add_argument(
+        "--e2e-only",
+        action="store_true",
+        help=(
+            "Skip the instrumented full-generation replay. This keeps the "
+            "clean E2E measurement and is useful for very large workloads."
         ),
     )
     parser.add_argument(
@@ -192,6 +232,18 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.compile_size_specialization and args.enforce_eager:
         parser.error("--compile-size-specialization requires --no-enforce-eager")
+    for name in (
+        "engine_max_model_len",
+        "max_num_batched_tokens",
+        "kv_cache_memory_bytes",
+    ):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.e2e_only and (
+        args.diagnose_outlier_pool or args.diagnose_forced_raw_lifecycle
+    ):
+        parser.error("--e2e-only cannot be combined with replay-dependent diagnostics")
     if not 0 <= args.capture_logprobs <= 20:
         parser.error("--capture-logprobs must be between 0 and 20")
     if args.diagnose_forced_raw_lifecycle:
@@ -991,9 +1043,18 @@ def _collect_kv_cache_plan(llm) -> dict[str, Any]:
     )
     sidecar_bytes = int(getattr(config, "byte_v2_raw_fallback_sidecar_bytes", 0))
     workspace_bytes = int(getattr(config, "byte_v2_raw_staging_workspace_bytes", 0))
+    block_size = int(
+        getattr(
+            getattr(getattr(model_runner, "vllm_config", None), "cache_config", None),
+            "block_size",
+            16,
+        )
+    )
     return {
         "available": True,
         "num_blocks": int(config.num_blocks),
+        "block_size": block_size,
+        "capacity_tokens": int(config.num_blocks) * block_size,
         "compact_tensor_bytes": compact_tensor_bytes,
         "raw_fallback_sidecar_bytes": sidecar_bytes,
         "raw_staging_workspace_bytes": workspace_bytes,
@@ -1003,6 +1064,33 @@ def _collect_kv_cache_plan(llm) -> dict[str, Any]:
             getattr(config, "byte_v2_raw_fallback_slots", 0)
         ),
         "raw_staging_slots": int(getattr(config, "byte_v2_raw_staging_slots", 0)),
+    }
+
+
+def _workload_kv_demand(
+    prompt_token_ids: list[list[int]],
+    token_ids: list[list[int]],
+    kv_cache_plan: dict[str, Any],
+) -> dict[str, Any]:
+    block_size = int(kv_cache_plan.get("block_size", 16))
+    resident_lengths = [
+        len(prompt) + max(len(output) - 1, 0)
+        for prompt, output in zip(prompt_token_ids, token_ids)
+    ]
+    resident_blocks = sum(
+        (length + block_size - 1) // block_size for length in resident_lengths
+    )
+    planned_blocks = kv_cache_plan.get("num_blocks")
+    return {
+        "logical_prompt_tokens": sum(map(len, prompt_token_ids)),
+        "logical_output_tokens": sum(map(len, token_ids)),
+        "peak_resident_kv_tokens": sum(resident_lengths),
+        "peak_resident_kv_blocks": resident_blocks,
+        "planned_kv_blocks": planned_blocks,
+        "block_size": block_size,
+        "pressure_ratio": (
+            resident_blocks / planned_blocks if planned_blocks else None
+        ),
     }
 
 
@@ -1108,10 +1196,31 @@ def _make_sharegpt_prompt_token_ids(
     return [prompt_ids for _, prompt_ids in candidates[:num_requests]]
 
 
+def _resolve_engine_limits(
+    args: argparse.Namespace,
+    spec_tokens: int,
+) -> tuple[int, int]:
+    required_sequence_len = max(args.context_lens) + args.max_tokens + spec_tokens
+    max_model_len = args.engine_max_model_len
+    if max_model_len is None:
+        max_model_len = required_sequence_len + 8
+    elif max_model_len < required_sequence_len:
+        raise ValueError(
+            "--engine-max-model-len is smaller than the requested prompt, "
+            f"decode, and speculative-token demand: {max_model_len} < "
+            f"{required_sequence_len}"
+        )
+    max_num_batched_tokens = args.max_num_batched_tokens or max_model_len
+    return max_model_len, max_num_batched_tokens
+
+
 def _build_llm(args: argparse.Namespace, backend: str, spec_tokens: int):
     from vllm import LLM
 
-    max_model_len = max(args.context_lens) + args.max_tokens + spec_tokens + 8
+    max_model_len, max_num_batched_tokens = _resolve_engine_limits(
+        args,
+        spec_tokens,
+    )
     attention_backend = "BYTE_V2" if backend == "byte_v2" else "FLASH_ATTN"
     speculative_config = None
     if spec_tokens > 0:
@@ -1129,8 +1238,9 @@ def _build_llm(args: argparse.Namespace, backend: str, spec_tokens: int):
         dtype="bfloat16",
         enforce_eager=args.enforce_eager,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         max_model_len=max_model_len,
-        max_num_batched_tokens=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=args.batch_size,
         block_size=16,
         enable_prefix_caching=not args.disable_prefix_caching,
@@ -1144,7 +1254,10 @@ def _build_llm(args: argparse.Namespace, backend: str, spec_tokens: int):
 def _metric_snapshot(llm) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for metric in llm.get_metrics():
-        if not metric.name.startswith("vllm:spec_decode_"):
+        if (
+            not metric.name.startswith("vllm:spec_decode_")
+            and metric.name not in _SCHEDULER_COUNTER_METRICS
+        ):
             continue
         value = getattr(metric, "value", None)
         if value is not None:
@@ -1154,6 +1267,13 @@ def _metric_snapshot(llm) -> dict[str, Any]:
         if values is not None:
             result[metric.name] = list(values)
     return result
+
+
+def _scheduler_counter_result(metrics: dict[str, Any]) -> dict[str, float]:
+    return {
+        name.removeprefix("vllm:"): float(metrics.get(name, 0))
+        for name in sorted(_SCHEDULER_COUNTER_METRICS)
+    }
 
 
 def _metric_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
@@ -1216,6 +1336,36 @@ def _serialize_sample_logprobs(outputs) -> list[list[list[dict[str, Any]]]] | No
     return serialized
 
 
+def _serialize_request_metrics(outputs) -> list[dict[str, Any]]:
+    result = []
+    for output in outputs:
+        metrics = output.metrics
+        result.append(
+            {
+                "request_id": str(output.request_id),
+                "first_token_latency": (
+                    float(metrics.first_token_latency) if metrics else None
+                ),
+                "queue_seconds": (
+                    float(metrics.scheduled_ts - metrics.queued_ts)
+                    if metrics and metrics.scheduled_ts and metrics.queued_ts
+                    else None
+                ),
+                "decode_seconds": (
+                    float(metrics.last_token_ts - metrics.first_token_ts)
+                    if metrics and metrics.last_token_ts and metrics.first_token_ts
+                    else None
+                ),
+                "engine_e2e_seconds": (
+                    float(metrics.last_token_ts - metrics.queued_ts)
+                    if metrics and metrics.last_token_ts and metrics.queued_ts
+                    else None
+                ),
+            }
+        )
+    return result
+
+
 def _run_generate(
     llm,
     prompts,
@@ -1224,6 +1374,7 @@ def _run_generate(
     float,
     list[list[int]],
     list[list[list[dict[str, Any]]]] | None,
+    list[dict[str, Any]],
 ]:
     import torch
 
@@ -1233,7 +1384,95 @@ def _run_generate(
     torch.accelerator.synchronize()
     elapsed = time.perf_counter() - start
     token_ids = [list(output.outputs[0].token_ids) for output in outputs]
-    return elapsed, token_ids, _serialize_sample_logprobs(outputs)
+    return (
+        elapsed,
+        token_ids,
+        _serialize_sample_logprobs(outputs),
+        _serialize_request_metrics(outputs),
+    )
+
+
+@dataclass
+class SchedulerTrace:
+    available: bool = False
+    peak_running_requests: int = 0
+    peak_waiting_capacity_requests: int = 0
+    peak_waiting_deferred_requests: int = 0
+    peak_kv_cache_usage: float = 0.0
+    steps_with_chunked_prefill: int = 0
+    prefill_chunk_request_steps: int = 0
+    preemption_count: int = 0
+    discarded_kv_tokens: int = 0
+    preempted_request_ids: set[str] = field(default_factory=set)
+    _scheduler: Any = None
+    _original_preempt: Callable | None = None
+
+    def install(self, llm) -> None:
+        engine = getattr(llm, "llm_engine", None)
+        core_client = getattr(engine, "engine_core", None)
+        engine_core = getattr(core_client, "engine_core", None)
+        scheduler = getattr(engine_core, "scheduler", None)
+        if scheduler is None:
+            return
+        self.available = True
+        self._scheduler = scheduler
+        self._original_preempt = scheduler._preempt_request
+
+        def wrapped_preempt(request, timestamp):
+            self.preemption_count += 1
+            self.discarded_kv_tokens += int(request.num_computed_tokens)
+            self.preempted_request_ids.add(str(request.request_id))
+            assert self._original_preempt is not None
+            return self._original_preempt(request, timestamp)
+
+        scheduler._preempt_request = wrapped_preempt
+
+    def observe(self) -> None:
+        if not self.available:
+            return
+        scheduler = self._scheduler
+        running = list(scheduler.running)
+        chunk_requests = sum(request.is_prefill_chunk for request in running)
+        self.peak_running_requests = max(
+            self.peak_running_requests,
+            len(running),
+        )
+        self.peak_waiting_capacity_requests = max(
+            self.peak_waiting_capacity_requests,
+            len(scheduler.waiting),
+        )
+        self.peak_waiting_deferred_requests = max(
+            self.peak_waiting_deferred_requests,
+            len(scheduler.skipped_waiting),
+        )
+        self.peak_kv_cache_usage = max(
+            self.peak_kv_cache_usage,
+            float(scheduler.kv_cache_manager.usage),
+        )
+        if chunk_requests:
+            self.steps_with_chunked_prefill += 1
+            self.prefill_chunk_request_steps += chunk_requests
+
+    def restore(self) -> None:
+        if self._scheduler is not None and self._original_preempt is not None:
+            self._scheduler._preempt_request = self._original_preempt
+        self._scheduler = None
+        self._original_preempt = None
+
+    def result(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "peak_running_requests": self.peak_running_requests,
+            "peak_waiting_capacity_requests": (self.peak_waiting_capacity_requests),
+            "peak_waiting_deferred_requests": (self.peak_waiting_deferred_requests),
+            "peak_kv_cache_usage": self.peak_kv_cache_usage,
+            "steps_with_chunked_prefill": self.steps_with_chunked_prefill,
+            "prefill_chunk_request_steps": self.prefill_chunk_request_steps,
+            "preemption_count": self.preemption_count,
+            "discarded_kv_tokens": self.discarded_kv_tokens,
+            "preempted_request_count": len(self.preempted_request_ids),
+            "preempted_request_ids": sorted(self.preempted_request_ids),
+        }
 
 
 def _run_generate_step_profile(
@@ -1281,6 +1520,8 @@ def _run_generate_step_profile(
         )
 
     collector.reset()
+    scheduler_trace = SchedulerTrace()
+    scheduler_trace.install(llm)
     collector.enabled = True
     try:
         while llm.llm_engine.has_unfinished_requests():
@@ -1292,6 +1533,7 @@ def _run_generate_step_profile(
             step_outputs = llm.llm_engine.step()
             torch.accelerator.synchronize()
             step_seconds = time.perf_counter() - step_start
+            scheduler_trace.observe()
             total_seconds += step_seconds
             outputs.extend(output for output in step_outputs if output.finished)
 
@@ -1311,6 +1553,7 @@ def _run_generate_step_profile(
                         other_query_labels[label] += 1
     finally:
         collector.enabled = False
+        scheduler_trace.restore()
 
     outputs.sort(key=lambda output: int(output.request_id))
     token_ids = [list(output.outputs[0].token_ids) for output in outputs]
@@ -1323,6 +1566,7 @@ def _run_generate_step_profile(
             "other_steps": other_steps,
             "other_wall_seconds": other_seconds,
             "other_query_labels": dict(sorted(other_query_labels.items())),
+            "scheduler_trace": scheduler_trace.result(),
         },
     )
 
@@ -1385,7 +1629,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             ]
 
             if args.disable_prefix_caching:
-                warmup_seconds, _, _ = _run_generate(
+                warmup_seconds, _, _, _ = _run_generate(
                     llm,
                     prompts,
                     cache_fill_params,
@@ -1393,7 +1637,7 @@ def _run_worker(args: argparse.Namespace) -> None:
             else:
                 warmup_seconds = 0.0
                 for prompt in prompts:
-                    prompt_seconds, _, _ = _run_generate(
+                    prompt_seconds, _, _, _ = _run_generate(
                         llm,
                         [prompt],
                         cache_fill_params,
@@ -1408,11 +1652,12 @@ def _run_worker(args: argparse.Namespace) -> None:
                     arm=True,
                 )
             before = _metric_snapshot(llm)
-            measured_seconds, token_ids, sample_logprobs = _run_generate(
-                llm,
-                prompts,
-                sampling_params,
-            )
+            (
+                measured_seconds,
+                token_ids,
+                sample_logprobs,
+                request_metrics,
+            ) = _run_generate(llm, prompts, sampling_params)
             if args.ignore_eos:
                 _validate_exact_decode_lengths(
                     token_ids,
@@ -1431,50 +1676,58 @@ def _run_worker(args: argparse.Namespace) -> None:
                 else None
             )
 
-            profile_instrumentation_installed = False
-            if not args.diagnose_outlier_pool:
-                collector.install(args.backend)
-                profile_instrumentation_installed = True
-            try:
-                forced_raw_profile_armed = (
-                    _control_forced_raw_diagnostic(llm, arm=True)
+            profile_seconds = None
+            profile_token_ids = None
+            step_profile = None
+            profile_metrics: dict[str, Any] = {}
+            forced_raw_profile_armed = None
+            forced_raw_profile_reset = None
+            forced_raw_profile_completed = None
+            if not args.e2e_only:
+                profile_instrumentation_installed = False
+                if not args.diagnose_outlier_pool:
+                    collector.install(args.backend)
+                    profile_instrumentation_installed = True
+                try:
+                    forced_raw_profile_armed = (
+                        _control_forced_raw_diagnostic(llm, arm=True)
+                        if args.diagnose_forced_raw_lifecycle
+                        else None
+                    )
+                    profile_metrics_before = _metric_snapshot(llm)
+                    profile_seconds, profile_token_ids, step_profile = (
+                        _run_generate_step_profile(
+                            llm,
+                            prompts,
+                            sampling_params,
+                            collector,
+                            backend=args.backend,
+                            verify_query_len=spec_tokens + 1,
+                        )
+                    )
+                    if args.ignore_eos:
+                        _validate_exact_decode_lengths(
+                            profile_token_ids,
+                            expected_tokens=args.max_tokens,
+                            label="profile replay",
+                        )
+                finally:
+                    if profile_instrumentation_installed:
+                        collector.restore()
+                profile_metrics = _metric_diff(
+                    profile_metrics_before,
+                    _metric_snapshot(llm),
+                )
+                forced_raw_profile_reset = (
+                    _reset_forced_raw_pages_through_runner(llm)
                     if args.diagnose_forced_raw_lifecycle
                     else None
                 )
-                profile_metrics_before = _metric_snapshot(llm)
-                profile_seconds, profile_token_ids, step_profile = (
-                    _run_generate_step_profile(
-                        llm,
-                        prompts,
-                        sampling_params,
-                        collector,
-                        backend=args.backend,
-                        verify_query_len=spec_tokens + 1,
-                    )
+                forced_raw_profile_completed = (
+                    _collect_hybrid_raw_fallback_state(llm)
+                    if args.diagnose_forced_raw_lifecycle
+                    else None
                 )
-                if args.ignore_eos:
-                    _validate_exact_decode_lengths(
-                        profile_token_ids,
-                        expected_tokens=args.max_tokens,
-                        label="profile replay",
-                    )
-            finally:
-                if profile_instrumentation_installed:
-                    collector.restore()
-            profile_metrics = _metric_diff(
-                profile_metrics_before,
-                _metric_snapshot(llm),
-            )
-            forced_raw_profile_reset = (
-                _reset_forced_raw_pages_through_runner(llm)
-                if args.diagnose_forced_raw_lifecycle
-                else None
-            )
-            forced_raw_profile_completed = (
-                _collect_hybrid_raw_fallback_state(llm)
-                if args.diagnose_forced_raw_lifecycle
-                else None
-            )
             forced_raw_lifecycle = None
             if args.diagnose_forced_raw_lifecycle:
                 assert forced_raw_measured_armed is not None
@@ -1506,15 +1759,26 @@ def _run_worker(args: argparse.Namespace) -> None:
                         "ByteV2 forced raw lifecycle diagnostic did not "
                         f"verify: {forced_raw_lifecycle}"
                     )
-            steady_tokens = profile_metrics.get("vllm:spec_decode_num_drafts", 0)
-            steady_tokens += profile_metrics.get(
-                "vllm:spec_decode_num_accepted_tokens", 0
+            if step_profile is not None:
+                steady_tokens = profile_metrics.get(
+                    "vllm:spec_decode_num_drafts",
+                    0,
+                )
+                steady_tokens += profile_metrics.get(
+                    "vllm:spec_decode_num_accepted_tokens",
+                    0,
+                )
+                verify_seconds = step_profile["verify_wall_seconds"]
+                step_profile["steady_output_tokens"] = steady_tokens
+                step_profile["steady_output_tokens_per_second"] = (
+                    steady_tokens / verify_seconds if verify_seconds > 0 else None
+                )
+
+            max_model_len, max_num_batched_tokens = _resolve_engine_limits(
+                args,
+                spec_tokens,
             )
-            verify_seconds = step_profile["verify_wall_seconds"]
-            step_profile["steady_output_tokens"] = steady_tokens
-            step_profile["steady_output_tokens_per_second"] = (
-                steady_tokens / verify_seconds if verify_seconds > 0 else None
-            )
+            kv_cache_plan = _collect_kv_cache_plan(llm)
 
             result = {
                 "backend": args.backend,
@@ -1534,6 +1798,10 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "batch_size": args.batch_size,
                 "max_tokens": args.max_tokens,
                 "ignore_eos": args.ignore_eos,
+                "engine_max_model_len": max_model_len,
+                "max_num_batched_tokens": max_num_batched_tokens,
+                "kv_cache_memory_bytes": args.kv_cache_memory_bytes,
+                "profile_replay_enabled": not args.e2e_only,
                 "enforce_eager": args.enforce_eager,
                 "compile_size_specialization": (args.compile_size_specialization),
                 "performance_valid_for_tps": (
@@ -1550,8 +1818,19 @@ def _run_worker(args: argparse.Namespace) -> None:
                 ),
                 "token_ids": token_ids,
                 "sample_logprobs": sample_logprobs,
-                "profile_token_ids_match": token_ids == profile_token_ids,
+                "request_metrics": request_metrics,
+                "profile_token_ids_match": (
+                    token_ids == profile_token_ids
+                    if profile_token_ids is not None
+                    else None
+                ),
                 "spec_metrics": measured_metrics,
+                "measured_scheduler_counters": _scheduler_counter_result(
+                    measured_metrics
+                ),
+                "profile_scheduler_counters": _scheduler_counter_result(
+                    profile_metrics
+                ),
                 "profile_ops": collector.result(),
                 "byte_v2_prefill_patterns": collector.byte_v2_pattern_result(),
                 "byte_v2_prefill_shapes": collector.byte_v2_shape_result(),
@@ -1559,7 +1838,12 @@ def _run_worker(args: argparse.Namespace) -> None:
                 "outlier_pool_diagnostic": (
                     pool_diagnostic.result() if pool_diagnostic is not None else None
                 ),
-                "kv_cache_plan": _collect_kv_cache_plan(llm),
+                "kv_cache_plan": kv_cache_plan,
+                "workload_kv_demand": _workload_kv_demand(
+                    prompt_token_ids,
+                    token_ids,
+                    kv_cache_plan,
+                ),
                 "hybrid_raw_fallback_state": (
                     forced_raw_profile_completed
                     if args.diagnose_forced_raw_lifecycle
@@ -1626,6 +1910,12 @@ def _run_child(
         "--prompt-lookup-max",
         str(args.prompt_lookup_max),
     ]
+    if args.engine_max_model_len is not None:
+        cmd.extend(["--engine-max-model-len", str(args.engine_max_model_len)])
+    if args.max_num_batched_tokens is not None:
+        cmd.extend(["--max-num-batched-tokens", str(args.max_num_batched_tokens)])
+    if args.kv_cache_memory_bytes is not None:
+        cmd.extend(["--kv-cache-memory-bytes", str(args.kv_cache_memory_bytes)])
     if args.capture_logprobs:
         cmd.extend(["--capture-logprobs", str(args.capture_logprobs)])
     if args.sharegpt_rows_dir:
@@ -1642,6 +1932,8 @@ def _run_child(
         cmd.append("--disable-prefix-caching")
     if args.ignore_eos:
         cmd.append("--ignore-eos")
+    if args.e2e_only:
+        cmd.append("--e2e-only")
     if args.diagnose_outlier_pool:
         cmd.append("--diagnose-outlier-pool")
     if args.collect_hybrid_state:
