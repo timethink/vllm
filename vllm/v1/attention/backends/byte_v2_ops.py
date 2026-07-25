@@ -122,6 +122,17 @@ def byte_v2_hybrid_cache_update_is_available() -> bool:
     )
 
 
+def byte_v2_hybrid_raw_tail_q1_is_available() -> bool:
+    """Return whether the optional persistent raw-tail Q1 op is registered."""
+    return (
+        _find_op(
+            "_C_cache_ops",
+            "byte_v2_update_hybrid_cache_raw_tail_q1",
+        )
+        is not None
+    )
+
+
 def byte_v2_test_forced_raw_promotion_is_available() -> bool:
     """Return whether the test-only forced raw-promotion op is registered."""
     return (
@@ -530,6 +541,52 @@ def byte_v2_update_hybrid_cache_raw_staging_q1(
     )
 
 
+def byte_v2_update_hybrid_cache_raw_tail_q1(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    raw_staging: torch.Tensor,
+    kv_cache: torch.Tensor,
+    persistent_raw_staging: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_to_staging_slot: torch.Tensor,
+    staging_to_physical_block: torch.Tensor,
+    valid_rows: torch.Tensor,
+    next_staging_slot: torch.Tensor,
+    overflow: torch.Tensor,
+    page_to_raw_slot: torch.Tensor,
+    free_raw_slots: torch.Tensor,
+    free_raw_slot_count: torch.Tensor,
+    raw_pool_overflow: torch.Tensor,
+    *,
+    tile_policy: Sequence[int],
+    page_unsafe_flags: torch.Tensor | None = None,
+) -> None:
+    """Append Q1 to a raw tail and seal a full page on the current CUDA stream.
+
+    Update and attention must stay ordered on that stream; this experimental
+    path does not synchronize concurrent cache readers on other streams.
+    """
+    _require_op("_C_cache_ops", "byte_v2_update_hybrid_cache_raw_tail_q1")(
+        key,
+        value,
+        raw_staging,
+        kv_cache,
+        persistent_raw_staging,
+        slot_mapping,
+        block_to_staging_slot,
+        staging_to_physical_block,
+        valid_rows,
+        next_staging_slot,
+        overflow,
+        page_to_raw_slot,
+        free_raw_slots,
+        free_raw_slot_count,
+        raw_pool_overflow,
+        list(tile_policy),
+        page_unsafe_flags,
+    )
+
+
 def byte_v2_update_hybrid_cache_raw_staging_multi_token(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -769,6 +826,7 @@ def byte_v2_fa2_raw_staging_prefill_attention(
     max_query_len: int,
     max_seq_len: int,
     causal: bool,
+    block_tables_are_staging_slots: bool = False,
 ) -> None:
     """Run original raw paged FA2 directly over exact staging pages."""
     expected_slot_bytes = 2 * 2 * num_kv_heads * block_size * head_dim
@@ -791,7 +849,11 @@ def byte_v2_fa2_raw_staging_prefill_attention(
     )
     key_cache = raw_kv[:, 0].permute(0, 2, 1, 3)
     value_cache = raw_kv[:, 1].permute(0, 2, 1, 3)
-    staging_block_tables = block_to_staging_slot[block_tables]
+    staging_block_tables = (
+        block_tables
+        if block_tables_are_staging_slots
+        else block_to_staging_slot[block_tables]
+    )
     _require_fa2_op("varlen_fwd")(
         query,
         key_cache,
@@ -804,6 +866,82 @@ def byte_v2_fa2_raw_staging_prefill_attention(
         staging_block_tables,
         None,
         max_query_len,
+        max_seq_len,
+        0.0,
+        scale,
+        False,
+        causal,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+
+
+def byte_v2_fa2_direct_paged_prefill_attention(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_pages: torch.Tensor,
+    value_pages: torch.Tensor,
+    query_start_locs: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    scale: float,
+    max_query_len: int,
+    max_seq_len: int,
+    causal: bool,
+    preserve_mixed_dispatch: bool = False,
+) -> None:
+    """Run raw paged FA2 over zero-copy views of current BF16 K/V."""
+
+    def is_supported_page_view(pages: torch.Tensor) -> bool:
+        if (
+            pages.dtype != torch.bfloat16
+            or pages.ndim != 4
+            or pages.shape[0] <= 0
+            or pages.shape[1:] != (16, 8, 128)
+        ):
+            return False
+        page_stride, row_stride, head_stride, dim_stride = pages.stride()
+        return (
+            dim_stride == 1
+            and head_stride == 128
+            and row_stride >= 8 * 128
+            and page_stride == 16 * row_stride
+        )
+
+    if (
+        value_pages.shape != key_pages.shape
+        or not is_supported_page_view(key_pages)
+        or not is_supported_page_view(value_pages)
+    ):
+        raise ValueError(
+            "ByteV2 direct prefill K/V must be row-strided BF16 pages with "
+            "shape (num_pages, 16, 8, 128) and contiguous head dimensions"
+        )
+    if preserve_mixed_dispatch and (not causal or max_query_len <= 0):
+        raise ValueError(
+            "Preserving mixed raw FA2 dispatch requires causal attention and "
+            "a positive maximum query length"
+        )
+    dispatch_max_query_len = (
+        max(max_query_len, 2) if preserve_mixed_dispatch else max_query_len
+    )
+    _require_fa2_op("varlen_fwd")(
+        query,
+        key_pages,
+        value_pages,
+        output,
+        query_start_locs,
+        query_start_locs,
+        seq_lens,
+        None,
+        block_tables,
+        None,
+        dispatch_max_query_len,
         max_seq_len,
         0.0,
         scale,
@@ -832,8 +970,17 @@ def byte_v2_fa2_hybrid_paged_decode_attention(
     max_query_len: int,
     max_seq_len: int,
     causal: bool,
+    preserve_mixed_dispatch: bool = False,
 ) -> None:
     """Run FA2 over mixed compact and authoritative raw pages."""
+    if preserve_mixed_dispatch and (not causal or max_query_len <= 0):
+        raise ValueError(
+            "Preserving mixed ByteV2 dispatch requires causal attention and "
+            "a positive maximum query length"
+        )
+    dispatch_max_query_len = (
+        max(max_query_len, 2) if preserve_mixed_dispatch else max_query_len
+    )
     _require_fa2_op("byte_v2_hybrid_varlen_fwd")(
         query,
         kv_cache,
@@ -847,7 +994,7 @@ def byte_v2_fa2_hybrid_paged_decode_attention(
         None,
         block_tables,
         None,
-        max_query_len,
+        dispatch_max_query_len,
         max_seq_len,
         0.0,
         scale,

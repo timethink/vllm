@@ -22,12 +22,22 @@ from vllm.v1.attention.backends.byte_v2_layout import (
 pytestmark = pytest.mark.cpu_test
 
 
-def _metadata(query_start_locs, num_actual_tokens=None):
+def _metadata(
+    query_start_locs,
+    num_actual_tokens=None,
+    *,
+    seq_lens_cpu_upper_bound=None,
+):
     if num_actual_tokens is None:
         num_actual_tokens = query_start_locs[-1]
     return SimpleNamespace(
         num_actual_tokens=num_actual_tokens,
         query_start_loc_cpu=torch.tensor(query_start_locs, dtype=torch.int32),
+        seq_lens_cpu_upper_bound=(
+            None
+            if seq_lens_cpu_upper_bound is None
+            else torch.tensor(seq_lens_cpu_upper_bound, dtype=torch.int32)
+        ),
     )
 
 
@@ -92,6 +102,95 @@ def test_byte_v2_page_aware_wave_splits_16k_into_nine_waves():
     assert waves[-1].end == 16_384
     assert all(wave.max_unique_pages <= 128 for wave in waves)
     assert all(left.end == right.start for left, right in zip(waves, waves[1:]))
+
+
+def test_byte_v2_initial_prefill_uses_exact_page_aligned_waves():
+    waves = plan_byte_v2_raw_staging_waves(
+        4096,
+        128,
+        _metadata(
+            [0, 4096],
+            seq_lens_cpu_upper_bound=[4096],
+        ),
+    )
+
+    assert [(wave.start, wave.end, wave.max_unique_pages) for wave in waves] == [
+        (0, 2048, 128),
+        (2048, 4096, 128),
+    ]
+
+
+def test_byte_v2_initial_prefill_production_shape_uses_eight_waves():
+    query_start_locs = [0, 4096, 8192, 12_288, 16_384]
+    waves = plan_byte_v2_raw_staging_waves(
+        16_384,
+        128,
+        _metadata(
+            query_start_locs,
+            seq_lens_cpu_upper_bound=[4096] * 4,
+        ),
+    )
+
+    assert [(wave.start, wave.end, wave.max_unique_pages) for wave in waves] == [
+        (0, 2048, 128),
+        (2048, 4096, 128),
+        (4096, 6144, 128),
+        (6144, 8192, 128),
+        (8192, 10_240, 128),
+        (10_240, 12_288, 128),
+        (12_288, 14_336, 128),
+        (14_336, 16_384, 128),
+    ]
+
+
+def test_byte_v2_mixed_cached_and_initial_rows_keep_individual_bounds():
+    waves = plan_byte_v2_raw_staging_waves(
+        4112,
+        128,
+        _metadata(
+            [0, 16, 4112],
+            seq_lens_cpu_upper_bound=[32, 4096],
+        ),
+    )
+
+    assert [(wave.start, wave.end, wave.max_unique_pages) for wave in waves] == [
+        (0, 16, 2),
+        (16, 2064, 128),
+        (2064, 4112, 128),
+    ]
+
+
+def test_byte_v2_zero_length_padding_does_not_add_a_wave():
+    waves = plan_byte_v2_raw_staging_waves(
+        4096,
+        128,
+        _metadata(
+            [0, 4096, 4096],
+            seq_lens_cpu_upper_bound=[4096, 0],
+        ),
+    )
+
+    assert [(wave.start, wave.end, wave.max_unique_pages) for wave in waves] == [
+        (0, 2048, 128),
+        (2048, 4096, 128),
+    ]
+
+
+def test_byte_v2_cached_row_keeps_conservative_page_bound():
+    waves = plan_byte_v2_raw_staging_waves(
+        4096,
+        128,
+        _metadata(
+            [0, 4096],
+            seq_lens_cpu_upper_bound=[4112],
+        ),
+    )
+
+    assert [(wave.start, wave.end, wave.max_unique_pages) for wave in waves] == [
+        (0, 2033, 128),
+        (2033, 4066, 128),
+        (4066, 4096, 3),
+    ]
 
 
 def test_byte_v2_page_aware_wave_bounds_many_one_token_requests():

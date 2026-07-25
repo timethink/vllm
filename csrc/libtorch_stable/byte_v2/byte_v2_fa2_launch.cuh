@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 #include "flash_fwd_launch_template.h"
@@ -14,15 +16,34 @@
 namespace FLASH_NAMESPACE {
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_byte_v2_kernel, bool Is_causal,
-                            bool Split) {
+                            bool Split, bool ReuseKvSmemNonsplit) {
 #if defined(ARCH_SUPPORTS_FLASH)
+  using ExternalKvLoader =
+      std::conditional_t<ReuseKvSmemNonsplit,
+                         vllm::byte_v2::fa2::LoaderReuseKvSmemNonsplit,
+                         vllm::byte_v2::fa2::Loader>;
   FLASH_NAMESPACE::compute_attn_splitkv<
       Kernel_traits, Is_causal, /*Is_local=*/false, /*Has_alibi=*/false,
       /*Is_even_MN=*/false, /*Is_even_K=*/true, /*Is_softcap=*/false, Split,
-      /*Append_KV=*/false, vllm::byte_v2::fa2::Loader>(params);
+      /*Append_KV=*/false, ExternalKvLoader>(params);
 #else
   FLASH_UNSUPPORTED_ARCH
 #endif
+}
+
+inline bool byte_v2_fa2_reuse_kv_smem_nonsplit_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("BYTE_V2_FA2_REUSE_KV_SMEM_NONSPLIT");
+    if (value == nullptr || std::strcmp(value, "1") == 0) {
+      return true;
+    }
+    TORCH_CHECK(
+        std::strcmp(value, "0") == 0,
+        "BYTE_V2_FA2_REUSE_KV_SMEM_NONSPLIT must be unset, 0, or 1; got '",
+        value, "'");
+    return false;
+  }();
+  return enabled;
 }
 
 template <typename Kernel_traits, bool Is_causal>
@@ -76,20 +97,37 @@ void run_flash_byte_v2_splitkv_fwd(Flash_fwd_params& params,
             params.num_splits > 1 ? params.b * params.h : params.h);
 
   BOOL_SWITCH(params.num_splits > 1, Split, [&] {
-    constexpr size_t smem_size =
-        Split && vllm::byte_v2::fa2::Loader::ReuseKvSmem
-            ? Kernel_traits::kSmemQSize + Kernel_traits::kSmemKVSize / 2
-            : Kernel_traits::kSmemSize;
-    static_assert(!Split || !vllm::byte_v2::fa2::Loader::ReuseKvSmem ||
-                  smem_size == 48 * 1024);
-    auto kernel =
-        &flash_fwd_splitkv_byte_v2_kernel<Kernel_traits, Is_causal, Split>;
-    if (smem_size >= 48 * 1024) {
-      C10_CUDA_CHECK(cudaFuncSetAttribute(
-          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    auto launch = [&](auto reuse_nonsplit_tag) {
+      constexpr bool ReuseKvSmemNonsplit = decltype(reuse_nonsplit_tag)::value;
+      using ExternalKvLoader =
+          std::conditional_t<ReuseKvSmemNonsplit,
+                             vllm::byte_v2::fa2::LoaderReuseKvSmemNonsplit,
+                             vllm::byte_v2::fa2::Loader>;
+      constexpr bool reuse_kv_smem =
+          ExternalKvLoader::ReuseKvSmem &&
+          (Split || ExternalKvLoader::ReuseKvSmemNonsplit);
+      constexpr size_t smem_size =
+          reuse_kv_smem
+              ? Kernel_traits::kSmemQSize + Kernel_traits::kSmemKVSize / 2
+              : Kernel_traits::kSmemSize;
+      static_assert(!reuse_kv_smem || smem_size == 48 * 1024);
+      auto kernel =
+          &flash_fwd_splitkv_byte_v2_kernel<Kernel_traits, Is_causal, Split,
+                                            ReuseKvSmemNonsplit>;
+      if (smem_size >= 48 * 1024) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
+      kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    };
+    if constexpr (Split) {
+      launch(std::false_type{});
+    } else if (byte_v2_fa2_reuse_kv_smem_nonsplit_enabled()) {
+      launch(std::true_type{});
+    } else {
+      launch(std::false_type{});
     }
-    kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
   if (params.num_splits > 1) {

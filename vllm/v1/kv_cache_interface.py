@@ -484,6 +484,11 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
     def real_page_size_bytes(self) -> int:
         return self._page_layout().page_size_bytes
 
+    @property
+    def page_metadata_size_bytes(self) -> int:
+        """Return the page prefix that must be reset before block reuse."""
+        return self._page_layout().aligned_metadata_bytes
+
     def copy_with_new_block_size(self, block_size: int) -> Self:
         return replace(
             self,

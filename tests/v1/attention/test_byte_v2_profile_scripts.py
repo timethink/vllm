@@ -13,10 +13,12 @@ PROFILE_MODULES = (byte_v2_e2e_profile, byte_v2_speculative_profile)
 HYBRID_PROFILE_OPS = {
     "byte_v2_hydrate_raw_staging_from_hybrid_cache",
     "byte_v2_commit_raw_staging_to_hybrid_cache",
+    "byte_v2_fa2_direct_paged_prefill_attention",
     "byte_v2_fa2_hybrid_paged_decode_attention",
     "byte_v2_fa2_raw_staging_prefill_attention",
     "byte_v2_reset_raw_fallback_pages",
     "byte_v2_test_force_promote_raw_staging_q1",
+    "byte_v2_update_hybrid_cache_raw_tail_q1",
     "byte_v2_update_hybrid_cache_raw_staging_multi_token",
     "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained",
 }

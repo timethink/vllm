@@ -42,11 +42,13 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_commit_raw_staging_to_hybrid_cache,
     byte_v2_custom_ops_are_available,
     byte_v2_fa2_decode_is_available,
+    byte_v2_fa2_direct_paged_prefill_attention,
     byte_v2_fa2_hybrid_decode_is_available,
     byte_v2_fa2_hybrid_paged_decode_attention,
     byte_v2_fa2_paged_decode_attention,
     byte_v2_fa2_raw_staging_prefill_attention,
     byte_v2_hybrid_cache_update_is_available,
+    byte_v2_hybrid_raw_tail_q1_is_available,
     byte_v2_hydrate_raw_staging_from_cache,
     byte_v2_hydrate_raw_staging_from_hybrid_cache,
     byte_v2_paged_decode_attention,
@@ -68,6 +70,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_update_hybrid_cache_raw_staging_multi_token,
     byte_v2_update_hybrid_cache_raw_staging_multi_token_retained,
     byte_v2_update_hybrid_cache_raw_staging_q1,
+    byte_v2_update_hybrid_cache_raw_tail_q1,
 )
 from vllm.v1.kv_cache_interface import (
     byte_v2_hybrid_raw_fallback_enabled,
@@ -251,6 +254,36 @@ def _cached_prefix_q16_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _direct_paged_prefill_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_FA2_DIRECT_PREFILL")
+    if value is None:
+        return True
+    if value not in ("0", "1"):
+        raise ValueError(
+            f"BYTE_V2_FA2_DIRECT_PREFILL must be unset, 0, or 1; got {value!r}"
+        )
+    return value == "1"
+
+
+def _cached_prefill_hydrate_to_raw_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW")
+    if value is None:
+        return False
+    if value not in ("0", "1"):
+        raise ValueError(
+            "BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW must be unset, 0, or "
+            f"1; got {value!r}"
+        )
+    return value == "1"
+
+
+def _hybrid_raw_mutable_tail_q1_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1")
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 def _prefill_backend() -> str:
     value = os.environ.get("BYTE_V2_PREFILL_BACKEND")
     if value is None:
@@ -285,6 +318,31 @@ def _debug_sync(label: str) -> None:
     logger.warning("[ByteV2] sync done %s", label)
 
 
+@dataclass(frozen=True)
+class ByteV2DirectPrefillGroup:
+    """One zero-copy raw-paged group with page-aligned internal boundaries."""
+
+    first_request: int
+    num_requests: int
+    first_token: int
+    num_tokens: int
+    rounded_tokens: int
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    block_table: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ByteV2DirectPrefillPlan:
+    """Cached-prefix and direct-initial-suffix routing for one scheduler step."""
+
+    cached_request_count: int
+    cached_token_count: int
+    cached_max_query_len: int
+    cached_max_seq_len: int
+    groups: tuple[ByteV2DirectPrefillGroup, ...]
+
+
 @dataclass
 class ByteV2AttentionMetadata(AttentionMetadata):
     num_actual_tokens: int
@@ -292,6 +350,7 @@ class ByteV2AttentionMetadata(AttentionMetadata):
     query_start_loc: torch.Tensor
     query_start_loc_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor | None
+    seq_lens_cpu_upper_bound: torch.Tensor | None
     max_seq_len: int
     seq_lens: torch.Tensor
     block_table: torch.Tensor
@@ -300,6 +359,132 @@ class ByteV2AttentionMetadata(AttentionMetadata):
     seq_len_sum: int | None = None
     common_prefix_len: int = 0
     tile_policy: ByteV2TilePolicy = DEFAULT_BYTE_V2_TILE_POLICY
+    direct_prefill_plan: ByteV2DirectPrefillPlan | None = None
+
+
+def _build_byte_v2_direct_prefill_plan(
+    *,
+    query_start_loc_cpu: torch.Tensor,
+    query_start_loc: torch.Tensor | None = None,
+    seq_lens_cpu: torch.Tensor | None,
+    num_reqs: int,
+    num_actual_tokens: int,
+    device: torch.device,
+    block_size: int,
+) -> ByteV2DirectPrefillPlan | None:
+    """Build a fail-closed cached-prefix/initial-suffix direct-paged plan."""
+    query_start_loc_device = (
+        query_start_loc_cpu if query_start_loc is None else query_start_loc
+    )
+    if (
+        seq_lens_cpu is None
+        or num_reqs <= 0
+        or block_size <= 0
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.ndim != 1
+        or query_start_loc_cpu.shape[0] < num_reqs + 1
+        or query_start_loc_device.device != device
+        or query_start_loc_device.dtype != torch.int32
+        or query_start_loc_device.ndim != 1
+        or query_start_loc_device.shape[0] < num_reqs + 1
+        or not query_start_loc_device.is_contiguous()
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.ndim != 1
+        or seq_lens_cpu.shape[0] < num_reqs
+    ):
+        return None
+
+    starts = [int(value) for value in query_start_loc_cpu[: num_reqs + 1]]
+    if (
+        starts[0] != 0
+        or starts[-1] != num_actual_tokens
+        or any(end <= start for start, end in zip(starts, starts[1:]))
+    ):
+        return None
+    query_lens = [end - start for start, end in zip(starts, starts[1:])]
+    seq_lens = [int(value) for value in seq_lens_cpu[:num_reqs]]
+    context_lens = [
+        seq_len - query_len for seq_len, query_len in zip(seq_lens, query_lens)
+    ]
+    if any(context_len < 0 for context_len in context_lens):
+        return None
+
+    first_initial = next(
+        (index for index, context_len in enumerate(context_lens) if context_len == 0),
+        num_reqs,
+    )
+    if first_initial == num_reqs:
+        return None
+    if any(context_len <= 0 for context_len in context_lens[:first_initial]) or any(
+        context_len != 0 for context_len in context_lens[first_initial:]
+    ):
+        return None
+
+    groups = []
+    request_index = first_initial
+    while request_index < num_reqs:
+        group_first_request = request_index
+        request_index += 1
+        while (
+            request_index < num_reqs and query_lens[request_index - 1] % block_size == 0
+        ):
+            request_index += 1
+        group_request_end = request_index
+        first_token = starts[group_first_request]
+        token_end = starts[group_request_end]
+        num_tokens = token_end - first_token
+        rounded_tokens = (num_tokens + block_size - 1) // block_size * block_size
+        group_query_lens = query_lens[group_first_request:group_request_end]
+        local_starts = [
+            starts[index] - first_token
+            for index in range(group_first_request, group_request_end + 1)
+        ]
+        if any(local_start % block_size for local_start in local_starts[:-1]):
+            return None
+        blocks_per_request = [
+            (query_len + block_size - 1) // block_size for query_len in group_query_lens
+        ]
+        max_blocks = max(blocks_per_request)
+        local_block_table = torch.zeros(
+            (len(group_query_lens), max_blocks),
+            dtype=torch.int32,
+            device=device,
+        )
+        for row, (local_start, num_blocks) in enumerate(
+            zip(local_starts, blocks_per_request)
+        ):
+            first_page = local_start // block_size
+            local_block_table[row, :num_blocks] = torch.arange(
+                first_page,
+                first_page + num_blocks,
+                dtype=torch.int32,
+                device=device,
+            )
+        local_query_start_loc = query_start_loc_device[
+            group_first_request : group_request_end + 1
+        ]
+        if first_token:
+            local_query_start_loc = local_query_start_loc - first_token
+        groups.append(
+            ByteV2DirectPrefillGroup(
+                first_request=group_first_request,
+                num_requests=len(group_query_lens),
+                first_token=first_token,
+                num_tokens=num_tokens,
+                rounded_tokens=rounded_tokens,
+                max_query_len=max(group_query_lens),
+                query_start_loc=local_query_start_loc,
+                block_table=local_block_table,
+            )
+        )
+
+    return ByteV2DirectPrefillPlan(
+        cached_request_count=first_initial,
+        cached_token_count=starts[first_initial],
+        cached_max_query_len=(max(query_lens[:first_initial], default=0)),
+        cached_max_seq_len=max(seq_lens[:first_initial], default=0),
+        groups=tuple(groups),
+    )
 
 
 class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMetadata]):
@@ -336,6 +521,16 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
     ) -> ByteV2AttentionMetadata:
         del fast_build
         seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        seq_lens_cpu_upper_bound = getattr(
+            common_attn_metadata,
+            "seq_lens_cpu_upper_bound",
+            None,
+        )
+        prefill_seq_lens_cpu = seq_lens_cpu
+        if prefill_seq_lens_cpu is None:
+            prefill_seq_lens_cpu = seq_lens_cpu_upper_bound
+        if seq_lens_cpu_upper_bound is None:
+            seq_lens_cpu_upper_bound = seq_lens_cpu
         num_reqs = int(
             getattr(
                 common_attn_metadata,
@@ -348,12 +543,29 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
             if seq_lens_cpu is not None and num_reqs > 0
             else None
         )
+        direct_prefill_plan = None
+        if (
+            _direct_paged_prefill_enabled()
+            and byte_v2_hybrid_raw_fallback_enabled()
+            and common_attn_metadata.causal
+            and common_attn_metadata.max_query_len > 1
+        ):
+            direct_prefill_plan = _build_byte_v2_direct_prefill_plan(
+                query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+                query_start_loc=common_attn_metadata.query_start_loc,
+                seq_lens_cpu=prefill_seq_lens_cpu,
+                num_reqs=num_reqs,
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                device=common_attn_metadata.query_start_loc.device,
+                block_size=self.tile_policy.alloc_block_tokens,
+            )
         return ByteV2AttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=common_attn_metadata.seq_lens,
             block_table=common_attn_metadata.block_table_tensor,
@@ -362,6 +574,7 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
             seq_len_sum=seq_len_sum,
             common_prefix_len=int(common_prefix_len),
             tile_policy=self.tile_policy,
+            direct_prefill_plan=direct_prefill_plan,
         )
 
     def update_block_table(
@@ -775,6 +988,39 @@ def _trusted_byte_v2_query_start_locs(
     return query_start_locs
 
 
+def _trusted_byte_v2_initial_prefill_rows(
+    attn_metadata: object | None,
+    query_start_locs: list[int],
+) -> list[bool]:
+    """Identify rows whose first scheduled token is known to be page-aligned."""
+    num_requests = len(query_start_locs) - 1
+    unknown = [False] * num_requests
+    if attn_metadata is None:
+        return unknown
+
+    seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu_upper_bound", None)
+    if (
+        not isinstance(seq_lens_cpu, torch.Tensor)
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.dtype not in (torch.int32, torch.int64)
+        or seq_lens_cpu.ndim != 1
+        or seq_lens_cpu.shape[0] < num_requests
+    ):
+        return unknown
+
+    # The exact sequence length cannot be shorter than its scheduled query,
+    # while seq_lens_cpu_upper_bound cannot be shorter than the exact length.
+    # Equality at both ends therefore proves context_len == 0 even when async
+    # speculative decode makes the CPU value only an upper bound. All rows
+    # with a positive or unknown context retain the conservative bound.
+    return [
+        int(seq_lens_cpu[index]) == request_end - request_start
+        for index, (request_start, request_end) in enumerate(
+            zip(query_start_locs, query_start_locs[1:])
+        )
+    ]
+
+
 def plan_byte_v2_raw_staging_waves(
     num_tokens: int,
     num_staging_slots: int,
@@ -785,9 +1031,11 @@ def plan_byte_v2_raw_staging_waves(
     """Plan page-bounded, stream-ordered staging waves.
 
     A request segment with ``n`` consecutive logical tokens can touch at most
-    ``ceil((block_size - 1 + n) / block_size)`` pages because its first row is
-    unknown here. Bounds from adjacent requests are summed, which may
-    over-count shared physical pages but can never under-count them.
+    ``ceil((block_size - 1 + n) / block_size)`` pages when its first row is
+    unknown. An initial-prefill row whose zero context is proven by trusted CPU
+    metadata instead uses its exact page alignment. Bounds from adjacent
+    requests are summed, which may over-count shared physical pages but can
+    never under-count them.
     """
     if num_tokens < 0:
         raise ValueError("num_tokens must be non-negative")
@@ -807,20 +1055,34 @@ def plan_byte_v2_raw_staging_waves(
             conservative_waves.append(ByteV2RawStagingWave(start, end, end - start))
         return conservative_waves
 
-    pieces: list[ByteV2RawStagingWave] = []
-    max_consecutive_tokens = alloc_block_tokens * num_staging_slots
-    max_consecutive_tokens -= alloc_block_tokens - 1
-    for request_start, request_end in zip(
+    initial_prefill_rows = _trusted_byte_v2_initial_prefill_rows(
+        attn_metadata,
         query_start_locs,
-        query_start_locs[1:],
+    )
+    pieces: list[ByteV2RawStagingWave] = []
+    conservative_token_limit = alloc_block_tokens * num_staging_slots
+    conservative_token_limit -= alloc_block_tokens - 1
+    aligned_token_limit = alloc_block_tokens * num_staging_slots
+    for request_index, (request_start, request_end) in enumerate(
+        zip(query_start_locs, query_start_locs[1:])
     ):
+        initial_prefill = initial_prefill_rows[request_index]
+        token_limit = (
+            aligned_token_limit if initial_prefill else conservative_token_limit
+        )
         start = request_start
         while start < request_end:
-            end = min(start + max_consecutive_tokens, request_end)
+            end = min(start + token_limit, request_end)
             num_request_tokens = end - start
-            max_unique_pages = (
-                num_request_tokens + 2 * alloc_block_tokens - 2
-            ) // alloc_block_tokens
+            if initial_prefill:
+                first_row = (start - request_start) % alloc_block_tokens
+                max_unique_pages = (
+                    first_row + num_request_tokens + alloc_block_tokens - 1
+                ) // alloc_block_tokens
+            else:
+                max_unique_pages = (
+                    num_request_tokens + 2 * alloc_block_tokens - 2
+                ) // alloc_block_tokens
             pieces.append(ByteV2RawStagingWave(start, end, max_unique_pages))
             start = end
 
@@ -850,6 +1112,7 @@ class ByteV2RawStagingManager:
         num_kv_heads: int,
         max_tokens_per_update: int = _BYTE_V2_MAX_RAW_STAGING_TOKENS,
         raw_fallback_store: ByteV2RawFallbackStore | None = None,
+        hybrid_raw_mutable_tail_q1: bool = False,
     ) -> None:
         self.tile_policy = tile_policy
         self.raw_layout = ByteV2RawStagingLayout(
@@ -858,6 +1121,7 @@ class ByteV2RawStagingManager:
         )
         self.max_tokens_per_update = max_tokens_per_update
         self.raw_fallback_store = raw_fallback_store
+        self.hybrid_raw_mutable_tail_q1 = hybrid_raw_mutable_tail_q1
         self.shared_workspace: ByteV2RawStagingWorkspace | None = None
 
         self.raw_staging: torch.Tensor | None = None
@@ -989,6 +1253,86 @@ class ByteV2RawStagingManager:
             valid_rows,
         )
 
+    def stage_cached_prefill(
+        self,
+        *,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Hydrate one B1 cached sequence into exact raw BF16 pages.
+
+        This is an experimental full-prefix path. It decodes each logical
+        page once, then exposes a dense local block table to the original raw
+        paged FA2 implementation. If the fixed workspace cannot hold the
+        complete sequence, return ``None`` without mutating allocator state.
+        """
+        if self._initial_prefill_lease is not None:
+            raise RuntimeError(
+                "ByteV2 cached-prefill hydrate cannot reuse an active "
+                "initial-prefill staging lease"
+            )
+        workspace = self.shared_workspace
+        if (
+            workspace is None
+            or self.raw_fallback_store is None
+            or seq_len <= 0
+            or block_table.dtype != torch.int32
+            or block_table.device != kv_cache.device
+            or block_table.ndim != 2
+            or block_table.shape[0] != 1
+            or block_table.stride(1) != 1
+        ):
+            return None
+
+        block_size = self.tile_policy.alloc_block_tokens
+        num_pages = (seq_len + block_size - 1) // block_size
+        if (
+            num_pages <= 0
+            or num_pages > workspace.spec.num_staging_slots
+            or num_pages > block_table.shape[1]
+            or num_pages > workspace.block_to_staging_slot.shape[0]
+        ):
+            return None
+
+        raw_staging = workspace.raw_staging[:num_pages]
+        valid_rows = workspace.valid_rows[:num_pages]
+        physical_pages = block_table[0, :num_pages]
+        hybrid_state = self.raw_fallback_store.state(kv_cache)
+        valid_rows.fill_(block_size)
+        final_rows = seq_len % block_size
+        if final_rows:
+            valid_rows[-1].fill_(final_rows)
+
+        # This descriptor is not used by hydrate; it is a fixed-address dense
+        # block table for the following raw FA2 call.
+        local_page_ids = workspace.staging_to_physical_block[:num_pages]
+        try:
+            torch.arange(num_pages, out=local_page_ids)
+            byte_v2_hydrate_raw_staging_from_hybrid_cache(
+                raw_staging,
+                kv_cache,
+                hybrid_state.raw_pages,
+                hybrid_state.page_to_raw_slot,
+                physical_pages,
+                valid_rows,
+                codec_token_block=self.tile_policy.codec_token_block,
+                codec_dim_block=self.tile_policy.codec_dim_block,
+                alloc_block_tokens=block_size,
+            )
+        except Exception:
+            self.release_cached_prefill(
+                local_page_ids.view(1, num_pages),
+                valid_rows,
+            )
+            raise
+        return (
+            raw_staging,
+            workspace.block_to_staging_slot,
+            local_page_ids.view(1, num_pages),
+            valid_rows,
+        )
+
     def release_initial_prefill(
         self,
         staging_to_physical_block: torch.Tensor,
@@ -1005,6 +1349,14 @@ class ByteV2RawStagingManager:
             workspace.next_staging_slot,
             workspace.overflow,
         )
+
+    def release_cached_prefill(
+        self,
+        local_page_ids: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> None:
+        """Release cached-prefill descriptors while ``block_to`` is quiescent."""
+        self.release_initial_prefill(local_page_ids.view(-1), valid_rows)
 
     def _should_stage(self, slot_mapping: torch.Tensor) -> bool:
         num_tokens = slot_mapping.shape[0]
@@ -1290,6 +1642,40 @@ class ByteV2RawStagingManager:
             and active_slot_capacity == 1
             and slot_mapping.is_cuda
         ):
+            if getattr(self, "hybrid_raw_mutable_tail_q1", False):
+                try:
+                    byte_v2_update_hybrid_cache_raw_tail_q1(
+                        key,
+                        value,
+                        raw_staging,
+                        kv_cache,
+                        hybrid_state.raw_pages,
+                        slot_mapping,
+                        self.block_to_staging_slot,
+                        staging_to_physical_block,
+                        valid_rows,
+                        self.next_staging_slot,
+                        self.overflow,
+                        hybrid_state.page_to_raw_slot,
+                        hybrid_state.free_slots,
+                        hybrid_state.free_count,
+                        hybrid_state.fatal,
+                        tile_policy=(
+                            self.tile_policy.codec_token_block,
+                            self.tile_policy.codec_dim_block,
+                            self.tile_policy.alloc_block_tokens,
+                            self.tile_policy.compute_block_n,
+                            self.tile_policy.head_dim,
+                            self.tile_policy.head_dim_v,
+                        ),
+                        page_unsafe_flags=page_unsafe_flags,
+                    )
+                except NotImplementedError:
+                    pass
+                else:
+                    # Raw-tail sealing owns the row-15 demotion decision; the
+                    # forced-promotion diagnostic must not remap that page.
+                    return True, page_unsafe_flags is not None
             try:
                 byte_v2_update_hybrid_cache_raw_staging_q1(
                     key,
@@ -1599,11 +1985,63 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             head_dim_v=head_size,
         )
         self.fa2_hybrid_raw_fallback = byte_v2_hybrid_raw_fallback_enabled()
+        raw_tail_requested = _hybrid_raw_mutable_tail_q1_enabled()
+        if raw_tail_requested and not self.fa2_hybrid_raw_fallback:
+            raise RuntimeError(
+                "BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1=1 requires "
+                "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
+            )
+        self.hybrid_raw_mutable_tail_q1 = (
+            raw_tail_requested and byte_v2_hybrid_raw_tail_q1_is_available()
+        )
+        if self.hybrid_raw_mutable_tail_q1:
+            logger.warning_once(
+                "[ByteV2] experimental raw-tail Q1 requires the request "
+                "lifecycle to remain batch size 1; dynamic batching is not "
+                "supported"
+            )
+        if raw_tail_requested and not self.hybrid_raw_mutable_tail_q1:
+            logger.warning_once(
+                "[ByteV2] persistent raw-tail Q1 op is unavailable; using "
+                "the existing hybrid Q1 cache update"
+            )
+        direct_paged_prefill_enabled = _direct_paged_prefill_enabled()
+        if (
+            os.environ.get("BYTE_V2_FA2_DIRECT_PREFILL") == "1"
+            and not self.fa2_hybrid_raw_fallback
+        ):
+            raise RuntimeError(
+                "BYTE_V2_FA2_DIRECT_PREFILL=1 requires "
+                "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
+            )
+        self.direct_paged_prefill = (
+            self.fa2_hybrid_raw_fallback and direct_paged_prefill_enabled
+        )
+        cached_prefill_hydrate_requested = _cached_prefill_hydrate_to_raw_enabled()
+        if cached_prefill_hydrate_requested and not self.fa2_hybrid_raw_fallback:
+            raise RuntimeError(
+                "BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW=1 requires "
+                "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
+            )
+        self.cached_prefill_hydrate_to_raw = (
+            self.fa2_hybrid_raw_fallback and cached_prefill_hydrate_requested
+        )
+        if self.cached_prefill_hydrate_to_raw:
+            logger.warning_once(
+                "[ByteV2] experimental B1 cached-prefill hydrate-to-raw is "
+                "enabled; sequences that exceed raw staging capacity retain "
+                "the hybrid reader"
+            )
         self.test_forced_raw_promotion = byte_v2_test_forced_raw_promotion_enabled()
         if self.test_forced_raw_promotion and not self.fa2_hybrid_raw_fallback:
             raise RuntimeError(
                 "BYTE_V2_TEST_FORCE_RAW_PROMOTION=1 requires "
                 "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
+            )
+        if self.test_forced_raw_promotion and self.hybrid_raw_mutable_tail_q1:
+            raise RuntimeError(
+                "BYTE_V2_TEST_FORCE_RAW_PROMOTION=1 is incompatible with "
+                "BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1=1"
             )
         if self.fa2_hybrid_raw_fallback:
             unsupported = []
@@ -1639,6 +2077,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             tile_policy=self.tile_policy,
             num_kv_heads=self.num_kv_heads,
             raw_fallback_store=self.raw_fallback_store,
+            hybrid_raw_mutable_tail_q1=self.hybrid_raw_mutable_tail_q1,
         )
         self.prefill_backend = _prefill_backend()
         self.decode_kernel_mode = _decode_kernel_mode()
@@ -2959,6 +3398,15 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 attn_metadata,
             ):
                 return output
+            if self._forward_direct_paged_prefill(
+                query,
+                key,
+                value,
+                kv_cache,
+                output,
+                attn_metadata,
+            ):
+                return output
             return self._forward_prefill_from_cache(
                 query,
                 kv_cache,
@@ -3093,6 +3541,170 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             )
         return True
 
+    def _forward_direct_paged_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> bool:
+        """Split a safe cached-prefix/initial-suffix batch without K/V copies."""
+        plan = getattr(attn_metadata, "direct_prefill_plan", None)
+        if not getattr(self, "direct_paged_prefill", False) or plan is None:
+            return False
+        raw_fallback_store = self.raw_fallback_store
+        num_actual_tokens = int(attn_metadata.num_actual_tokens)
+        num_requests = plan.cached_request_count + sum(
+            group.num_requests for group in plan.groups
+        )
+        if (
+            not attn_metadata.causal
+            or not plan.groups
+            or num_actual_tokens <= 0
+            or plan.cached_request_count < 0
+            or not 0 <= plan.cached_token_count <= num_actual_tokens
+            or query.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or key.dtype != torch.bfloat16
+            or value.dtype != torch.bfloat16
+            or output.device != query.device
+            or key.device != query.device
+            or value.device != query.device
+            or query.ndim != 3
+            or output.shape != query.shape
+            or key.ndim != 3
+            or value.shape != key.shape
+            or query.shape[0] < num_actual_tokens
+            or key.shape[0] < num_actual_tokens
+            or value.shape[0] < num_actual_tokens
+            or query.shape[1:] != (self.num_heads, self.head_size)
+            or key.shape[1:] != (self.num_kv_heads, self.head_size)
+            or query.stride()[1:] != (self.head_size, 1)
+            or output.stride()[1:] != (self.head_size, 1)
+            or key.stride()[1:] != (self.head_size, 1)
+            or value.stride()[1:] != (self.head_size, 1)
+            or query.stride(0) < self.num_heads * self.head_size
+            or output.stride(0) < self.num_heads * self.head_size
+            or key.stride(0) < self.num_kv_heads * self.head_size
+            or value.stride(0) < self.num_kv_heads * self.head_size
+            or attn_metadata.query_start_loc.dtype != torch.int32
+            or attn_metadata.query_start_loc.device != query.device
+            or attn_metadata.query_start_loc.ndim != 1
+            or attn_metadata.query_start_loc.shape[0] < num_requests + 1
+            or attn_metadata.block_table.dtype != torch.int32
+            or attn_metadata.block_table.device != query.device
+            or attn_metadata.block_table.ndim != 2
+            or attn_metadata.block_table.shape[0] < num_requests
+            or attn_metadata.seq_lens.dtype != torch.int32
+            or attn_metadata.seq_lens.device != query.device
+            or attn_metadata.seq_lens.ndim != 1
+            or attn_metadata.seq_lens.shape[0] < num_requests
+            or (plan.cached_request_count > 0 and raw_fallback_store is None)
+        ):
+            return False
+
+        # Preflight every view before launching either side of the split. A
+        # ragged group may borrow masked rows from the following group, but it
+        # must never read beyond the padded projection tensor's storage.
+        direct_calls = []
+        expected_request = plan.cached_request_count
+        expected_token = plan.cached_token_count
+        for group in plan.groups:
+            rounded_end = group.first_token + group.rounded_tokens
+            if (
+                group.first_request != expected_request
+                or group.first_token != expected_token
+                or group.num_requests <= 0
+                or group.num_tokens <= 0
+                or group.rounded_tokens < group.num_tokens
+                or group.rounded_tokens % self.tile_policy.alloc_block_tokens != 0
+                or group.max_query_len <= 0
+                or group.query_start_loc.dtype != torch.int32
+                or group.query_start_loc.device != query.device
+                or group.query_start_loc.ndim != 1
+                or group.query_start_loc.shape[0] != group.num_requests + 1
+                or group.block_table.dtype != torch.int32
+                or group.block_table.device != query.device
+                or group.block_table.ndim != 2
+                or group.block_table.shape[0] != group.num_requests
+                or rounded_end > key.shape[0]
+                or rounded_end > value.shape[0]
+                or group.first_token + group.num_tokens > num_actual_tokens
+            ):
+                return False
+            num_pages = group.rounded_tokens // self.tile_policy.alloc_block_tokens
+            try:
+                key_pages = key.narrow(
+                    0,
+                    group.first_token,
+                    group.rounded_tokens,
+                ).view(
+                    num_pages,
+                    self.tile_policy.alloc_block_tokens,
+                    self.num_kv_heads,
+                    self.head_size,
+                )
+                value_pages = value.narrow(
+                    0,
+                    group.first_token,
+                    group.rounded_tokens,
+                ).view_as(key_pages)
+            except RuntimeError:
+                return False
+            request_end = group.first_request + group.num_requests
+            direct_calls.append(
+                (
+                    group,
+                    key_pages,
+                    value_pages,
+                    attn_metadata.seq_lens[group.first_request : request_end],
+                )
+            )
+            expected_request = request_end
+            expected_token = group.first_token + group.num_tokens
+
+        if expected_request != num_requests or expected_token != num_actual_tokens:
+            return False
+
+        if plan.cached_request_count:
+            assert raw_fallback_store is not None
+            hybrid_state = raw_fallback_store.state(kv_cache)
+            byte_v2_fa2_hybrid_paged_decode_attention(
+                output[: plan.cached_token_count],
+                query[: plan.cached_token_count],
+                kv_cache,
+                hybrid_state.raw_pages,
+                hybrid_state.page_to_raw_slot,
+                attn_metadata.query_start_loc[: plan.cached_request_count + 1],
+                attn_metadata.block_table[: plan.cached_request_count],
+                attn_metadata.seq_lens[: plan.cached_request_count],
+                scale=self.scale,
+                max_query_len=plan.cached_max_query_len,
+                max_seq_len=plan.cached_max_seq_len,
+                causal=True,
+                preserve_mixed_dispatch=True,
+            )
+
+        for group, key_pages, value_pages, seq_lens in direct_calls:
+            token_end = group.first_token + group.num_tokens
+            byte_v2_fa2_direct_paged_prefill_attention(
+                output[group.first_token : token_end],
+                query[group.first_token : token_end],
+                key_pages,
+                value_pages,
+                group.query_start_loc,
+                group.block_table,
+                seq_lens,
+                scale=self.scale,
+                max_query_len=group.max_query_len,
+                max_seq_len=group.max_query_len,
+                causal=True,
+                preserve_mixed_dispatch=True,
+            )
+        return True
+
     @staticmethod
     def _prefill_has_cached_context(
         attn_metadata: ByteV2AttentionMetadata,
@@ -3101,7 +3713,18 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         if query_start_loc_cpu is None:
             query_start_loc_cpu = attn_metadata.query_start_loc.detach().cpu()
         query_start_locs = query_start_loc_cpu.tolist()
-        seq_lens_cpu = ByteV2AttentionImpl._metadata_seq_lens_cpu(attn_metadata)
+        # The common metadata's CPU upper bound is exact for prefill rows. In
+        # async speculative decode it can only conservatively keep a decode row
+        # on the cached path, which is the fail-closed routing decision. Reuse
+        # it here instead of synchronously copying device seq_lens in every
+        # layer.
+        seq_lens_cpu = getattr(
+            attn_metadata,
+            "seq_lens_cpu_upper_bound",
+            None,
+        )
+        if seq_lens_cpu is None:
+            seq_lens_cpu = ByteV2AttentionImpl._metadata_seq_lens_cpu(attn_metadata)
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         for seq_idx, (start, end) in enumerate(
@@ -3115,6 +3738,104 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             if int(seq_lens_cpu[seq_idx]) > query_len:
                 return True
         return False
+
+    def _forward_cached_prefill_from_hydrated_cache(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> bool:
+        """Hydrate one complete B1 cached sequence, then run raw paged FA2."""
+        if (
+            not getattr(self, "cached_prefill_hydrate_to_raw", False)
+            or self.raw_fallback_store is None
+            or not attn_metadata.causal
+            or attn_metadata.max_query_len <= 1
+        ):
+            return False
+
+        num_actual_tokens = min(attn_metadata.num_actual_tokens, query.shape[0])
+        query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+        if (
+            num_actual_tokens <= 1
+            or attn_metadata.max_query_len != num_actual_tokens
+            or not isinstance(query_start_loc_cpu, torch.Tensor)
+            or query_start_loc_cpu.device.type != "cpu"
+            or query_start_loc_cpu.ndim != 1
+            or query_start_loc_cpu.numel() < 2
+        ):
+            return False
+        query_start_locs = [int(value) for value in query_start_loc_cpu.tolist()]
+        if (
+            query_start_locs[0] != 0
+            or query_start_locs[1] != num_actual_tokens
+            or any(value != num_actual_tokens for value in query_start_locs[2:])
+        ):
+            return False
+
+        seq_len = int(attn_metadata.max_seq_len)
+        seq_lens_cpu = getattr(
+            attn_metadata,
+            "seq_lens_cpu_upper_bound",
+            None,
+        )
+        if (
+            seq_len <= num_actual_tokens
+            or not isinstance(seq_lens_cpu, torch.Tensor)
+            or seq_lens_cpu.device.type != "cpu"
+            or seq_lens_cpu.ndim != 1
+            or seq_lens_cpu.numel() < 1
+            or int(seq_lens_cpu[0]) != seq_len
+            or attn_metadata.block_table.dtype != torch.int32
+            or attn_metadata.block_table.device != query.device
+            or attn_metadata.block_table.ndim != 2
+            or attn_metadata.block_table.shape[0] < 1
+            or attn_metadata.seq_lens.dtype != torch.int32
+            or attn_metadata.seq_lens.device != query.device
+            or attn_metadata.seq_lens.ndim != 1
+            or attn_metadata.seq_lens.shape[0] < 1
+        ):
+            return False
+
+        num_pages = (
+            seq_len + self.tile_policy.alloc_block_tokens - 1
+        ) // self.tile_policy.alloc_block_tokens
+        if attn_metadata.block_table.shape[1] < num_pages:
+            return False
+        staged = self.raw_staging_manager.stage_cached_prefill(
+            kv_cache=kv_cache,
+            block_table=attn_metadata.block_table[:1, :num_pages],
+            seq_len=seq_len,
+        )
+        if staged is None:
+            return False
+
+        raw_staging, page_map, local_block_table, valid_rows = staged
+        try:
+            byte_v2_fa2_raw_staging_prefill_attention(
+                output[:num_actual_tokens],
+                query[:num_actual_tokens],
+                raw_staging,
+                page_map,
+                attn_metadata.query_start_loc[:2],
+                local_block_table,
+                attn_metadata.seq_lens[:1],
+                scale=self.scale,
+                num_kv_heads=self.num_kv_heads,
+                block_size=self.tile_policy.alloc_block_tokens,
+                head_dim=self.head_size,
+                max_query_len=attn_metadata.max_query_len,
+                max_seq_len=seq_len,
+                causal=True,
+                block_tables_are_staging_slots=True,
+            )
+        finally:
+            self.raw_staging_manager.release_cached_prefill(
+                local_block_table,
+                valid_rows,
+            )
+        return True
 
     def _forward_prefill_from_cache(
         self,
@@ -3139,6 +3860,13 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 attn_metadata.seq_lens.shape[0],
             )
             if batch_size <= 0:
+                return output
+            if self._forward_cached_prefill_from_hydrated_cache(
+                query,
+                kv_cache,
+                output,
+                attn_metadata,
+            ):
                 return output
             hybrid_state = self.raw_fallback_store.state(kv_cache)
             byte_v2_fa2_hybrid_paged_decode_attention(

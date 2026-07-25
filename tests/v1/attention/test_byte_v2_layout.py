@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1441,6 +1442,83 @@ def test_byte_v2_cached_prefix_q16_defaults_off(monkeypatch):
     assert byte_v2_attn_module._cached_prefix_q16_enabled() is True
 
 
+def test_byte_v2_direct_paged_prefill_defaults_on(monkeypatch):
+    env_name = "BYTE_V2_FA2_DIRECT_PREFILL"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._direct_paged_prefill_enabled() is True
+
+    monkeypatch.setenv(env_name, "1")
+    assert byte_v2_attn_module._direct_paged_prefill_enabled() is True
+
+    monkeypatch.setenv(env_name, "0")
+    assert byte_v2_attn_module._direct_paged_prefill_enabled() is False
+
+    monkeypatch.setenv(env_name, "true")
+    with pytest.raises(ValueError, match="BYTE_V2_FA2_DIRECT_PREFILL"):
+        byte_v2_attn_module._direct_paged_prefill_enabled()
+
+
+def test_byte_v2_cached_prefill_hydrate_to_raw_defaults_off(monkeypatch):
+    env_name = "BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW"
+    monkeypatch.delenv(env_name, raising=False)
+    assert byte_v2_attn_module._cached_prefill_hydrate_to_raw_enabled() is False
+
+    monkeypatch.setenv(env_name, "1")
+    assert byte_v2_attn_module._cached_prefill_hydrate_to_raw_enabled() is True
+
+    monkeypatch.setenv(env_name, "0")
+    assert byte_v2_attn_module._cached_prefill_hydrate_to_raw_enabled() is False
+
+    monkeypatch.setenv(env_name, "true")
+    with pytest.raises(ValueError, match="CACHED_PREFILL_HYDRATE_TO_RAW"):
+        byte_v2_attn_module._cached_prefill_hydrate_to_raw_enabled()
+
+
+def test_byte_v2_cached_prefill_hydrate_requires_hybrid_fallback(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW", "1")
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "0")
+
+    with pytest.raises(RuntimeError, match="requires.*HYBRID_RAW_FALLBACK"):
+        byte_v2_attn_module.ByteV2AttentionImpl(
+            num_heads=32,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=8,
+        )
+
+
+def test_byte_v2_direct_paged_prefill_requires_hybrid_fallback(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_DIRECT_PREFILL", "1")
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "0")
+
+    with pytest.raises(RuntimeError, match="requires.*HYBRID_RAW_FALLBACK"):
+        byte_v2_attn_module.ByteV2AttentionImpl(
+            num_heads=32,
+            head_size=128,
+            scale=0.125,
+            num_kv_heads=8,
+        )
+
+    monkeypatch.delenv("BYTE_V2_FA2_DIRECT_PREFILL")
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    assert impl.direct_paged_prefill is False
+
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_FA2_DIRECT_PREFILL", "0")
+    impl = byte_v2_attn_module.ByteV2AttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=0.125,
+        num_kv_heads=8,
+    )
+    assert impl.direct_paged_prefill is False
+
+
 def test_byte_v2_hybrid_cached_prefill_uses_generic_fa2_reader(monkeypatch):
     impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
     impl.scale = 0.125
@@ -1493,6 +1571,221 @@ def test_byte_v2_hybrid_cached_prefill_uses_generic_fa2_reader(monkeypatch):
     }
 
 
+def test_byte_v2_b1_cached_prefill_defaults_to_hybrid_reader(monkeypatch):
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.cached_prefill_hydrate_to_raw = False
+    impl.scale = 0.125
+    impl.raw_staging_manager = SimpleNamespace(
+        stage_cached_prefill=lambda **kwargs: pytest.fail(
+            f"default-off route staged cached prefill: {kwargs}"
+        )
+    )
+    state = SimpleNamespace(
+        raw_pages=torch.empty((1, 65_536), dtype=torch.uint8),
+        page_to_raw_slot=torch.full((3,), -1, dtype=torch.int32),
+    )
+    impl.raw_fallback_store = SimpleNamespace(state=lambda _: state)
+    calls = []
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_hybrid_paged_decode_attention",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=4,
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([35], dtype=torch.int32),
+        block_table=torch.tensor([[2, 0, 1]], dtype=torch.int32),
+        seq_lens=torch.tensor([35], dtype=torch.int32),
+        max_query_len=4,
+        max_seq_len=35,
+        causal=True,
+        common_prefix_len=0,
+    )
+
+    output = torch.empty((4, 32, 128), dtype=torch.bfloat16)
+    result = impl._forward_prefill_from_cache(
+        torch.empty_like(output),
+        torch.empty((3, 52_096), dtype=torch.uint8),
+        output,
+        metadata,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+
+
+def test_byte_v2_b1_cached_prefill_hydrates_then_uses_raw_fa2(monkeypatch):
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.cached_prefill_hydrate_to_raw = True
+    impl.raw_fallback_store = object()
+    impl.scale = 0.125
+    impl.num_kv_heads = 8
+    impl.head_size = 128
+    impl.tile_policy = DEFAULT_BYTE_V2_TILE_POLICY
+    raw_staging = torch.empty((3, 65_536), dtype=torch.uint8)
+    page_map = torch.full((5,), -1, dtype=torch.int32)
+    local_block_table = torch.arange(3, dtype=torch.int32).view(1, 3)
+    valid_rows = torch.tensor([16, 16, 3], dtype=torch.int32)
+    calls: list[Any] = []
+
+    class FakeManager:
+        def stage_cached_prefill(self, **kwargs):
+            calls.append(("stage", kwargs))
+            return raw_staging, page_map, local_block_table, valid_rows
+
+        def release_cached_prefill(self, *args):
+            calls.append(("release", args))
+
+    impl.raw_staging_manager = FakeManager()
+    query = torch.empty((4, 32, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    kv_cache = torch.empty((5, 52_096), dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        num_actual_tokens=4,
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([35], dtype=torch.int32),
+        block_table=torch.tensor([[4, 1, 3]], dtype=torch.int32),
+        seq_lens=torch.tensor([35], dtype=torch.int32),
+        max_query_len=4,
+        max_seq_len=35,
+        causal=True,
+        common_prefix_len=0,
+    )
+
+    def fake_raw_fa2(*args, **kwargs):
+        calls.append(("raw_fa2", args, kwargs))
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_raw_staging_prefill_attention",
+        fake_raw_fa2,
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_hybrid_paged_decode_attention",
+        lambda *args, **kwargs: pytest.fail("fit B1 route used hybrid FA2"),
+    )
+
+    result = impl._forward_prefill_from_cache(query, kv_cache, output, metadata)
+
+    assert result is output
+    assert [call[0] for call in calls] == ["stage", "raw_fa2", "release"]
+    assert calls[0][1]["seq_len"] == 35
+    assert torch.equal(calls[0][1]["block_table"], metadata.block_table)
+    raw_call = calls[1]
+    assert raw_call[1][2] is raw_staging
+    assert raw_call[1][5] is local_block_table
+    assert raw_call[2]["block_tables_are_staging_slots"] is True
+    assert raw_call[2]["max_query_len"] == 4
+    assert raw_call[2]["max_seq_len"] == 35
+    assert calls[2][1] == (local_block_table, valid_rows)
+
+
+def test_byte_v2_b1_cached_prefill_hydrate_releases_after_fa2_error(
+    monkeypatch,
+):
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.cached_prefill_hydrate_to_raw = True
+    impl.raw_fallback_store = object()
+    impl.scale = 0.125
+    impl.num_kv_heads = 8
+    impl.head_size = 128
+    impl.tile_policy = DEFAULT_BYTE_V2_TILE_POLICY
+    local_block_table = torch.arange(2, dtype=torch.int32).view(1, 2)
+    valid_rows = torch.tensor([16, 1], dtype=torch.int32)
+    released = []
+
+    class FakeManager:
+        def stage_cached_prefill(self, **kwargs):
+            del kwargs
+            return (
+                torch.empty((2, 65_536), dtype=torch.uint8),
+                torch.full((3,), -1, dtype=torch.int32),
+                local_block_table,
+                valid_rows,
+            )
+
+        def release_cached_prefill(self, *args):
+            released.append(args)
+
+    impl.raw_staging_manager = FakeManager()
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([17], dtype=torch.int32),
+        block_table=torch.tensor([[2, 0]], dtype=torch.int32),
+        seq_lens=torch.tensor([17], dtype=torch.int32),
+        max_query_len=2,
+        max_seq_len=17,
+        causal=True,
+        common_prefix_len=0,
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_raw_staging_prefill_attention",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("FA2 failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="FA2 failed"):
+        impl._forward_prefill_from_cache(
+            torch.empty((2, 32, 128), dtype=torch.bfloat16),
+            torch.empty((3, 52_096), dtype=torch.uint8),
+            torch.empty((2, 32, 128), dtype=torch.bfloat16),
+            metadata,
+        )
+    assert released == [(local_block_table, valid_rows)]
+
+
+def test_byte_v2_b1_cached_prefill_hydrate_capacity_falls_back(monkeypatch):
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.cached_prefill_hydrate_to_raw = True
+    impl.scale = 0.125
+    impl.num_kv_heads = 8
+    impl.head_size = 128
+    impl.tile_policy = DEFAULT_BYTE_V2_TILE_POLICY
+    state = SimpleNamespace(
+        raw_pages=torch.empty((1, 65_536), dtype=torch.uint8),
+        page_to_raw_slot=torch.full((3,), -1, dtype=torch.int32),
+    )
+    impl.raw_fallback_store = SimpleNamespace(state=lambda _: state)
+    impl.raw_staging_manager = SimpleNamespace(
+        stage_cached_prefill=lambda **kwargs: None
+    )
+    calls = []
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_hybrid_paged_decode_attention",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([33], dtype=torch.int32),
+        block_table=torch.tensor([[2, 0, 1]], dtype=torch.int32),
+        seq_lens=torch.tensor([33], dtype=torch.int32),
+        max_query_len=2,
+        max_seq_len=33,
+        causal=True,
+        common_prefix_len=0,
+    )
+
+    output = torch.empty((2, 32, 128), dtype=torch.bfloat16)
+    result = impl._forward_prefill_from_cache(
+        torch.empty_like(output),
+        torch.empty((3, 52_096), dtype=torch.uint8),
+        output,
+        metadata,
+    )
+
+    assert result is output
+    assert len(calls) == 1
+
+
 def test_byte_v2_hybrid_cached_prefill_rejects_noncausal_metadata():
     impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
     impl.raw_fallback_store = object()
@@ -1539,6 +1832,135 @@ def test_byte_v2_hybrid_fa2_wrapper_forwards_generic_query_length(monkeypatch):
     assert len(calls) == 1
     assert calls[0][12] == 4
     assert calls[0][13] == 36
+
+
+def test_byte_v2_hybrid_fa2_wrapper_preserves_mixed_dispatch(monkeypatch):
+    calls = []
+
+    def fake_op(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(byte_v2_ops_module, "_require_fa2_op", lambda _: fake_op)
+    query = torch.empty((2, 32, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    common = (
+        output,
+        query,
+        torch.empty((4, 52_096), dtype=torch.uint8),
+        torch.empty((1, 65_536), dtype=torch.uint8),
+        torch.full((4,), -1, dtype=torch.int32),
+        torch.tensor([0, 1, 2], dtype=torch.int32),
+        torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        torch.tensor([17, 33], dtype=torch.int32),
+    )
+
+    byte_v2_ops_module.byte_v2_fa2_hybrid_paged_decode_attention(
+        *common,
+        scale=0.125,
+        max_query_len=1,
+        max_seq_len=33,
+        causal=True,
+        preserve_mixed_dispatch=True,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][12] == 2
+    assert calls[0][13] == 33
+
+    with pytest.raises(ValueError, match="requires causal attention"):
+        byte_v2_ops_module.byte_v2_fa2_hybrid_paged_decode_attention(
+            *common,
+            scale=0.125,
+            max_query_len=1,
+            max_seq_len=33,
+            causal=False,
+            preserve_mixed_dispatch=True,
+        )
+
+
+def test_byte_v2_direct_paged_prefill_wrapper_forwards_raw_pages(monkeypatch):
+    calls = []
+
+    def fake_require_fa2_op(op_name):
+        assert op_name == "varlen_fwd"
+
+        def fake_op(*args):
+            calls.append(args)
+
+        return fake_op
+
+    monkeypatch.setattr(byte_v2_ops_module, "_require_fa2_op", fake_require_fa2_op)
+    fused_qkv = torch.empty((48, 48, 128), dtype=torch.bfloat16)
+    _, key, value = fused_qkv.split((32, 8, 8), dim=1)
+    key_pages = key.view(3, 16, 8, 128)
+    value_pages = value.view(3, 16, 8, 128)
+    assert key_pages.stride() == (98_304, 6144, 128, 1)
+    assert value_pages.stride() == (98_304, 6144, 128, 1)
+    query = torch.empty((29, 32, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    query_start_locs = torch.tensor([0, 13, 29], dtype=torch.int32)
+    block_tables = torch.tensor([[0, 0], [1, 2]], dtype=torch.int32)
+    seq_lens = torch.tensor([13, 16], dtype=torch.int32)
+
+    byte_v2_ops_module.byte_v2_fa2_direct_paged_prefill_attention(
+        output,
+        query,
+        key_pages,
+        value_pages,
+        query_start_locs,
+        block_tables,
+        seq_lens,
+        scale=0.125,
+        max_query_len=16,
+        max_seq_len=16,
+        causal=True,
+    )
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[0] is query
+    assert args[1] is key_pages
+    assert args[2] is value_pages
+    assert args[3] is output
+    assert args[4] is query_start_locs
+    assert args[5] is query_start_locs
+    assert args[6] is seq_lens
+    assert args[8] is block_tables
+    assert args[10] == 16
+    assert args[11] == 16
+
+    q1_start_locs = torch.tensor([0, 1], dtype=torch.int32)
+    byte_v2_ops_module.byte_v2_fa2_direct_paged_prefill_attention(
+        output[:1],
+        query[:1],
+        key_pages,
+        value_pages,
+        q1_start_locs,
+        block_tables[:1, :1],
+        torch.tensor([1], dtype=torch.int32),
+        scale=0.125,
+        max_query_len=1,
+        max_seq_len=1,
+        causal=True,
+        preserve_mixed_dispatch=True,
+    )
+    assert len(calls) == 2
+    assert calls[1][10] == 2
+
+    with pytest.raises(ValueError, match="row-strided BF16 pages"):
+        byte_v2_ops_module.byte_v2_fa2_direct_paged_prefill_attention(
+            output,
+            query,
+            key_pages[:, :, :, ::2],
+            value_pages,
+            query_start_locs,
+            block_tables,
+            seq_lens,
+            scale=0.125,
+            max_query_len=16,
+            max_seq_len=16,
+            causal=True,
+        )
 
 
 def test_byte_v2_raw_staging_fa2_wrapper_builds_paged_views(monkeypatch):
@@ -1590,6 +2012,26 @@ def test_byte_v2_raw_staging_fa2_wrapper_builds_paged_views(monkeypatch):
     assert calls[0][10] == 4
     assert calls[0][11] == 36
 
+    byte_v2_ops_module.byte_v2_fa2_raw_staging_prefill_attention(
+        output,
+        query,
+        raw_staging,
+        page_map,
+        query_start_locs,
+        block_tables,
+        torch.tensor([18, 36], dtype=torch.int32),
+        scale=0.125,
+        num_kv_heads=8,
+        block_size=16,
+        head_dim=128,
+        max_query_len=4,
+        max_seq_len=36,
+        causal=True,
+        block_tables_are_staging_slots=True,
+    )
+    assert len(calls) == 2
+    assert calls[1][8] is block_tables
+
 
 def test_byte_v2_hybrid_q1_update_wrapper_forwards_optional_flags(monkeypatch):
     captured = {}
@@ -1608,6 +2050,33 @@ def test_byte_v2_hybrid_q1_update_wrapper_forwards_optional_flags(monkeypatch):
     flags = torch.empty(1)
 
     byte_v2_ops_module.byte_v2_update_hybrid_cache_raw_staging_q1(
+        *tensors,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+        page_unsafe_flags=flags,
+    )
+
+    assert captured["args"][:15] == tuple(tensors)
+    assert captured["args"][15] == [16, 16, 16, 64, 128, 128]
+    assert captured["args"][16] is flags
+
+
+def test_byte_v2_hybrid_raw_tail_q1_wrapper_forwards_optional_flags(monkeypatch):
+    captured = {}
+
+    def fake_require_op(namespace, op_name):
+        assert namespace == "_C_cache_ops"
+        assert op_name == "byte_v2_update_hybrid_cache_raw_tail_q1"
+
+        def fake_op(*args):
+            captured["args"] = args
+
+        return fake_op
+
+    monkeypatch.setattr(byte_v2_ops_module, "_require_op", fake_require_op)
+    tensors = [torch.empty(1) for _ in range(15)]
+    flags = torch.empty(1)
+
+    byte_v2_ops_module.byte_v2_update_hybrid_cache_raw_tail_q1(
         *tensors,
         tile_policy=(16, 16, 16, 64, 128, 128),
         page_unsafe_flags=flags,
@@ -2318,6 +2787,11 @@ def test_byte_v2_kv_cache_spec_uses_byte_page_layout():
     assert spec.include_raw_payload is False
     assert spec.real_page_size_bytes == ByteV2PageLayoutV5().page_size_bytes
     assert spec.page_size_bytes == ByteV2PageLayoutV5().page_size_bytes
+    assert (
+        spec.page_metadata_size_bytes
+        == ByteV2PageLayoutV5().aligned_metadata_bytes
+        == 896
+    )
     assert backend_cls.get_kv_cache_shape(
         num_blocks=3,
         block_size=spec.block_size,
@@ -2898,6 +3372,173 @@ def test_byte_v2_raw_staging_manager_uses_fused_hybrid_q1_update(monkeypatch):
     assert calls[0][0][4] is hybrid_state.raw_pages
     assert calls[0][0][5] is slot_mapping
     assert calls[0][1]["page_unsafe_flags"] is page_flags
+
+
+def test_byte_v2_raw_staging_manager_hydrates_b1_cached_prefill(monkeypatch):
+    layout = ByteV2RawStagingLayout()
+    workspace = byte_v2_attn_module.ByteV2RawStagingWorkspaceSpec(
+        num_blocks=5,
+        num_staging_slots=3,
+        slot_size_bytes=layout.slot_size_bytes,
+        device=torch.device("cpu"),
+    ).allocate()
+    hybrid_state = SimpleNamespace(
+        raw_pages=torch.empty((2, layout.slot_size_bytes), dtype=torch.uint8),
+        page_to_raw_slot=torch.tensor([-1, 1, -1, 0, -1], dtype=torch.int32),
+    )
+    manager = byte_v2_attn_module.ByteV2RawStagingManager(
+        tile_policy=DEFAULT_BYTE_V2_TILE_POLICY,
+        num_kv_heads=8,
+        raw_fallback_store=SimpleNamespace(state=lambda _: hybrid_state),
+    )
+    manager.bind_shared_workspace(workspace)
+    calls = []
+
+    def hydrate(*args, **kwargs):
+        calls.append(("hydrate", args, kwargs))
+
+    def release(*args, **kwargs):
+        calls.append(("release", args, kwargs))
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_hydrate_raw_staging_from_hybrid_cache",
+        hydrate,
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_release_raw_staging",
+        release,
+    )
+    padded_block_table = torch.tensor(
+        [[4, 1, 3, -1, -1]],
+        dtype=torch.int32,
+    )
+    block_table = padded_block_table[:, :3]
+    assert block_table.stride(0) > block_table.shape[1]
+    kv_cache = torch.empty(
+        (5, ByteV2PageLayoutV5().page_size_bytes),
+        dtype=torch.uint8,
+    )
+
+    staged = manager.stage_cached_prefill(
+        kv_cache=kv_cache,
+        block_table=block_table,
+        seq_len=35,
+    )
+
+    assert staged is not None
+    raw_staging, page_map, local_block_table, valid_rows = staged
+    assert raw_staging.data_ptr() == workspace.raw_staging.data_ptr()
+    assert page_map is workspace.block_to_staging_slot
+    torch.testing.assert_close(
+        local_block_table,
+        torch.tensor([[0, 1, 2]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        valid_rows,
+        torch.tensor([16, 16, 3], dtype=torch.int32),
+    )
+    assert len(calls) == 1
+    hydrate_args = calls[0][1]
+    assert hydrate_args[2] is hybrid_state.raw_pages
+    assert hydrate_args[3] is hybrid_state.page_to_raw_slot
+    assert torch.equal(hydrate_args[4], block_table[0])
+
+    manager.release_cached_prefill(local_block_table, valid_rows)
+    assert [call[0] for call in calls] == ["hydrate", "release"]
+    assert calls[1][1][2] is valid_rows
+
+
+def test_byte_v2_raw_staging_manager_cached_prefill_requires_full_capacity(
+    monkeypatch,
+):
+    layout = ByteV2RawStagingLayout()
+    workspace = byte_v2_attn_module.ByteV2RawStagingWorkspaceSpec(
+        num_blocks=4,
+        num_staging_slots=2,
+        slot_size_bytes=layout.slot_size_bytes,
+        device=torch.device("cpu"),
+    ).allocate()
+    manager = byte_v2_attn_module.ByteV2RawStagingManager(
+        tile_policy=DEFAULT_BYTE_V2_TILE_POLICY,
+        num_kv_heads=8,
+        raw_fallback_store=SimpleNamespace(
+            state=lambda _: pytest.fail("insufficient capacity allocated state")
+        ),
+    )
+    manager.bind_shared_workspace(workspace)
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_hydrate_raw_staging_from_hybrid_cache",
+        lambda *args, **kwargs: pytest.fail("insufficient capacity hydrated"),
+    )
+
+    staged = manager.stage_cached_prefill(
+        kv_cache=torch.empty(
+            (4, ByteV2PageLayoutV5().page_size_bytes),
+            dtype=torch.uint8,
+        ),
+        block_table=torch.tensor([[3, 1, 2]], dtype=torch.int32),
+        seq_len=33,
+    )
+
+    assert staged is None
+    assert bool((workspace.staging_to_physical_block == -1).all())
+    assert bool((workspace.valid_rows == 0).all())
+
+
+def test_byte_v2_raw_staging_manager_releases_failed_cached_hydrate(
+    monkeypatch,
+):
+    layout = ByteV2RawStagingLayout()
+    workspace = byte_v2_attn_module.ByteV2RawStagingWorkspaceSpec(
+        num_blocks=2,
+        num_staging_slots=2,
+        slot_size_bytes=layout.slot_size_bytes,
+        device=torch.device("cpu"),
+    ).allocate()
+    hybrid_state = SimpleNamespace(
+        raw_pages=torch.empty((1, layout.slot_size_bytes), dtype=torch.uint8),
+        page_to_raw_slot=torch.full((2,), -1, dtype=torch.int32),
+    )
+    manager = byte_v2_attn_module.ByteV2RawStagingManager(
+        tile_policy=DEFAULT_BYTE_V2_TILE_POLICY,
+        num_kv_heads=8,
+        raw_fallback_store=SimpleNamespace(state=lambda _: hybrid_state),
+    )
+    manager.bind_shared_workspace(workspace)
+    released = []
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_hydrate_raw_staging_from_hybrid_cache",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("hydrate failed")),
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_release_raw_staging",
+        lambda *args, **kwargs: released.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="hydrate failed"):
+        manager.stage_cached_prefill(
+            kv_cache=torch.empty(
+                (2, ByteV2PageLayoutV5().page_size_bytes),
+                dtype=torch.uint8,
+            ),
+            block_table=torch.tensor([[1, 0]], dtype=torch.int32),
+            seq_len=17,
+        )
+
+    assert len(released) == 1
+    torch.testing.assert_close(
+        released[0][0][1],
+        torch.tensor([0, 1], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        released[0][0][2],
+        torch.tensor([16, 1], dtype=torch.int32),
+    )
 
 
 def test_byte_v2_raw_staging_manager_routes_test_forced_raw_only_after_q1(
@@ -3586,6 +4227,406 @@ def test_byte_v2_attention_metadata_builder_preserves_common_prefix_len():
     assert metadata.tile_policy == DEFAULT_BYTE_V2_TILE_POLICY
 
 
+def test_byte_v2_metadata_builder_uses_prefill_sequence_length_upper_bound(
+    monkeypatch,
+):
+    monkeypatch.setenv("BYTE_V2_FA2_DIRECT_PREFILL", "1")
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    builder = object.__new__(byte_v2_attn_module.ByteV2AttentionMetadataBuilder)
+    builder.tile_policy = DEFAULT_BYTE_V2_TILE_POLICY
+    query_start_loc = torch.tensor([0, 16], dtype=torch.int32)
+    common_attn_metadata = SimpleNamespace(
+        num_actual_tokens=16,
+        num_reqs=1,
+        max_query_len=16,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc.cpu(),
+        max_seq_len=16,
+        seq_lens=torch.tensor([16], dtype=torch.int32),
+        _seq_lens_cpu=None,
+        seq_lens_cpu_upper_bound=torch.tensor([16], dtype=torch.int32),
+        block_table_tensor=torch.zeros((1, 1), dtype=torch.int32),
+        slot_mapping=torch.arange(16, dtype=torch.int64),
+        causal=True,
+    )
+
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common_attn_metadata,
+    )
+
+    assert metadata.seq_lens_cpu is None
+    assert (
+        metadata.seq_lens_cpu_upper_bound
+        is common_attn_metadata.seq_lens_cpu_upper_bound
+    )
+    assert metadata.seq_len_sum is None
+    assert metadata.direct_prefill_plan is not None
+    assert metadata.direct_prefill_plan.cached_request_count == 0
+    assert len(metadata.direct_prefill_plan.groups) == 1
+
+
+def test_byte_v2_direct_prefill_plan_splits_ragged_initial_suffix():
+    query_start_loc = torch.tensor(
+        [0, 1, 2, 3, 4, 4096, 8192, 12_288, 16_384],
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor(
+        [4097, 4097, 4097, 4097, 4092, 4096, 4096, 4096],
+        dtype=torch.int32,
+    )
+
+    plan = byte_v2_attn_module._build_byte_v2_direct_prefill_plan(
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=seq_lens,
+        num_reqs=8,
+        num_actual_tokens=16_384,
+        device=torch.device("cpu"),
+        block_size=16,
+    )
+
+    assert plan is not None
+    assert plan.cached_request_count == 4
+    assert plan.cached_token_count == 4
+    assert plan.cached_max_query_len == 1
+    assert plan.cached_max_seq_len == 4097
+    assert len(plan.groups) == 2
+
+    ragged, aligned = plan.groups
+    assert (
+        ragged.first_request,
+        ragged.num_requests,
+        ragged.first_token,
+        ragged.num_tokens,
+        ragged.rounded_tokens,
+        ragged.max_query_len,
+    ) == (4, 1, 4, 4092, 4096, 4092)
+    torch.testing.assert_close(
+        ragged.query_start_loc,
+        torch.tensor([0, 4092], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        ragged.block_table[0],
+        torch.arange(256, dtype=torch.int32),
+    )
+
+    assert (
+        aligned.first_request,
+        aligned.num_requests,
+        aligned.first_token,
+        aligned.num_tokens,
+        aligned.rounded_tokens,
+        aligned.max_query_len,
+    ) == (5, 3, 4096, 12_288, 12_288, 4096)
+    torch.testing.assert_close(
+        aligned.query_start_loc,
+        torch.tensor([0, 4096, 8192, 12_288], dtype=torch.int32),
+    )
+    for row in range(3):
+        torch.testing.assert_close(
+            aligned.block_table[row],
+            torch.arange(row * 256, (row + 1) * 256, dtype=torch.int32),
+        )
+
+
+def test_byte_v2_direct_prefill_plan_handles_pure_initial_batch():
+    query_start_loc = torch.arange(0, 16_385, 4096, dtype=torch.int32)
+    seq_lens = torch.full((4,), 4096, dtype=torch.int32)
+
+    plan = byte_v2_attn_module._build_byte_v2_direct_prefill_plan(
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=seq_lens,
+        num_reqs=4,
+        num_actual_tokens=16_384,
+        device=torch.device("cpu"),
+        block_size=16,
+    )
+
+    assert plan is not None
+    assert plan.cached_request_count == 0
+    assert plan.cached_token_count == 0
+    assert plan.cached_max_query_len == 0
+    assert plan.cached_max_seq_len == 0
+    assert len(plan.groups) == 1
+    assert plan.groups[0].num_requests == 4
+    assert plan.groups[0].num_tokens == 16_384
+    assert plan.groups[0].rounded_tokens == 16_384
+    assert plan.groups[0].query_start_loc.data_ptr() == query_start_loc.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("seq_len", "expected"),
+    [
+        pytest.param(16, False, id="initial-prefill"),
+        pytest.param(17, True, id="cached-prefill"),
+    ],
+)
+def test_byte_v2_prefill_cached_context_uses_cpu_upper_bound(
+    monkeypatch,
+    seq_len,
+    expected,
+):
+    metadata = SimpleNamespace(
+        num_actual_tokens=16,
+        query_start_loc_cpu=torch.tensor([0, 16], dtype=torch.int32),
+        seq_lens_cpu=None,
+        seq_lens_cpu_upper_bound=torch.tensor([seq_len], dtype=torch.int32),
+        seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+    )
+
+    def fail_device_readback(_):
+        raise AssertionError("device seq_lens must not be copied to CPU")
+
+    monkeypatch.setattr(
+        byte_v2_attn_module.ByteV2AttentionImpl,
+        "_metadata_seq_lens_cpu",
+        fail_device_readback,
+    )
+
+    assert (
+        byte_v2_attn_module.ByteV2AttentionImpl._prefill_has_cached_context(metadata)
+        is expected
+    )
+
+
+def test_byte_v2_direct_prefill_plan_rejects_noncontiguous_device_starts():
+    query_start_loc_cpu = torch.tensor([0, 16], dtype=torch.int32)
+    query_start_loc = torch.tensor(
+        [[0, -1], [16, -1]],
+        dtype=torch.int32,
+    )[:, 0]
+    assert not query_start_loc.is_contiguous()
+
+    assert (
+        byte_v2_attn_module._build_byte_v2_direct_prefill_plan(
+            query_start_loc_cpu=query_start_loc_cpu,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=torch.tensor([16], dtype=torch.int32),
+            num_reqs=1,
+            num_actual_tokens=16,
+            device=torch.device("cpu"),
+            block_size=16,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("query_start_loc", "seq_lens", "num_reqs", "num_actual_tokens"),
+    [
+        pytest.param(
+            torch.tensor([0, 1, 17, 18], dtype=torch.int32),
+            torch.tensor([17, 16, 17], dtype=torch.int32),
+            3,
+            18,
+            id="interleaved-cached-initial-cached",
+        ),
+        pytest.param(
+            torch.tensor([0, 1], dtype=torch.int32),
+            None,
+            1,
+            1,
+            id="missing-sequence-lengths",
+        ),
+    ],
+)
+def test_byte_v2_direct_prefill_plan_fails_closed(
+    query_start_loc,
+    seq_lens,
+    num_reqs,
+    num_actual_tokens,
+):
+    assert (
+        byte_v2_attn_module._build_byte_v2_direct_prefill_plan(
+            query_start_loc_cpu=query_start_loc,
+            seq_lens_cpu=seq_lens,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_actual_tokens,
+            device=torch.device("cpu"),
+            block_size=16,
+        )
+        is None
+    )
+
+
+def test_byte_v2_direct_prefill_routes_cached_prefix_and_initial_groups(monkeypatch):
+    query_start_loc = torch.tensor([0, 1, 14, 30], dtype=torch.int32)
+    seq_lens = torch.tensor([17, 13, 16], dtype=torch.int32)
+    plan = byte_v2_attn_module._build_byte_v2_direct_prefill_plan(
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=seq_lens,
+        num_reqs=3,
+        num_actual_tokens=30,
+        device=torch.device("cpu"),
+        block_size=16,
+    )
+    assert plan is not None
+
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.scale = 0.125
+    impl.num_heads = 32
+    impl.num_kv_heads = 8
+    impl.head_size = 128
+    impl.tile_policy = DEFAULT_BYTE_V2_TILE_POLICY
+    impl.direct_paged_prefill = True
+    state = SimpleNamespace(
+        raw_pages=torch.empty((2, 65_536), dtype=torch.uint8),
+        page_to_raw_slot=torch.full((8,), -1, dtype=torch.int32),
+    )
+    impl.raw_fallback_store = SimpleNamespace(state=lambda _: state)
+    fused_qkv = torch.empty((30, 48, 128), dtype=torch.bfloat16)
+    query, key, value = fused_qkv.split((32, 8, 8), dim=1)
+    assert key.stride() == (6144, 128, 1)
+    assert value.stride() == (6144, 128, 1)
+    output = torch.empty_like(query)
+    kv_cache = torch.empty((8, 52_096), dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        direct_prefill_plan=plan,
+        causal=True,
+        num_actual_tokens=30,
+        query_start_loc=query_start_loc,
+        block_table=torch.tensor([[0, 1], [2, 0], [3, 0]], dtype=torch.int32),
+        seq_lens=seq_lens,
+    )
+    hybrid_calls = []
+    direct_calls = []
+
+    def fake_hybrid(*args, **kwargs):
+        hybrid_calls.append((args, kwargs))
+
+    def fake_direct(*args, **kwargs):
+        direct_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_hybrid_paged_decode_attention",
+        fake_hybrid,
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_direct_paged_prefill_attention",
+        fake_direct,
+    )
+
+    assert impl._forward_direct_paged_prefill(
+        query,
+        key,
+        value,
+        kv_cache,
+        output,
+        metadata,
+    )
+
+    assert len(hybrid_calls) == 1
+    hybrid_args, hybrid_kwargs = hybrid_calls[0]
+    assert hybrid_args[0].data_ptr() == output.data_ptr()
+    assert hybrid_args[1].data_ptr() == query.data_ptr()
+    assert hybrid_args[3] is state.raw_pages
+    assert hybrid_args[4] is state.page_to_raw_slot
+    assert hybrid_kwargs["max_query_len"] == 1
+    assert hybrid_kwargs["max_seq_len"] == 17
+    assert hybrid_kwargs["preserve_mixed_dispatch"] is True
+
+    assert len(direct_calls) == 2
+    first_args, first_kwargs = direct_calls[0]
+    assert first_args[0].data_ptr() == output[1:].data_ptr()
+    assert first_args[1].data_ptr() == query[1:].data_ptr()
+    assert first_args[2].data_ptr() == key[1:].data_ptr()
+    assert first_args[3].data_ptr() == value[1:].data_ptr()
+    assert first_args[2].shape == (1, 16, 8, 128)
+    assert first_kwargs["max_query_len"] == 13
+    assert first_kwargs["max_seq_len"] == 13
+    assert first_kwargs["preserve_mixed_dispatch"] is True
+
+    second_args, second_kwargs = direct_calls[1]
+    assert second_args[0].data_ptr() == output[14:].data_ptr()
+    assert second_args[1].data_ptr() == query[14:].data_ptr()
+    assert second_args[2].data_ptr() == key[14:].data_ptr()
+    assert second_args[3].data_ptr() == value[14:].data_ptr()
+    assert second_args[2].shape == (1, 16, 8, 128)
+    assert second_kwargs["max_query_len"] == 16
+    assert second_kwargs["max_seq_len"] == 16
+    assert second_kwargs["preserve_mixed_dispatch"] is True
+
+
+def test_byte_v2_direct_prefill_rejects_unpadded_final_ragged_group(monkeypatch):
+    query_start_loc = torch.tensor([0, 1, 14], dtype=torch.int32)
+    seq_lens = torch.tensor([17, 13], dtype=torch.int32)
+    plan = byte_v2_attn_module._build_byte_v2_direct_prefill_plan(
+        query_start_loc_cpu=query_start_loc,
+        seq_lens_cpu=seq_lens,
+        num_reqs=2,
+        num_actual_tokens=14,
+        device=torch.device("cpu"),
+        block_size=16,
+    )
+    assert plan is not None
+
+    impl = object.__new__(byte_v2_attn_module.ByteV2AttentionImpl)
+    impl.scale = 0.125
+    impl.num_heads = 32
+    impl.num_kv_heads = 8
+    impl.head_size = 128
+    impl.tile_policy = DEFAULT_BYTE_V2_TILE_POLICY
+    impl.direct_paged_prefill = True
+    impl.raw_fallback_store = object()
+    query = torch.empty((14, 32, 128), dtype=torch.bfloat16)
+    key = torch.empty((14, 8, 128), dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    output = torch.empty_like(query)
+    metadata = SimpleNamespace(
+        direct_prefill_plan=plan,
+        causal=True,
+        num_actual_tokens=14,
+        query_start_loc=query_start_loc,
+        block_table=torch.tensor([[0, 1], [2, 0]], dtype=torch.int32),
+        seq_lens=seq_lens,
+    )
+    calls = []
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_hybrid_paged_decode_attention",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        byte_v2_attn_module,
+        "byte_v2_fa2_direct_paged_prefill_attention",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    assert not impl._forward_direct_paged_prefill(
+        query,
+        key,
+        value,
+        torch.empty((4, 52_096), dtype=torch.uint8),
+        output,
+        metadata,
+    )
+    assert calls == []
+
+    state = SimpleNamespace(
+        raw_pages=torch.empty((2, 65_536), dtype=torch.uint8),
+        page_to_raw_slot=torch.full((4,), -1, dtype=torch.int32),
+    )
+    impl.raw_fallback_store = SimpleNamespace(state=lambda _: state)
+    padded_key = torch.empty((17, 8, 128), dtype=torch.bfloat16)
+    padded_value = torch.empty_like(padded_key)
+
+    assert impl._forward_direct_paged_prefill(
+        query,
+        padded_key,
+        padded_value,
+        torch.empty((4, 52_096), dtype=torch.uint8),
+        output,
+        metadata,
+    )
+    assert len(calls) == 2
+    direct_args, direct_kwargs = calls[1]
+    assert direct_args[2].shape == (1, 16, 8, 128)
+    assert direct_args[2].data_ptr() == padded_key[1:].data_ptr()
+    assert direct_kwargs["max_query_len"] == 13
+
+
 def test_byte_v2_attention_forward_uses_paged_decode_for_prefix_prefill(
     monkeypatch,
 ):
@@ -3976,6 +5017,171 @@ def test_byte_v2_hybrid_fa2_python_wrapper_q4_matches_raw_bitwise():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_direct_prefill_split_matches_mixed_hybrid_bitwise():
+    from scripts.byte_v2_fa2_oracle import (
+        add_hybrid_raw_pages,
+        hybrid_fa2_oracle_ops_are_available,
+        make_inputs,
+    )
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    tensors = make_inputs(
+        (17, 13, 16),
+        query_len=1,
+        force_outliers=True,
+        permute_pages=True,
+    )
+    block_table = tensors["block_table"]
+    raw_key = tensors["key"]
+    raw_value = tensors["value"]
+    assert isinstance(block_table, torch.Tensor)
+    assert isinstance(raw_key, torch.Tensor)
+    assert isinstance(raw_value, torch.Tensor)
+    cached_pages = block_table[0, :2].detach().cpu().tolist()
+    add_hybrid_raw_pages(tensors, cached_pages[-1:], reverse_raw_slots=True)
+
+    query_values = torch.arange(
+        30 * 32 * 128,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    query = ((query_values % 127) / 31).reshape(30, 32, 128).to(torch.bfloat16)
+    query_start_locs = torch.tensor([0, 1, 14, 30], dtype=torch.int32, device="cuda")
+    seq_lens = tensors["seq_lens"]
+    assert isinstance(seq_lens, torch.Tensor)
+
+    reference_out, reference_lse = torch.ops._vllm_fa2_C.byte_v2_hybrid_varlen_fwd(
+        query,
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        tensors["page_to_raw_slot"],
+        None,
+        torch.empty_like(query),
+        query_start_locs,
+        query_start_locs,
+        seq_lens,
+        None,
+        block_table,
+        None,
+        16,
+        17,
+        0.0,
+        float(tensors["scale"]),
+        False,
+        True,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+
+    cached_query_start_locs = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    cached_out, cached_lse = torch.ops._vllm_fa2_C.byte_v2_hybrid_varlen_fwd(
+        query[:1],
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        tensors["page_to_raw_slot"],
+        None,
+        torch.empty_like(query[:1]),
+        cached_query_start_locs,
+        cached_query_start_locs,
+        seq_lens[:1],
+        None,
+        block_table[:1],
+        None,
+        2,
+        17,
+        0.0,
+        float(tensors["scale"]),
+        False,
+        True,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+
+    key = torch.empty((30, 8, 128), dtype=torch.bfloat16, device="cuda")
+    fused_value = torch.empty((30, 48, 128), dtype=torch.bfloat16, device="cuda")
+    value = fused_value[:, 40:]
+
+    def logical_tokens(cache, request_index, seq_len):
+        pages = block_table[request_index, : (seq_len + 15) // 16].long()
+        return cache.index_select(0, pages).flatten(0, 1)[:seq_len]
+
+    cached_key = logical_tokens(raw_key, 0, 17)
+    cached_value = logical_tokens(raw_value, 0, 17)
+    first_initial_key = logical_tokens(raw_key, 1, 13)
+    first_initial_value = logical_tokens(raw_value, 1, 13)
+    second_initial_key = logical_tokens(raw_key, 2, 16)
+    second_initial_value = logical_tokens(raw_value, 2, 16)
+    key[0].copy_(cached_key[-1])
+    value[0].copy_(cached_value[-1])
+    key[1:14].copy_(first_initial_key)
+    value[1:14].copy_(first_initial_value)
+    key[14:].copy_(second_initial_key)
+    value[14:].copy_(second_initial_value)
+    assert key.stride() == (1024, 128, 1)
+    assert value.stride() == (6144, 128, 1)
+
+    def run_direct_group(first_token, query_len):
+        rounded_tokens = (query_len + 15) // 16 * 16
+        key_pages = key.narrow(0, first_token, rounded_tokens).view(-1, 16, 8, 128)
+        value_pages = value.narrow(0, first_token, rounded_tokens).view_as(key_pages)
+        group_query_start_locs = torch.tensor(
+            [0, query_len], dtype=torch.int32, device="cuda"
+        )
+        group_block_table = torch.arange(
+            rounded_tokens // 16,
+            dtype=torch.int32,
+            device="cuda",
+        ).unsqueeze(0)
+        return torch.ops._vllm_fa2_C.varlen_fwd(
+            query[first_token : first_token + query_len],
+            key_pages,
+            value_pages,
+            torch.empty_like(query[first_token : first_token + query_len]),
+            group_query_start_locs,
+            group_query_start_locs,
+            torch.tensor([query_len], dtype=torch.int32, device="cuda"),
+            None,
+            group_block_table,
+            None,
+            query_len,
+            query_len,
+            0.0,
+            float(tensors["scale"]),
+            False,
+            True,
+            -1,
+            -1,
+            0.0,
+            False,
+            0,
+            None,
+        )
+
+    first_initial_out, first_initial_lse = run_direct_group(1, 13)
+    second_initial_out, second_initial_lse = run_direct_group(14, 16)
+    torch.accelerator.synchronize()
+
+    split_out = torch.cat((cached_out, first_initial_out, second_initial_out))
+    split_lse = torch.cat((cached_lse, first_initial_lse, second_initial_lse), dim=1)
+    assert (
+        int((split_out.view(torch.int16) != reference_out.view(torch.int16)).sum()) == 0
+    )
+    assert (
+        int((split_lse.view(torch.int32) != reference_lse.view(torch.int32)).sum()) == 0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_byte_v2_hybrid_initial_prefill_staging_matches_raw_fa2_bitwise():
     from scripts.byte_v2_fa2_oracle import (
         compare_hybrid_byte_v2_and_raw,
@@ -4052,6 +5258,155 @@ def test_byte_v2_hybrid_initial_prefill_staging_matches_raw_fa2_bitwise():
     assert result["out_max_abs"] == 0.0
     assert result["lse_max_abs"] == 0.0
     assert bool((page_map == -1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "source",
+    ["compact-safe", "compact-outlier", "authoritative-raw"],
+)
+def test_byte_v2_cached_prefill_full_hydrate_matches_raw_fa2_bitwise(source):
+    from scripts.byte_v2_fa2_oracle import (
+        add_hybrid_raw_pages,
+        hybrid_fa2_oracle_ops_are_available,
+        make_inputs,
+    )
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    seq_len = 47
+    query_len = 8
+    tensors = make_inputs(
+        (seq_len,),
+        query_len=query_len,
+        force_outliers=source == "compact-outlier",
+        permute_pages=True,
+    )
+    block_table = tensors["block_table"]
+    byte_cache = tensors["byte_cache"]
+    query = tensors["query"]
+    assert isinstance(block_table, torch.Tensor)
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(query, torch.Tensor)
+    active_physical_pages = block_table[0, :3].cpu().tolist()
+    assert active_physical_pages != sorted(active_physical_pages)
+    if source == "authoritative-raw":
+        physical_pages = [active_physical_pages[0], active_physical_pages[-1]]
+        add_hybrid_raw_pages(tensors, physical_pages)
+    else:
+        add_hybrid_raw_pages(tensors, ())
+
+    persistent_raw = tensors["raw_staging"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(persistent_raw, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    if source == "compact-outlier":
+        cache_cpu = byte_cache.cpu()
+        stats = collect_byte_v2_fallback_stats(
+            cache_cpu,
+            layout=ByteV2PageLayoutV5(),
+        )
+        assert stats.overlay_tiles > 0
+        assert stats.fallback_tiles == 0
+        overflow_offset = ByteV2PageLayoutV5().outlier_pool_overflow_offset
+        assert int(cache_cpu[:, overflow_offset].sum()) == 0
+    elif source == "authoritative-raw":
+        page_map_cpu = page_to_raw_slot.cpu()
+        assert int(page_map_cpu[physical_pages[0]]) == 1
+        assert int(page_map_cpu[physical_pages[1]]) == 0
+        assert int(page_map_cpu[active_physical_pages[1]]) == -1
+    num_pages = (seq_len + 15) // 16
+    workspace = byte_v2_attn_module.ByteV2RawStagingWorkspaceSpec(
+        num_blocks=byte_cache.shape[0],
+        num_staging_slots=num_pages,
+        slot_size_bytes=ByteV2RawStagingLayout().slot_size_bytes,
+        device=byte_cache.device,
+    ).allocate()
+    hybrid_state = SimpleNamespace(
+        raw_pages=persistent_raw,
+        page_to_raw_slot=page_to_raw_slot,
+    )
+    manager = byte_v2_attn_module.ByteV2RawStagingManager(
+        tile_policy=DEFAULT_BYTE_V2_TILE_POLICY,
+        num_kv_heads=8,
+        raw_fallback_store=SimpleNamespace(state=lambda _: hybrid_state),
+    )
+    manager.bind_shared_workspace(workspace)
+
+    padded_block_table = torch.full(
+        (1, num_pages + 2),
+        -1,
+        dtype=torch.int32,
+        device=block_table.device,
+    )
+    padded_block_table[:, :num_pages].copy_(block_table)
+    staged = manager.stage_cached_prefill(
+        kv_cache=byte_cache,
+        block_table=padded_block_table[:, :num_pages],
+        seq_len=seq_len,
+    )
+    assert staged is not None
+    raw_staging, _, local_block_table, valid_rows = staged
+    torch.testing.assert_close(
+        valid_rows.cpu(),
+        torch.tensor([16, 16, 15], dtype=torch.int32),
+    )
+    staged_kv = raw_staging.view(torch.bfloat16).view(
+        num_pages,
+        2,
+        8,
+        16,
+        128,
+    )
+    staged_key = staged_kv[:, 0].permute(0, 2, 1, 3)
+    staged_value = staged_kv[:, 1].permute(0, 2, 1, 3)
+    common = (
+        tensors["cu_seqlens_q"],
+        tensors["dummy_cu_seqlens_k"],
+        tensors["seq_lens"],
+        None,
+        local_block_table,
+        None,
+        query_len,
+        seq_len,
+        0.0,
+        tensors["scale"],
+        False,
+        True,
+        -1,
+        -1,
+        0.0,
+        False,
+        0,
+        None,
+    )
+    staged_out, staged_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+        query,
+        staged_key,
+        staged_value,
+        torch.empty_like(query),
+        *common,
+    )
+    raw_common = list(common)
+    raw_common[4] = block_table
+    raw_out, raw_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+        query,
+        tensors["key"],
+        tensors["value"],
+        torch.empty_like(query),
+        *raw_common,
+    )
+    manager.release_cached_prefill(local_block_table, valid_rows)
+    torch.accelerator.synchronize()
+
+    assert int((staged_out.view(torch.int16) != raw_out.view(torch.int16)).sum()) == 0
+    assert int((staged_lse.view(torch.int32) != raw_lse.view(torch.int32)).sum()) == 0
+    assert bool((workspace.block_to_staging_slot == -1).all())
+    assert bool((workspace.staging_to_physical_block == -1).all())
+    assert bool((workspace.valid_rows == 0).all())
+    assert int(workspace.next_staging_slot) == 0
+    assert int(workspace.overflow) == 0
 
 
 def _run_byte_v2_hybrid_fa2_subprocess(probe: str):
@@ -4177,6 +5532,86 @@ def test_byte_v2_hybrid_fa2_invalid_raw_slot_fails_closed_in_subprocess():
     assert "hybrid_invalid_map_unexpected_success" not in combined_output
 
 
+def _run_byte_v2_nonsplit_kv_smem_reuse_subprocess(env_value: str | None):
+    probe_source = r"""
+import json
+
+import torch
+import vllm.vllm_flash_attn  # noqa: F401
+
+from scripts.byte_v2_fa2_oracle import (
+    add_hybrid_raw_pages,
+    compare_hybrid_byte_v2_and_raw,
+    make_inputs,
+)
+
+tensors = make_inputs(
+    (257, 385),
+    query_len=1,
+    force_outliers=True,
+    permute_pages=True,
+)
+block_table = tensors["block_table"]
+assert isinstance(block_table, torch.Tensor)
+physical_pages = sorted(set(block_table.cpu().flatten().tolist()))
+add_hybrid_raw_pages(tensors, [physical_pages[0], physical_pages[-1]])
+result = compare_hybrid_byte_v2_and_raw(
+    tensors,
+    query_len=1,
+    iterations=3,
+    num_splits=1,
+)
+assert result["out_mismatch"] == 0, result
+assert result["lse_mismatch"] == 0, result
+assert result["out_max_abs"] == 0.0, result
+assert result["lse_max_abs"] == 0.0, result
+print({"nonsplit_kv_smem_reuse_ok": json.dumps(result)}, flush=True)
+"""
+    repo_root = Path(__file__).resolve().parents[3]
+    env = os.environ.copy()
+    if env_value is None:
+        env.pop("BYTE_V2_FA2_REUSE_KV_SMEM_NONSPLIT", None)
+    else:
+        env["BYTE_V2_FA2_REUSE_KV_SMEM_NONSPLIT"] = env_value
+    return subprocess.run(
+        [sys.executable, "-c", probe_source],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("env_value", [None, "0", "1"])
+def test_byte_v2_nonsplit_kv_smem_reuse_matches_raw_bitwise_subprocess(env_value):
+    from scripts.byte_v2_fa2_oracle import hybrid_fa2_oracle_ops_are_available
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    completed = _run_byte_v2_nonsplit_kv_smem_reuse_subprocess(env_value)
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined_output
+    assert "nonsplit_kv_smem_reuse_ok" in combined_output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_nonsplit_kv_smem_reuse_invalid_env_fails_closed_subprocess():
+    from scripts.byte_v2_fa2_oracle import hybrid_fa2_oracle_ops_are_available
+
+    if not hybrid_fa2_oracle_ops_are_available():
+        pytest.skip("Hybrid ByteV2 and raw FA2 extension ops are not registered")
+
+    completed = _run_byte_v2_nonsplit_kv_smem_reuse_subprocess("invalid")
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, combined_output
+    assert "must be unset, 0, or 1" in combined_output
+    assert "nonsplit_kv_smem_reuse_ok" not in combined_output
+
+
 _BYTE_V2_HYBRID_WRITER_OPS = (
     "byte_v2_prepare_raw_staging",
     "byte_v2_hydrate_raw_staging_from_hybrid_cache",
@@ -4196,6 +5631,20 @@ def _byte_v2_hybrid_writer_ops_are_available() -> bool:
 def _byte_v2_fused_hybrid_writer_q1_op_is_available() -> bool:
     return _byte_v2_hybrid_writer_ops_are_available() and _has_torch_op(
         "_C_cache_ops", "byte_v2_update_hybrid_cache_raw_staging_q1"
+    )
+
+
+def _byte_v2_raw_tail_q1_op_is_available() -> bool:
+    return (
+        _byte_v2_hybrid_writer_ops_are_available()
+        and callable(
+            getattr(
+                byte_v2_ops_module,
+                "byte_v2_update_hybrid_cache_raw_tail_q1",
+                None,
+            )
+        )
+        and _has_torch_op("_C_cache_ops", "byte_v2_update_hybrid_cache_raw_tail_q1")
     )
 
 
@@ -4526,6 +5975,55 @@ def _byte_v2_fused_hybrid_writer_q1_update(
     )
 
 
+def _byte_v2_raw_tail_q1_update(
+    tensors,
+    state,
+    slot_mapping: torch.Tensor,
+    *,
+    page_unsafe_flags: torch.Tensor | None = None,
+) -> None:
+    assert slot_mapping.shape == (1,)
+    raw_key = tensors["key"]
+    raw_value = tensors["value"]
+    byte_cache = tensors["byte_cache"]
+    persistent_raw_staging = tensors["raw_staging"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    assert isinstance(raw_key, torch.Tensor)
+    assert isinstance(raw_value, torch.Tensor)
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(persistent_raw_staging, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+
+    flat_key = raw_key.view(-1, 8, 128)
+    flat_value = raw_value.view(-1, 8, 128)
+    if int(slot_mapping[0].cpu().item()) < 0:
+        key = torch.zeros_like(flat_key[:1])
+        value = torch.zeros_like(flat_value[:1])
+    else:
+        key = flat_key.index_select(0, slot_mapping)
+        value = flat_value.index_select(0, slot_mapping)
+    update_op = byte_v2_ops_module.byte_v2_update_hybrid_cache_raw_tail_q1
+    update_op(
+        key,
+        value,
+        state.transient_raw_staging[:1],
+        byte_cache,
+        persistent_raw_staging,
+        slot_mapping,
+        state.block_to_staging_slot,
+        state.staging_to_physical_block[:1],
+        state.valid_rows[:1],
+        state.next_staging_slot,
+        state.staging_overflow,
+        page_to_raw_slot,
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        state.raw_pool_overflow,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+        page_unsafe_flags=page_unsafe_flags,
+    )
+
+
 def _byte_v2_test_force_promote_hybrid_q1(
     tensors,
     state,
@@ -4651,6 +6149,30 @@ def _byte_v2_q34_full_two_page_mapping(device: torch.device) -> torch.Tensor:
     interleaved = torch.stack((page_rows + 16, page_rows), dim=1).flatten()
     return torch.cat(
         (interleaved[:9], interleaved.new_tensor([-1, -1]), interleaved[9:])
+    )
+
+
+def _byte_v2_production_n106_cached_tail_mappings(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # This reproduces the production n106/capacity33 shape: four full pages,
+    # one 15-row continuation, and 27 one-row cached-tail appends. The spare
+    # staging slot is intentional; the production wave touches 32 unique pages.
+    singleton_rows = (
+        (0,) * 4 + (1,) * 4 + (2,) * 4 + (3,) * 4 + (4,) * 4 + (5,) * 3 + (6,) * 4
+    )
+    seed_slots = [4 * 16]
+    update_slots = list(range(4 * 16))
+    update_slots.extend(range(4 * 16 + 1, 5 * 16))
+    for physical_block, row in enumerate(singleton_rows, start=5):
+        seed_slots.extend(physical_block * 16 + prefix_row for prefix_row in range(row))
+        update_slots.append(physical_block * 16 + row)
+
+    assert len(singleton_rows) == 27
+    assert len(update_slots) == 106
+    return (
+        torch.tensor(seed_slots, dtype=torch.int64, device=device),
+        torch.tensor(update_slots, dtype=torch.int64, device=device),
     )
 
 
@@ -5012,6 +6534,78 @@ def test_byte_v2_fused_hybrid_small_batch_matches_generic_bitwise(source):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("source", ["compact", "existing-raw"])
+def test_byte_v2_fused_hybrid_b32_distinct_pages_matches_generic_bitwise(source):
+    _require_byte_v2_fused_multi_token_hybrid_writer_reader_ops()
+    tensors, state, full_slots = _make_byte_v2_hybrid_writer_case(
+        seq_len=512,
+        force_outliers=source == "compact",
+        force_pool_overflow=source == "existing-raw",
+        raw_pool_slots=32,
+    )
+    _byte_v2_hybrid_writer_update(
+        tensors,
+        state,
+        full_slots,
+        active_capacity=32,
+    )
+    torch.accelerator.synchronize()
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    if source == "compact":
+        assert bool((page_to_raw_slot == -1).all())
+    else:
+        assert bool((page_to_raw_slot >= 0).all())
+        tensors["byte_cache"].zero_()
+
+    slot_mapping = (
+        torch.arange(32, dtype=torch.int64, device=full_slots.device) * 16 + 15
+    )
+    for tensor_name in ("key", "value"):
+        flat = tensors[tensor_name].view(-1, 8, 128)
+        flat.index_copy_(0, slot_mapping, -flat.index_select(0, slot_mapping))
+
+    reference_tensors, reference_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    candidate_tensors, candidate_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    reference_flags = torch.zeros(
+        (tensors["byte_cache"].size(0),),
+        dtype=torch.int32,
+        device=tensors["byte_cache"].device,
+    )
+    candidate_flags = torch.zeros_like(reference_flags)
+
+    _byte_v2_hybrid_writer_update(
+        reference_tensors,
+        reference_state,
+        slot_mapping,
+        active_capacity=32,
+        page_unsafe_flags=reference_flags,
+    )
+    _byte_v2_fused_hybrid_writer_multi_token_update(
+        candidate_tensors,
+        candidate_state,
+        slot_mapping,
+        active_capacity=32,
+        page_unsafe_flags=candidate_flags,
+    )
+    torch.accelerator.synchronize()
+
+    _assert_byte_v2_hybrid_writer_matches_raw(reference_tensors)
+    _assert_byte_v2_hybrid_writer_matches_raw(candidate_tensors)
+    _assert_byte_v2_hybrid_writers_are_canonically_equal(
+        reference_tensors,
+        reference_state,
+        candidate_tensors,
+        candidate_state,
+        reference_flags,
+        candidate_flags,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_pages", [2, 3, 4])
 def test_byte_v2_fused_hybrid_multi_token_adaptive_ctas_are_bitwise(
     num_pages,
@@ -5084,7 +6678,7 @@ def test_byte_v2_fused_hybrid_multi_token_adaptive_ctas_are_bitwise(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("num_tokens", [16, 17])
+@pytest.mark.parametrize("num_tokens", [16, 17, 32, 33])
 def test_byte_v2_fused_hybrid_multi_token_dispatch_boundary_is_bitwise(
     num_tokens,
 ):
@@ -5103,9 +6697,15 @@ def test_byte_v2_fused_hybrid_multi_token_dispatch_boundary_is_bitwise(
     torch.accelerator.synchronize()
     assert bool((tensors["page_to_raw_slot"] == -1).all())
 
-    slot_mapping = torch.arange(16, dtype=torch.int64, device=full_slots.device)
-    if num_tokens == 17:
+    if num_tokens == 16:
+        slot_mapping = torch.arange(16, dtype=torch.int64, device=full_slots.device)
+    elif num_tokens == 17:
+        slot_mapping = torch.arange(16, dtype=torch.int64, device=full_slots.device)
         slot_mapping = torch.cat((slot_mapping, slot_mapping.new_tensor([31])))
+    else:
+        slot_mapping = torch.arange(32, dtype=torch.int64, device=full_slots.device)
+        if num_tokens == 33:
+            slot_mapping = torch.cat((slot_mapping, slot_mapping.new_tensor([-1])))
     updated_slots = slot_mapping[slot_mapping >= 0]
     for tensor_name in ("key", "value"):
         flat = tensors[tensor_name].view(-1, 8, 128)
@@ -5152,6 +6752,355 @@ def test_byte_v2_fused_hybrid_multi_token_dispatch_boundary_is_bitwise(
     )
 
 
+def _byte_v2_cooperative_writer_selector_probe() -> None:
+    assert _byte_v2_fused_hybrid_writer_multi_token_op_is_available()
+    tensors, state, full_slots = _make_byte_v2_hybrid_writer_case(
+        seq_len=32,
+        force_outliers=True,
+        raw_pool_slots=2,
+    )
+    _byte_v2_hybrid_writer_update(
+        tensors,
+        state,
+        full_slots,
+        active_capacity=2,
+    )
+    torch.accelerator.synchronize()
+    assert bool((tensors["page_to_raw_slot"] == -1).all())
+
+    # N=17 selects the generic fallback with a limit of 16 and the cooperative
+    # writer with a limit of 32. Both routes must remain canonically identical.
+    slot_mapping = torch.arange(16, dtype=torch.int64, device=full_slots.device)
+    slot_mapping = torch.cat((slot_mapping, slot_mapping.new_tensor([31])))
+    for tensor_name in ("key", "value"):
+        flat = tensors[tensor_name].view(-1, 8, 128)
+        flat.index_copy_(0, slot_mapping, -flat.index_select(0, slot_mapping))
+
+    reference_tensors, reference_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    candidate_tensors, candidate_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    reference_flags = torch.zeros(
+        (tensors["byte_cache"].size(0),),
+        dtype=torch.int32,
+        device=tensors["byte_cache"].device,
+    )
+    candidate_flags = torch.zeros_like(reference_flags)
+
+    _byte_v2_hybrid_writer_update(
+        reference_tensors,
+        reference_state,
+        slot_mapping,
+        active_capacity=2,
+        page_unsafe_flags=reference_flags,
+    )
+    _byte_v2_fused_hybrid_writer_multi_token_update(
+        candidate_tensors,
+        candidate_state,
+        slot_mapping,
+        active_capacity=2,
+        page_unsafe_flags=candidate_flags,
+    )
+    torch.accelerator.synchronize()
+
+    _assert_byte_v2_hybrid_writer_matches_raw(reference_tensors)
+    _assert_byte_v2_hybrid_writer_matches_raw(candidate_tensors)
+    _assert_byte_v2_hybrid_writers_are_canonically_equal(
+        reference_tensors,
+        reference_state,
+        candidate_tensors,
+        candidate_state,
+        reference_flags,
+        candidate_flags,
+    )
+    print({"cooperative_writer_selector_ok": True}, flush=True)
+
+
+def _byte_v2_cooperative_writer_n106_capacity33_probe() -> None:
+    assert _byte_v2_fused_hybrid_writer_multi_token_op_is_available()
+    tensors, state, _ = _make_byte_v2_hybrid_writer_case(
+        seq_len=33 * 16,
+        force_outliers=True,
+        raw_pool_slots=33,
+    )
+    seed_slots, slot_mapping = _byte_v2_production_n106_cached_tail_mappings(
+        tensors["byte_cache"].device
+    )
+    _byte_v2_hybrid_writer_update(
+        tensors,
+        state,
+        seed_slots,
+        active_capacity=33,
+    )
+    torch.accelerator.synchronize()
+    assert bool((tensors["page_to_raw_slot"] == -1).all())
+    assert slot_mapping.numel() == 106
+    assert slot_mapping.unique().numel() == 106
+    assert (slot_mapping // 16).unique().numel() == 32
+
+    for tensor_name in ("key", "value"):
+        flat = tensors[tensor_name].view(-1, 8, 128)
+        flat.index_copy_(0, slot_mapping, -flat.index_select(0, slot_mapping))
+
+    reference_tensors, reference_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    candidate_tensors, candidate_state = _clone_byte_v2_hybrid_writer_case(
+        tensors, state
+    )
+    reference_flags = torch.zeros(
+        (tensors["byte_cache"].size(0),),
+        dtype=torch.int32,
+        device=tensors["byte_cache"].device,
+    )
+    candidate_flags = torch.zeros_like(reference_flags)
+
+    _byte_v2_hybrid_writer_update(
+        reference_tensors,
+        reference_state,
+        slot_mapping,
+        active_capacity=33,
+        page_unsafe_flags=reference_flags,
+    )
+    _byte_v2_fused_hybrid_writer_multi_token_update(
+        candidate_tensors,
+        candidate_state,
+        slot_mapping,
+        active_capacity=33,
+        page_unsafe_flags=candidate_flags,
+    )
+    torch.accelerator.synchronize()
+
+    decoded_valid_rows_list = [0] * 32
+    for slot in slot_mapping.cpu().tolist():
+        physical_block, row = divmod(slot, 16)
+        decoded_valid_rows_list[physical_block] = max(
+            decoded_valid_rows_list[physical_block], row + 1
+        )
+    decoded_valid_rows = torch.tensor(
+        decoded_valid_rows_list,
+        dtype=torch.int32,
+        device=slot_mapping.device,
+    )
+    decoded_physical_blocks = torch.arange(
+        32,
+        dtype=torch.int32,
+        device=slot_mapping.device,
+    )
+
+    def hydrate_updated_pages(updated_tensors, updated_state):
+        decoded = torch.zeros_like(updated_state.transient_raw_staging[:32])
+        torch.ops._C_cache_ops.byte_v2_hydrate_raw_staging_from_hybrid_cache(
+            decoded,
+            updated_tensors["byte_cache"],
+            updated_tensors["raw_staging"],
+            updated_tensors["page_to_raw_slot"],
+            decoded_physical_blocks,
+            decoded_valid_rows,
+            16,
+            16,
+            16,
+        )
+        return decoded
+
+    torch.testing.assert_close(
+        hydrate_updated_pages(reference_tensors, reference_state),
+        hydrate_updated_pages(candidate_tensors, candidate_state),
+        atol=0,
+        rtol=0,
+    )
+    _assert_byte_v2_hybrid_writers_are_canonically_equal(
+        reference_tensors,
+        reference_state,
+        candidate_tensors,
+        candidate_state,
+        reference_flags,
+        candidate_flags,
+    )
+    print({"cooperative_writer_n106_capacity33_ok": True}, flush=True)
+
+
+def _byte_v2_cooperative_writer_retained_boundary_probe() -> None:
+    assert _byte_v2_retained_hybrid_writer_multi_token_op_is_available()
+    for seq_len in (32, 33):
+        test_byte_v2_retained_initial_prefill_matches_raw_fa2_bitwise(seq_len)
+    print({"cooperative_writer_retained_boundary_ok": True}, flush=True)
+
+
+def _byte_v2_cooperative_writer_max_boundary_probe() -> None:
+    assert _byte_v2_fused_hybrid_writer_multi_token_op_is_available()
+    max_capacity = 145
+    tensors, state, full_slots = _make_byte_v2_hybrid_writer_case(
+        seq_len=max_capacity * 16,
+        force_outliers=True,
+        raw_pool_slots=max_capacity,
+    )
+    _byte_v2_hybrid_writer_update(
+        tensors,
+        state,
+        full_slots,
+        active_capacity=max_capacity,
+    )
+    torch.accelerator.synchronize()
+
+    updated_slots = full_slots.view(max_capacity, 16)[:, 15]
+
+    # Cover both independent selector inputs. N=144/capacity=144 is the
+    # cooperative maximum; either N=145 or capacity=145 must use generic.
+    for num_tokens, active_capacity in ((144, 144), (144, 145), (145, 145)):
+        slot_mapping = updated_slots[:num_tokens].contiguous()
+        reference_tensors, reference_state = _clone_byte_v2_hybrid_writer_case(
+            tensors, state
+        )
+        candidate_tensors, candidate_state = _clone_byte_v2_hybrid_writer_case(
+            tensors, state
+        )
+        for updated_tensors in (reference_tensors, candidate_tensors):
+            for tensor_name in ("key", "value"):
+                flat = updated_tensors[tensor_name].view(-1, 8, 128)
+                flat.index_copy_(
+                    0,
+                    slot_mapping,
+                    -flat.index_select(0, slot_mapping),
+                )
+        reference_flags = torch.zeros(
+            (tensors["byte_cache"].size(0),),
+            dtype=torch.int32,
+            device=tensors["byte_cache"].device,
+        )
+        candidate_flags = torch.zeros_like(reference_flags)
+
+        _byte_v2_hybrid_writer_update(
+            reference_tensors,
+            reference_state,
+            slot_mapping,
+            active_capacity=active_capacity,
+            page_unsafe_flags=reference_flags,
+        )
+        _byte_v2_fused_hybrid_writer_multi_token_update(
+            candidate_tensors,
+            candidate_state,
+            slot_mapping,
+            active_capacity=active_capacity,
+            page_unsafe_flags=candidate_flags,
+        )
+        torch.accelerator.synchronize()
+
+        _assert_byte_v2_hybrid_writer_matches_raw(reference_tensors)
+        _assert_byte_v2_hybrid_writer_matches_raw(candidate_tensors)
+        _assert_byte_v2_hybrid_writers_are_canonically_equal(
+            reference_tensors,
+            reference_state,
+            candidate_tensors,
+            candidate_state,
+            reference_flags,
+            candidate_flags,
+        )
+    print({"cooperative_writer_max_boundary_ok": True}, flush=True)
+
+
+def _run_byte_v2_cooperative_writer_selector_subprocess(
+    env_value: str | None,
+    probe_name: str = "_byte_v2_cooperative_writer_selector_probe",
+):
+    probe_source = r"""
+import runpy
+import sys
+
+namespace = runpy.run_path(sys.argv[1])
+namespace[sys.argv[2]]()
+"""
+    env = os.environ.copy()
+    if env_value is None:
+        env.pop("BYTE_V2_HYBRID_COOPERATIVE_WRITER_LIMIT", None)
+    else:
+        env["BYTE_V2_HYBRID_COOPERATIVE_WRITER_LIMIT"] = env_value
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            probe_source,
+            str(Path(__file__).resolve()),
+            probe_name,
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("env_value", [None, "16", "32", "144"])
+def test_byte_v2_cooperative_writer_selector_is_bitwise_subprocess(env_value):
+    if not _byte_v2_fused_hybrid_writer_multi_token_op_is_available():
+        pytest.skip("ByteV2 fused hybrid multi-token writer op is not registered")
+
+    completed = _run_byte_v2_cooperative_writer_selector_subprocess(env_value)
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined_output
+    assert "cooperative_writer_selector_ok" in combined_output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_cooperative_writer_selector_invalid_env_fails_closed_subprocess():
+    if not _byte_v2_fused_hybrid_writer_multi_token_op_is_available():
+        pytest.skip("ByteV2 fused hybrid multi-token writer op is not registered")
+
+    completed = _run_byte_v2_cooperative_writer_selector_subprocess("17")
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, combined_output
+    assert "must be one of 16, 32, or 144, got 17" in combined_output
+    assert "cooperative_writer_selector_ok" not in combined_output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_cooperative_writer_n106_capacity33_is_canonical_subprocess():
+    if not _byte_v2_fused_hybrid_writer_multi_token_op_is_available():
+        pytest.skip("ByteV2 fused hybrid multi-token writer op is not registered")
+
+    completed = _run_byte_v2_cooperative_writer_selector_subprocess(
+        "144",
+        "_byte_v2_cooperative_writer_n106_capacity33_probe",
+    )
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined_output
+    assert "cooperative_writer_n106_capacity33_ok" in combined_output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_cooperative_writer_144_retained_boundary_is_bitwise_subprocess():
+    if not _byte_v2_retained_hybrid_writer_multi_token_op_is_available():
+        pytest.skip("ByteV2 retained hybrid writer op is not registered")
+    _require_byte_v2_hybrid_writer_reader_ops()
+
+    completed = _run_byte_v2_cooperative_writer_selector_subprocess(
+        "144",
+        "_byte_v2_cooperative_writer_retained_boundary_probe",
+    )
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined_output
+    assert "cooperative_writer_retained_boundary_ok" in combined_output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_cooperative_writer_144_max_boundary_is_canonical_subprocess():
+    if not _byte_v2_fused_hybrid_writer_multi_token_op_is_available():
+        pytest.skip("ByteV2 fused hybrid multi-token writer op is not registered")
+
+    completed = _run_byte_v2_cooperative_writer_selector_subprocess(
+        "144",
+        "_byte_v2_cooperative_writer_max_boundary_probe",
+    )
+    combined_output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, combined_output
+    assert "cooperative_writer_max_boundary_ok" in combined_output
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_byte_v2_fused_hybrid_multi_token_all_dummy_q34_is_noop():
     _require_byte_v2_fused_multi_token_hybrid_writer_reader_ops()
@@ -5190,7 +7139,7 @@ def test_byte_v2_fused_hybrid_multi_token_all_dummy_q34_is_noop():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("num_tokens", [16, 34])
+@pytest.mark.parametrize("num_tokens", [16, 32, 34])
 def test_byte_v2_fused_hybrid_multi_token_cuda_graph_reuses_workspace(
     num_tokens,
 ):
@@ -5244,11 +7193,12 @@ def test_byte_v2_fused_hybrid_multi_token_cuda_graph_reuses_workspace(
     with torch.cuda.graph(graph):
         update()
 
-    actual_slots = (
-        torch.arange(16, dtype=torch.int64, device=flat_key.device)
-        if num_tokens == 16
-        else _byte_v2_q34_full_two_page_mapping(flat_key.device)
-    )
+    if num_tokens == 16:
+        actual_slots = torch.arange(16, dtype=torch.int64, device=flat_key.device)
+    elif num_tokens == 32:
+        actual_slots = torch.arange(32, dtype=torch.int64, device=flat_key.device)
+    else:
+        actual_slots = _byte_v2_q34_full_two_page_mapping(flat_key.device)
     safe_slots = actual_slots.clamp_min(0)
     graph_key.copy_(flat_key.index_select(0, safe_slots))
     graph_value.copy_(flat_value.index_select(0, safe_slots))
@@ -5289,6 +7239,428 @@ def test_byte_v2_fused_hybrid_multi_token_cuda_graph_reuses_workspace(
     for tensor, snapshot in zip(watched, snapshots):
         torch.testing.assert_close(tensor, snapshot, atol=0, rtol=0)
     _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_tail_q1_holds_one_slot_until_safe_page_seal():
+    if not _byte_v2_raw_tail_q1_op_is_available():
+        pytest.skip("ByteV2 raw-tail Q1 writer op is not registered")
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        seq_len=16,
+        raw_pool_slots=1,
+    )
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    persistent_raw_staging = tensors["raw_staging"]
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    assert isinstance(persistent_raw_staging, torch.Tensor)
+
+    raw_slot = -1
+    for row in range(15):
+        _byte_v2_raw_tail_q1_update(
+            tensors,
+            state,
+            slot_mapping[row : row + 1],
+        )
+        torch.accelerator.synchronize()
+        mapped_slot = int(page_to_raw_slot[0].item())
+        if row == 0:
+            raw_slot = mapped_slot
+            assert raw_slot == 0
+        assert mapped_slot == raw_slot
+        assert int(state.free_raw_slot_count.item()) == 0
+        assert int(state.raw_pool_overflow.item()) == 0
+        _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+    persistent_bf16 = persistent_raw_staging.view(torch.bfloat16).reshape(
+        -1,
+        2,
+        8,
+        16,
+        128,
+    )
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 0].permute(1, 0, 2)[:15],
+        tensors["key"][0, :15],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 1].permute(1, 0, 2)[:15],
+        tensors["value"][0, :15],
+        atol=0,
+        rtol=0,
+    )
+
+    _byte_v2_raw_tail_q1_update(tensors, state, slot_mapping[15:])
+    torch.accelerator.synchronize()
+
+    assert int(page_to_raw_slot[0].item()) == -1
+    assert int(state.free_raw_slot_count.item()) == 1
+    assert int(state.free_raw_slots[0].item()) == raw_slot
+    assert int(state.raw_pool_overflow.item()) == 0
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+    # A sealed safe page must be reconstructable from compact storage alone.
+    hydrated = torch.zeros_like(state.transient_raw_staging[:1])
+    physical_blocks = torch.tensor(
+        [0], dtype=torch.int32, device=page_to_raw_slot.device
+    )
+    valid_rows = torch.tensor([16], dtype=torch.int32, device=page_to_raw_slot.device)
+    torch.ops._C_cache_ops.byte_v2_hydrate_raw_staging_from_hybrid_cache(
+        hydrated,
+        tensors["byte_cache"],
+        persistent_raw_staging,
+        page_to_raw_slot,
+        physical_blocks,
+        valid_rows,
+        16,
+        16,
+        16,
+    )
+    torch.accelerator.synchronize()
+    hydrated_bf16 = hydrated.view(torch.bfloat16).reshape(1, 2, 8, 16, 128)
+    torch.testing.assert_close(
+        hydrated_bf16[0, 0].permute(1, 0, 2),
+        tensors["key"][0],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        hydrated_bf16[0, 1].permute(1, 0, 2),
+        tensors["value"][0],
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_tail_q1_overflow_seal_retains_raw_authority_bitwise():
+    if not _byte_v2_raw_tail_q1_op_is_available():
+        pytest.skip("ByteV2 raw-tail Q1 writer op is not registered")
+    _require_byte_v2_hybrid_writer_reader_ops()
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        seq_len=16,
+        force_pool_overflow=True,
+        raw_pool_slots=1,
+    )
+    byte_cache = tensors["byte_cache"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    persistent_raw_staging = tensors["raw_staging"]
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    assert isinstance(persistent_raw_staging, torch.Tensor)
+
+    _byte_v2_raw_tail_q1_update(tensors, state, slot_mapping[:1])
+    torch.accelerator.synchronize()
+    raw_slot = int(page_to_raw_slot[0].item())
+    assert raw_slot == 0
+    assert int(state.free_raw_slot_count.item()) == 0
+
+    for slot in slot_mapping[1:].split(1):
+        _byte_v2_raw_tail_q1_update(tensors, state, slot)
+    torch.accelerator.synchronize()
+
+    # The row-15 full compact attempt overflowed, so raw must remain the
+    # authoritative representation and its slot must not be returned.
+    layout = ByteV2PageLayoutV5()
+    assert (
+        _load_u32_bytes(
+            byte_cache.cpu(),
+            0,
+            layout.outlier_pool_overflow_offset,
+        )
+        != 0
+    )
+    assert int(page_to_raw_slot[0].item()) == raw_slot
+    assert int(state.free_raw_slot_count.item()) == 0
+    assert int(state.raw_pool_overflow.item()) == 0
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+    hydrated = torch.zeros_like(state.transient_raw_staging[:1])
+    physical_blocks = torch.tensor(
+        [0], dtype=torch.int32, device=page_to_raw_slot.device
+    )
+    valid_rows = torch.tensor([16], dtype=torch.int32, device=page_to_raw_slot.device)
+    torch.ops._C_cache_ops.byte_v2_hydrate_raw_staging_from_hybrid_cache(
+        hydrated,
+        byte_cache,
+        persistent_raw_staging,
+        page_to_raw_slot,
+        physical_blocks,
+        valid_rows,
+        16,
+        16,
+        16,
+    )
+    torch.accelerator.synchronize()
+    hydrated_bf16 = hydrated.view(torch.bfloat16).reshape(1, 2, 8, 16, 128)
+    torch.testing.assert_close(
+        hydrated_bf16[0, 0].permute(1, 0, 2),
+        tensors["key"][0],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        hydrated_bf16[0, 1].permute(1, 0, 2),
+        tensors["value"][0],
+        atol=0,
+        rtol=0,
+    )
+    _assert_byte_v2_hybrid_writer_matches_raw(tensors)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_tail_q1_existing_raw_page_is_authoritative():
+    if not _byte_v2_raw_tail_q1_op_is_available():
+        pytest.skip("ByteV2 raw-tail Q1 writer op is not registered")
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        seq_len=2,
+        raw_pool_slots=1,
+    )
+    byte_cache = tensors["byte_cache"]
+    page_to_raw_slot = tensors["page_to_raw_slot"]
+    persistent_raw_staging = tensors["raw_staging"]
+    assert isinstance(byte_cache, torch.Tensor)
+    assert isinstance(page_to_raw_slot, torch.Tensor)
+    assert isinstance(persistent_raw_staging, torch.Tensor)
+
+    _byte_v2_raw_tail_q1_update(tensors, state, slot_mapping[:1])
+    torch.accelerator.synchronize()
+    raw_slot = int(page_to_raw_slot[0].item())
+    assert raw_slot == 0
+    assert int(state.free_raw_slot_count.item()) == 0
+
+    # A mapped raw page is authoritative. Poisoning compact storage must not
+    # alter the retained prefix when the next row is appended.
+    byte_cache[0].fill_(0xA5)
+    poisoned_compact = byte_cache.clone()
+    _byte_v2_raw_tail_q1_update(tensors, state, slot_mapping[1:])
+    torch.accelerator.synchronize()
+
+    assert int(page_to_raw_slot[0].item()) == raw_slot
+    assert int(state.free_raw_slot_count.item()) == 0
+    assert int(state.raw_pool_overflow.item()) == 0
+    torch.testing.assert_close(byte_cache, poisoned_compact, atol=0, rtol=0)
+    persistent_bf16 = persistent_raw_staging.view(torch.bfloat16).reshape(
+        -1,
+        2,
+        8,
+        16,
+        128,
+    )
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 0].permute(1, 0, 2)[:2],
+        tensors["key"][0, :2],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 1].permute(1, 0, 2)[:2],
+        tensors["value"][0, :2],
+        atol=0,
+        rtol=0,
+    )
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_tail_q1_mapped_row_supports_strided_sources():
+    if not _byte_v2_raw_tail_q1_op_is_available():
+        pytest.skip("ByteV2 raw-tail Q1 writer op is not registered")
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        seq_len=2,
+        raw_pool_slots=1,
+    )
+    _byte_v2_raw_tail_q1_update(tensors, state, slot_mapping[:1])
+    torch.accelerator.synchronize()
+
+    # The mapped-row fast path vectorizes contiguous aligned sources, but the
+    # public op accepts general K/V strides and must retain its scalar fallback.
+    key_storage = torch.empty(
+        (1, 8, 256),
+        dtype=torch.bfloat16,
+        device=tensors["key"].device,
+    )
+    value_storage = torch.empty_like(key_storage)
+    key = key_storage[..., ::2]
+    value = value_storage[..., ::2]
+    key.copy_(tensors["key"][0, 1].unsqueeze(0))
+    value.copy_(tensors["value"][0, 1].unsqueeze(0))
+    assert key.shape == (1, 8, 128) and key.stride(2) == 2
+    assert value.shape == (1, 8, 128) and value.stride(2) == 2
+
+    update_op = byte_v2_ops_module.byte_v2_update_hybrid_cache_raw_tail_q1
+    update_op(
+        key,
+        value,
+        state.transient_raw_staging[:1],
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        slot_mapping[1:],
+        state.block_to_staging_slot,
+        state.staging_to_physical_block[:1],
+        state.valid_rows[:1],
+        state.next_staging_slot,
+        state.staging_overflow,
+        tensors["page_to_raw_slot"],
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        state.raw_pool_overflow,
+        tile_policy=(16, 16, 16, 64, 128, 128),
+    )
+    torch.accelerator.synchronize()
+
+    raw_slot = int(tensors["page_to_raw_slot"][0].item())
+    persistent_bf16 = (
+        tensors["raw_staging"]
+        .view(torch.bfloat16)
+        .reshape(
+            -1,
+            2,
+            8,
+            16,
+            128,
+        )
+    )
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 0, :, 1],
+        key[0],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        persistent_bf16[raw_slot, 1, :, 1],
+        value[0],
+        atol=0,
+        rtol=0,
+    )
+    assert int(state.raw_pool_overflow.item()) == 0
+    _assert_byte_v2_hybrid_writer_transient_state_is_clean(state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_tail_q1_dummy_slot_is_noop():
+    if not _byte_v2_raw_tail_q1_op_is_available():
+        pytest.skip("ByteV2 raw-tail Q1 writer op is not registered")
+    tensors, state, _ = _make_byte_v2_hybrid_writer_case(raw_pool_slots=1)
+    page_flags = torch.full(
+        (tensors["byte_cache"].size(0),),
+        7,
+        dtype=torch.int32,
+        device=tensors["byte_cache"].device,
+    )
+    watched = (
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        tensors["page_to_raw_slot"],
+        state.transient_raw_staging,
+        state.block_to_staging_slot,
+        state.staging_to_physical_block,
+        state.valid_rows,
+        state.next_staging_slot,
+        state.staging_overflow,
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        state.raw_pool_overflow,
+        page_flags,
+    )
+    snapshots = [tensor.clone() for tensor in watched]
+
+    _byte_v2_raw_tail_q1_update(
+        tensors,
+        state,
+        torch.tensor([-1], dtype=torch.int64, device=tensors["byte_cache"].device),
+        page_unsafe_flags=page_flags,
+    )
+    torch.accelerator.synchronize()
+
+    for tensor, snapshot in zip(watched, snapshots):
+        torch.testing.assert_close(tensor, snapshot, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_byte_v2_raw_tail_q1_cuda_graph_seals_and_reuses_slot():
+    if not _byte_v2_raw_tail_q1_op_is_available():
+        pytest.skip("ByteV2 raw-tail Q1 writer op is not registered")
+    tensors, state, slot_mapping = _make_byte_v2_hybrid_writer_case(
+        seq_len=17,
+        raw_pool_slots=1,
+    )
+    flat_key = tensors["key"].view(-1, 8, 128)
+    flat_value = tensors["value"].view(-1, 8, 128)
+    graph_key = torch.zeros_like(flat_key[:1])
+    graph_value = torch.zeros_like(flat_value[:1])
+    graph_slot = torch.full(
+        (1,),
+        -1,
+        dtype=torch.int64,
+        device=tensors["byte_cache"].device,
+    )
+
+    def update() -> None:
+        update_op = byte_v2_ops_module.byte_v2_update_hybrid_cache_raw_tail_q1
+        update_op(
+            graph_key,
+            graph_value,
+            state.transient_raw_staging[:1],
+            tensors["byte_cache"],
+            tensors["raw_staging"],
+            graph_slot,
+            state.block_to_staging_slot,
+            state.staging_to_physical_block[:1],
+            state.valid_rows[:1],
+            state.next_staging_slot,
+            state.staging_overflow,
+            tensors["page_to_raw_slot"],
+            state.free_raw_slots,
+            state.free_raw_slot_count,
+            state.raw_pool_overflow,
+            tile_policy=(16, 16, 16, 64, 128, 128),
+        )
+
+    update()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        update()
+
+    def replay(token_idx: int) -> None:
+        graph_key.copy_(flat_key[token_idx : token_idx + 1])
+        graph_value.copy_(flat_value[token_idx : token_idx + 1])
+        graph_slot.copy_(slot_mapping[token_idx : token_idx + 1])
+        graph.replay()
+
+    for token_idx in range(16):
+        replay(token_idx)
+    torch.accelerator.synchronize()
+    assert tensors["page_to_raw_slot"].cpu().tolist() == [-1, -1]
+    assert int(state.free_raw_slot_count.item()) == 1
+    assert int(state.raw_pool_overflow.item()) == 0
+
+    # The next page must reuse the slot just released by the row-15 seal.
+    replay(16)
+    torch.accelerator.synchronize()
+    assert tensors["page_to_raw_slot"].cpu().tolist() == [-1, 0]
+    assert int(state.free_raw_slot_count.item()) == 0
+    assert int(state.raw_pool_overflow.item()) == 0
+    _assert_byte_v2_hybrid_writer_matches_raw(tensors)
+
+    watched = (
+        tensors["byte_cache"],
+        tensors["raw_staging"],
+        tensors["page_to_raw_slot"],
+        state.free_raw_slots,
+        state.free_raw_slot_count,
+        state.raw_pool_overflow,
+    )
+    snapshots = [tensor.clone() for tensor in watched]
+    graph_key.zero_()
+    graph_value.zero_()
+    graph_slot.fill_(-1)
+    graph.replay()
+    torch.accelerator.synchronize()
+    for tensor, snapshot in zip(watched, snapshots):
+        torch.testing.assert_close(tensor, snapshot, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -6003,6 +8375,25 @@ def _byte_v2_fused_hybrid_multi_token_fatal_probe(probe: str) -> None:
             [0, 16], dtype=torch.int64, device=tensors["byte_cache"].device
         )
         active_capacity = 1
+    elif probe == "cross-boundary-duplicate-slot":
+        tensors, state, _ = _make_byte_v2_hybrid_writer_case(
+            seq_len=32, raw_pool_slots=2
+        )
+        slot_mapping = torch.arange(
+            32, dtype=torch.int64, device=tensors["byte_cache"].device
+        )
+        slot_mapping[-1] = 0
+        active_capacity = 2
+    elif probe == "b32-capacity-overflow":
+        tensors, state, _ = _make_byte_v2_hybrid_writer_case(
+            seq_len=512, raw_pool_slots=32
+        )
+        slot_mapping = (
+            torch.arange(32, dtype=torch.int64, device=tensors["byte_cache"].device)
+            * 16
+            + 15
+        )
+        active_capacity = 31
     elif probe == "pool-exhaustion":
         tensors, state, full_slots = _make_byte_v2_hybrid_writer_case(
             seq_len=32,
@@ -6037,7 +8428,15 @@ def _byte_v2_fused_hybrid_multi_token_fatal_probe(probe: str) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "probe", ["invalid-map", "duplicate-slot", "capacity-overflow", "pool-exhaustion"]
+    "probe",
+    [
+        "invalid-map",
+        "duplicate-slot",
+        "capacity-overflow",
+        "cross-boundary-duplicate-slot",
+        "b32-capacity-overflow",
+        "pool-exhaustion",
+    ],
 )
 def test_byte_v2_fused_hybrid_multi_token_fatal_state_fails_closed_subprocess(
     probe,

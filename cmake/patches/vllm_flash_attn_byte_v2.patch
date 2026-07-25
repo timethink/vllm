@@ -476,7 +476,7 @@ index 7512828..3f82db0 100644
  #include "block_info.h"
  #include "kernel_traits.h"
  #include "utils.h"
-@@ -27,6 +29,18 @@ using namespace cute;
+@@ -27,6 +29,28 @@ using namespace cute;
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  
@@ -490,12 +490,22 @@ index 7512828..3f82db0 100644
 +    static constexpr bool ReuseKvSmem = Loader::ReuseKvSmem;
 +};
 +
++template <typename Loader, typename = void>
++struct ExternalKvLoaderNonsplitConfig {
++    static constexpr bool ReuseKvSmemNonsplit = false;
++};
++
++template <typename Loader>
++struct ExternalKvLoaderNonsplitConfig<Loader, std::void_t<decltype(Loader::ReuseKvSmemNonsplit)>> {
++    static constexpr bool ReuseKvSmemNonsplit = Loader::ReuseKvSmemNonsplit;
++};
++
 +////////////////////////////////////////////////////////////////////////////////////////////////////
 +
  template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
  __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
          // When params.unpadded_lse is false, LSE is written as (b, h, seqlen_q) - this is non-variable seqlen path.
-@@ -495,7 +509,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
+@@ -495,7 +519,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  
@@ -504,14 +514,15 @@ index 7512828..3f82db0 100644
  inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
  
      using Element = typename Kernel_traits::Element;
-@@ -512,6 +526,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -512,6 +536,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
      constexpr int kBlockN = Kernel_traits::kBlockN;
      constexpr int kHeadDim = Kernel_traits::kHeadDim;
      constexpr int kNWarps = Kernel_traits::kNWarps;
 +    constexpr bool Has_external_kv_loader =
 +        !std::is_void_v<ExternalKvLoader>;
 +    constexpr bool Reuse_kv_smem =
-+        Split && ExternalKvLoaderConfig<ExternalKvLoader>::ReuseKvSmem;
++        ExternalKvLoaderConfig<ExternalKvLoader>::ReuseKvSmem &&
++        (Split || ExternalKvLoaderNonsplitConfig<ExternalKvLoader>::ReuseKvSmemNonsplit);
 +
 +    if constexpr (Has_external_kv_loader) {
 +        static_assert(kHeadDim == 128, "ByteV2 FA2 loader supports head dim 128");
@@ -523,7 +534,7 @@ index 7512828..3f82db0 100644
  
      using GmemTiledCopyO = std::conditional_t<
          !Split,
-@@ -607,7 +633,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -607,7 +644,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
      Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                              typename Kernel_traits::SmemLayoutQ{});
      Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
@@ -534,7 +545,7 @@ index 7512828..3f82db0 100644
      Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
      Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
  
-@@ -629,12 +657,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -629,12 +668,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
      Tensor tVgV = make_tensor(tVgV_.data(), reshape_thread_tile(tVgV_.layout()));
      Tensor tVsV = make_tensor(tVsV_.data(), reshape_thread_tile(tVsV_.layout()));
  
@@ -550,7 +561,7 @@ index 7512828..3f82db0 100644
      }
  
      typename Kernel_traits::TiledMma tiled_mma;
-@@ -793,7 +823,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -793,7 +834,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                  if (n_block > n_block_copy_min) {
                      tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
                          block_table, params.v_batch_stride, params.v_row_stride);
@@ -559,7 +570,7 @@ index 7512828..3f82db0 100644
                          block_table, params.k_batch_stride, params.k_row_stride);
                  }
              }
-@@ -848,8 +878,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -848,8 +889,15 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
  
      int n_block = n_block_max - 1;
      // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
@@ -577,7 +588,7 @@ index 7512828..3f82db0 100644
      cute::cp_async_fence();
  
      // FLASH_NAMESPACE::cp_async_wait<0>();
-@@ -880,29 +917,64 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -880,29 +928,64 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
          clear(acc_s);
          FLASH_NAMESPACE::cp_async_wait<0>();
@@ -655,7 +666,7 @@ index 7512828..3f82db0 100644
          // if (cute::thread0()) { print(acc_s); }
          if constexpr (Is_softcap){
              FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
-@@ -914,22 +986,36 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -914,22 +997,36 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          );
  
          FLASH_NAMESPACE::cp_async_wait<0>();
@@ -703,7 +714,7 @@ index 7512828..3f82db0 100644
          }
  
          // We have key_padding_mask so we'll need to Check_inf
-@@ -946,6 +1032,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -946,6 +1043,18 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
  
          FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
  
@@ -722,7 +733,7 @@ index 7512828..3f82db0 100644
          // This check is at the end of the loop since we always have at least 1 iteration
          if (n_masking_steps > 1 && n_block <= n_block_min) {
              --n_block;
-@@ -958,40 +1056,74 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -958,40 +1067,74 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
          clear(acc_s);
          FLASH_NAMESPACE::cp_async_wait<0>();
@@ -817,7 +828,7 @@ index 7512828..3f82db0 100644
          }
  
          mask.template apply_mask</*Causal_mask=*/false>(
-@@ -1005,6 +1137,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+@@ -1005,6 +1148,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
          Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
  
          FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
@@ -834,7 +845,7 @@ index 7512828..3f82db0 100644
      }
  
      // Epilogue
-@@ -1108,7 +1250,7 @@ inline __device__ void compute_attn(const Params &params) {
+@@ -1108,7 +1261,7 @@ inline __device__ void compute_attn(const Params &params) {
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
  
@@ -843,7 +854,7 @@ index 7512828..3f82db0 100644
  inline __device__ void compute_attn_splitkv(const Params &params) {
      const int m_block = blockIdx.x;
      // The block index for the batch.
-@@ -1117,7 +1259,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
+@@ -1117,7 +1270,7 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
      const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
      const int n_split_idx = Split ? blockIdx.y : 0;
      const int num_n_splits = Split ? gridDim.y : 1;

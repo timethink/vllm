@@ -58,11 +58,12 @@ static constexpr int kSidebandPrefetchMode =
     VLLM_BYTE_V2_FA2_SIDEBAND_PREFETCH_MODE;
 static_assert(kSidebandPrefetchMode >= 0 && kSidebandPrefetchMode <= 3);
 
-// Split-K can optionally reuse one 32 KiB FA2 KV tile for both K and V. The
-// mainloop then serializes K -> QK -> V -> PV -> next K, retaining N128 and
-// the original floating-point operation order while reducing dynamic shared
-// memory from 80 KiB to 48 KiB. Nonsplit keeps the original pipelined K/V
-// buffers because its small grid cannot benefit from a second resident CTA.
+// FA2 can optionally reuse one 32 KiB KV tile for both K and V. The mainloop
+// then serializes K -> QK -> V -> PV -> next K, retaining N128 and the original
+// floating-point operation order while reducing dynamic shared memory from
+// 80 KiB to 48 KiB. The base loader enables this for split-K only; an explicit
+// derived loader can opt the sufficiently large nonsplit grid into the same
+// schedule.
 static constexpr bool kReuseKvSmem = VLLM_BYTE_V2_FA2_REUSE_KV_SMEM != 0;
 
 __device__ __forceinline__ uint32_t load_u32(const uint8_t* page, int offset) {
@@ -769,6 +770,7 @@ struct Loader {
   static constexpr int BlockN = 128;
   static constexpr int Threads = 128;
   static constexpr bool ReuseKvSmem = kReuseKvSmem;
+  static constexpr bool ReuseKvSmemNonsplit = false;
 
   template <bool IsValue, typename Params, typename DstTensor,
             typename CoordTensor>
@@ -818,6 +820,10 @@ struct Loader {
           coords);
     }
   }
+};
+
+struct LoaderReuseKvSmemNonsplit : Loader {
+  static constexpr bool ReuseKvSmemNonsplit = true;
 };
 
 }  // namespace vllm::byte_v2::fa2
