@@ -228,6 +228,8 @@ class _WorkspaceImpl:
         self.workspace = None
         self.raw_plan = None
         self.raw_state_cache = None
+        self.hybrid_raw_mutable_tail_q1 = False
+        self.fa2_hybrid_raw_fallback = True
 
     def raw_staging_workspace_spec(self, kv_cache, num_staging_slots):
         assert kv_cache.device == self.spec.device
@@ -279,6 +281,61 @@ def test_bind_byte_v2_raw_staging_workspace_shares_one_allocation():
     assert impls[1].raw_plan == (4, 1)
     assert impls[0].raw_state_cache is context["0"].kv_cache
     assert impls[1].raw_state_cache is context["1"].kv_cache
+
+
+def test_bind_byte_v2_raw_staging_workspace_rejects_capability_mismatch():
+    spec = ByteV2RawStagingWorkspaceSpec(
+        num_blocks=4,
+        num_staging_slots=2,
+        slot_size_bytes=64,
+        device=torch.device("cpu"),
+    )
+    impl = _WorkspaceImpl(spec)
+    impl.hybrid_raw_mutable_tail_q1 = True
+    context = {
+        "layer": SimpleNamespace(
+            impl=impl,
+            kv_cache=torch.empty((4, 1), dtype=torch.uint8),
+        )
+    }
+    config = SimpleNamespace(
+        num_blocks=4,
+        byte_v2_raw_fallback_slots=1,
+        byte_v2_raw_staging_slots=2,
+        byte_v2_raw_staging_workspace_bytes=spec.nbytes,
+        byte_v2_raw_mutable_tail_q1=False,
+    )
+
+    with pytest.raises(RuntimeError, match="capability mismatch"):
+        bind_byte_v2_raw_staging_workspace(
+            context,
+            config,
+            use_ubatching=False,
+        )
+
+
+def test_bind_byte_v2_raw_staging_workspace_rejects_compact_only_v6():
+    impl = _WorkspaceImpl(spec=None)
+    impl.fa2_hybrid_raw_fallback = False
+    context = {
+        "layer": SimpleNamespace(
+            impl=impl,
+            kv_cache=torch.empty((4, 50_560), dtype=torch.uint8),
+        )
+    }
+    config = SimpleNamespace(
+        num_blocks=4,
+        byte_v2_raw_fallback_slots=0,
+        byte_v2_raw_staging_slots=0,
+        byte_v2_raw_staging_workspace_bytes=0,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot bind a compact-only engine"):
+        bind_byte_v2_raw_staging_workspace(
+            context,
+            config,
+            use_ubatching=False,
+        )
 
 
 def test_bind_byte_v2_raw_staging_workspace_rejects_ubatching():

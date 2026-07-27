@@ -39,6 +39,44 @@ def byte_v2_hybrid_raw_fallback_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def byte_v2_hybrid_raw_mutable_tail_q1_enabled(
+    *,
+    hybrid_raw_fallback: bool | None = None,
+) -> bool:
+    """Return whether hybrid Q1 writes should retain a mutable raw tail."""
+    value = os.environ.get("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1")
+    if value is None:
+        if hybrid_raw_fallback is None:
+            hybrid_raw_fallback = byte_v2_hybrid_raw_fallback_enabled()
+        return hybrid_raw_fallback and not byte_v2_test_forced_raw_promotion_enabled()
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def resolve_byte_v2_hybrid_raw_mutable_tail_q1(
+    *,
+    native_available: bool,
+    hybrid_raw_fallback: bool | None = None,
+) -> bool:
+    """Resolve raw-tail Q1 against the installed native operator ABI.
+
+    An implicit default may fall back to the legacy writer when an older
+    extension is installed. An explicit opt-in instead fails closed so cache
+    planning and request admission cannot disagree with the attention path.
+    """
+    if not byte_v2_hybrid_raw_mutable_tail_q1_enabled(
+        hybrid_raw_fallback=hybrid_raw_fallback
+    ):
+        return False
+    if native_available:
+        return True
+    if os.environ.get("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1") is not None:
+        raise RuntimeError(
+            "BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1=1 requires native raw-tail "
+            "Q1 and safe Q>1 demotion operator schemas"
+        )
+    return False
+
+
 def byte_v2_test_forced_raw_promotion_enabled() -> bool:
     """Return whether the test-only forced raw lifecycle hook is enabled."""
     value = os.environ.get("BYTE_V2_TEST_FORCE_RAW_PROMOTION")
@@ -404,7 +442,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
 
     ByteV2 stores compressed K/V payloads plus per-page metadata in a custom
     byte layout. The raw KV allocation therefore uses ``torch.uint8`` and the
-    page size comes from ``ByteV2PageLayoutV5`` instead of the normal
+    page size comes from ``ByteV2PageLayoutV6`` instead of the normal
     ``head_size * dtype`` formula.
     """
 
@@ -416,7 +454,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
     alignment_bytes: int = 128
     outlier_value_bits: int = 8
     outlier_entries_per_tile: int = 256
-    outlier_pool_entries: int = 1024
+    outlier_pool_entries: int = 256
     include_raw_payload: bool = False
 
     def __post_init__(self):
@@ -444,7 +482,7 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
             "alignment_bytes": 128,
             "outlier_value_bits": 8,
             "outlier_entries_per_tile": 256,
-            "outlier_pool_entries": 1024,
+            "outlier_pool_entries": 256,
             "include_raw_payload": False,
         }
         mismatches = [
@@ -454,17 +492,17 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
         ]
         if mismatches:
             raise ValueError(
-                "ByteV2FullAttentionSpec does not match the compiled V5 CUDA "
+                "ByteV2FullAttentionSpec does not match the compiled V6 CUDA "
                 f"layout; unsupported fields: {', '.join(mismatches)}"
             )
 
     def _page_layout(self):
         from vllm.v1.attention.backends.byte_v2_layout import (
             ByteV2CodecPayloadPolicy,
-            ByteV2PageLayoutV5,
+            ByteV2PageLayoutV6,
         )
 
-        return ByteV2PageLayoutV5(
+        return ByteV2PageLayoutV6(
             tile_policy=self.tile_policy,
             codec_payload_policy=ByteV2CodecPayloadPolicy(
                 low_bytes_per_elem=self.codec_low_bytes_per_elem,
@@ -1066,6 +1104,8 @@ class KVCacheConfig:
     """Raw staging slots in the runner-owned cross-layer workspace."""
     byte_v2_raw_staging_workspace_bytes: int = 0
     """Total bytes in the runner-owned ByteV2 staging workspace."""
+    byte_v2_raw_mutable_tail_q1: bool = False
+    """Whether this cache plan reserves one mutable raw tail per request."""
 
     @property
     def has_mamba_layers(self) -> bool:

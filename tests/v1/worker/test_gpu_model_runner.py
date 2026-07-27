@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -318,6 +319,63 @@ def test_select_common_block_size_no_valid_option():
 
     with pytest.raises(ValueError):
         select_common_block_size(48, [backend_a, backend_b])
+
+
+@pytest.mark.parametrize(
+    ("capture_blocks", "explicit_slots"),
+    ((1, None), (512, 5)),
+)
+def test_byte_v2_minimal_profile_cache_reserves_mutable_tails(
+    monkeypatch,
+    capture_blocks,
+    explicit_slots,
+):
+    from vllm.v1.core import kv_cache_utils
+
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "1")
+    if explicit_slots is not None:
+        monkeypatch.setenv(
+            "BYTE_V2_FA2_RAW_FALLBACK_SLOTS",
+            str(explicit_slots),
+        )
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
+        lambda: True,
+    )
+    config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    config.scheduler_config.max_num_seqs = 4
+    config.compilation_config.max_cudagraph_capture_size = capture_blocks
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = config
+    runner.cache_config = config.cache_config
+    runner.scheduler_config = config.scheduler_config
+    runner.compilation_config = config.compilation_config
+    runner.get_kv_cache_spec = lambda: {
+        "byte_v2": ByteV2FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.uint8,
+        )
+    }
+    captured = {}
+
+    def capture_config(kv_cache_config, *, is_profiling):
+        captured["config"] = kv_cache_config
+        captured["is_profiling"] = is_profiling
+
+    runner.initialize_kv_cache = capture_config
+
+    runner._init_minimal_kv_cache_for_profiling()
+
+    minimal_config = captured["config"]
+    assert captured["is_profiling"] is True
+    assert minimal_config.num_blocks == capture_blocks
+    assert minimal_config.byte_v2_raw_fallback_slots == 5
+    assert minimal_config.byte_v2_raw_mutable_tail_q1
+    assert config.cache_config.num_gpu_blocks_override is None
 
 
 def test_set_active_mm_loras_builds_tower_and_connector_mappings():

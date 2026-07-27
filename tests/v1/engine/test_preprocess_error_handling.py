@@ -12,8 +12,10 @@ from vllm.v1.engine.core import EngineCore
 MODEL_NAME = "hmellor/tiny-random-LlamaForCausalLM"
 
 
-def test_preprocess_error_handling(monkeypatch: pytest.MonkeyPatch):
-    """Test that preprocessing errors are handled gracefully."""
+def test_byte_v2_raw_tail_preprocess_error_is_request_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Test that an unsupported resumable request does not kill EngineCore."""
 
     if current_platform.is_rocm() or current_platform.is_xpu():
         pytest.skip(
@@ -29,16 +31,22 @@ def test_preprocess_error_handling(monkeypatch: pytest.MonkeyPatch):
     # Store original method to call for non-failing requests
     original_preprocess = EngineCore.preprocess_add_request
 
-    # Monkeypatch to make preprocess_add_request raise an exception
-    # only for requests with "FAIL" in the first token
-    def conditional_failing_preprocess(self, request: EngineCoreRequest):
-        # Fail if the first token id is 333
+    # Exercise the production guard only for the sentinel request while using
+    # the existing multiprocess preprocessing error-response path.
+    def trigger_raw_tail_guard(self, request: EngineCoreRequest):
         if request.prompt_token_ids and request.prompt_token_ids[0] == 333:
-            raise ValueError("Simulated preprocessing error!")
+            request.resumable = True
+            self.scheduler.byte_v2_raw_mutable_tail_q1 = True
+            try:
+                return original_preprocess(self, request)
+            finally:
+                self.scheduler.byte_v2_raw_mutable_tail_q1 = False
         return original_preprocess(self, request)
 
     monkeypatch.setattr(
-        EngineCore, "preprocess_add_request", conditional_failing_preprocess
+        EngineCore,
+        "preprocess_add_request",
+        trigger_raw_tail_guard,
     )
 
     llm = LLM(model=MODEL_NAME)
@@ -47,8 +55,7 @@ def test_preprocess_error_handling(monkeypatch: pytest.MonkeyPatch):
     # We need to use a direct approach since LLM.generate tokenizes for us
     from vllm.inputs import TokensPrompt
 
-    # This should raise an exception due to the preprocessing failure
-    # Special token id to trigger the failure
+    # The unsupported request receives a request-scoped error.
     failing_prompt = TokensPrompt(prompt_token_ids=[333])
     outputs = llm.generate(failing_prompt, SamplingParams(max_tokens=10))  # type: ignore
     assert len(outputs) == 1

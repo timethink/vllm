@@ -635,7 +635,8 @@ void byte_v2_update_hybrid_cache_raw_tail_q1(
     torch::stable::Tensor& free_raw_slot_count,
     torch::stable::Tensor& raw_pool_overflow,
     const std::vector<int64_t>& tile_policy,
-    std::optional<torch::stable::Tensor> page_unsafe_flags);
+    std::optional<torch::stable::Tensor> page_unsafe_flags,
+    bool fuse_commit_finalize);
 
 void byte_v2_update_hybrid_cache_raw_staging_multi_token(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
@@ -650,7 +651,8 @@ void byte_v2_update_hybrid_cache_raw_staging_multi_token(
     torch::stable::Tensor& free_raw_slot_count,
     torch::stable::Tensor& raw_pool_overflow,
     const std::vector<int64_t>& tile_policy,
-    std::optional<torch::stable::Tensor> page_unsafe_flags);
+    std::optional<torch::stable::Tensor> page_unsafe_flags,
+    bool demote_safe_raw_pages);
 
 void byte_v2_update_hybrid_cache_raw_staging_multi_token_retained(
     torch::stable::Tensor& key, torch::stable::Tensor& value,

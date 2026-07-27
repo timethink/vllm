@@ -160,6 +160,7 @@ def test_collect_speculative_profile_kv_cache_plan():
         num_byte_v2_layers=2,
         byte_v2_raw_fallback_slots=3,
         byte_v2_raw_staging_slots=128,
+        byte_v2_raw_mutable_tail_q1=True,
     )
     runner = SimpleNamespace(kv_cache_config=config)
     driver_worker = SimpleNamespace(model_runner=runner)
@@ -182,6 +183,7 @@ def test_collect_speculative_profile_kv_cache_plan():
         "num_byte_v2_layers": 2,
         "raw_fallback_slots_per_layer": 3,
         "raw_staging_slots": 128,
+        "raw_mutable_tail_q1": True,
     }
 
 

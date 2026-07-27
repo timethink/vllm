@@ -30,7 +30,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.byte_v2_layout import (
     DEFAULT_BYTE_V2_TILE_POLICY,
-    ByteV2PageLayoutV5,
+    ByteV2PageLayoutV6,
     ByteV2RawStagingLayout,
     ByteV2TilePolicy,
     byte_v2_tile_policy_from_env,
@@ -74,13 +74,16 @@ from vllm.v1.attention.backends.byte_v2_ops import (
 )
 from vllm.v1.kv_cache_interface import (
     byte_v2_hybrid_raw_fallback_enabled,
+    byte_v2_hybrid_raw_mutable_tail_q1_enabled,
     byte_v2_test_forced_raw_promotion_enabled,
+    resolve_byte_v2_hybrid_raw_mutable_tail_q1,
 )
 
 _BYTE_V2_KERNELS_NOT_READY = "ByteV2 native CUDA kernels are not registered yet"
 _BYTE_V2_MAX_RAW_STAGING_TOKENS = 1024
 _BYTE_V2_UNNORMALIZED_PARTITION_OUTPUT_MODE = 27
-_BYTE_V2_FA2_PAGE_SIZE_BYTES = ByteV2PageLayoutV5().page_size_bytes
+_BYTE_V2_FA2_PAGE_SIZE_BYTES = ByteV2PageLayoutV6().page_size_bytes
+_BYTE_V2_CACHED_PREFILL_AUTO_MIN_QUERY_LEN = 16_384
 logger = init_logger(__name__)
 
 
@@ -265,22 +268,35 @@ def _direct_paged_prefill_enabled() -> bool:
     return value == "1"
 
 
-def _cached_prefill_hydrate_to_raw_enabled() -> bool:
+def _cached_prefill_hydrate_to_raw_mode() -> str:
     value = os.environ.get("BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW")
     if value is None:
-        return False
+        return "auto"
     if value not in ("0", "1"):
         raise ValueError(
             "BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW must be unset, 0, or "
             f"1; got {value!r}"
         )
-    return value == "1"
+    return "enabled" if value == "1" else "disabled"
 
 
-def _hybrid_raw_mutable_tail_q1_enabled() -> bool:
-    value = os.environ.get("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1")
+def _cached_prefill_hydrate_to_raw_enabled() -> bool:
+    return _cached_prefill_hydrate_to_raw_mode() != "disabled"
+
+
+def _hybrid_raw_mutable_tail_q1_enabled(
+    *,
+    hybrid_raw_fallback: bool,
+) -> bool:
+    return byte_v2_hybrid_raw_mutable_tail_q1_enabled(
+        hybrid_raw_fallback=hybrid_raw_fallback
+    )
+
+
+def _hybrid_raw_tail_fused_finalize_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_HYBRID_RAW_TAIL_FUSED_FINALIZE")
     if value is None:
-        return False
+        return True
     return value.lower() not in ("0", "false", "no", "off")
 
 
@@ -356,6 +372,7 @@ class ByteV2AttentionMetadata(AttentionMetadata):
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     causal: bool
+    is_prefilling: torch.Tensor | None = None
     seq_len_sum: int | None = None
     common_prefix_len: int = 0
     tile_policy: ByteV2TilePolicy = DEFAULT_BYTE_V2_TILE_POLICY
@@ -571,6 +588,7 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             causal=common_attn_metadata.causal,
+            is_prefilling=getattr(common_attn_metadata, "is_prefilling", None),
             seq_len_sum=seq_len_sum,
             common_prefix_len=int(common_prefix_len),
             tile_policy=self.tile_policy,
@@ -631,7 +649,7 @@ class ByteV2AttentionBackend(AttentionBackend):
             head_dim=head_size,
             head_dim_v=head_size,
         )
-        layout = ByteV2PageLayoutV5(
+        layout = ByteV2PageLayoutV6(
             tile_policy=tile_policy,
             num_kv_heads=num_kv_heads,
         )
@@ -1113,6 +1131,7 @@ class ByteV2RawStagingManager:
         max_tokens_per_update: int = _BYTE_V2_MAX_RAW_STAGING_TOKENS,
         raw_fallback_store: ByteV2RawFallbackStore | None = None,
         hybrid_raw_mutable_tail_q1: bool = False,
+        hybrid_raw_tail_fused_finalize: bool = True,
     ) -> None:
         self.tile_policy = tile_policy
         self.raw_layout = ByteV2RawStagingLayout(
@@ -1122,6 +1141,7 @@ class ByteV2RawStagingManager:
         self.max_tokens_per_update = max_tokens_per_update
         self.raw_fallback_store = raw_fallback_store
         self.hybrid_raw_mutable_tail_q1 = hybrid_raw_mutable_tail_q1
+        self.hybrid_raw_tail_fused_finalize = hybrid_raw_tail_fused_finalize
         self.shared_workspace: ByteV2RawStagingWorkspace | None = None
 
         self.raw_staging: torch.Tensor | None = None
@@ -1669,6 +1689,7 @@ class ByteV2RawStagingManager:
                             self.tile_policy.head_dim_v,
                         ),
                         page_unsafe_flags=page_unsafe_flags,
+                        fuse_commit_finalize=self.hybrid_raw_tail_fused_finalize,
                     )
                 except NotImplementedError:
                     pass
@@ -1799,6 +1820,7 @@ class ByteV2RawStagingManager:
                         self.tile_policy.head_dim_v,
                     ),
                     page_unsafe_flags=page_unsafe_flags,
+                    demote_safe_raw_pages=self.hybrid_raw_mutable_tail_q1,
                 )
                 return True, page_unsafe_flags is not None
             except NotImplementedError:
@@ -1985,20 +2007,29 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             head_dim_v=head_size,
         )
         self.fa2_hybrid_raw_fallback = byte_v2_hybrid_raw_fallback_enabled()
-        raw_tail_requested = _hybrid_raw_mutable_tail_q1_enabled()
+        self.test_forced_raw_promotion = byte_v2_test_forced_raw_promotion_enabled()
+        raw_tail_requested = _hybrid_raw_mutable_tail_q1_enabled(
+            hybrid_raw_fallback=(
+                self.fa2_hybrid_raw_fallback and not self.test_forced_raw_promotion
+            )
+        )
         if raw_tail_requested and not self.fa2_hybrid_raw_fallback:
             raise RuntimeError(
                 "BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1=1 requires "
                 "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
             )
-        self.hybrid_raw_mutable_tail_q1 = (
-            raw_tail_requested and byte_v2_hybrid_raw_tail_q1_is_available()
+        self.hybrid_raw_mutable_tail_q1 = resolve_byte_v2_hybrid_raw_mutable_tail_q1(
+            native_available=byte_v2_hybrid_raw_tail_q1_is_available(),
+            hybrid_raw_fallback=(
+                self.fa2_hybrid_raw_fallback and not self.test_forced_raw_promotion
+            ),
         )
         if self.hybrid_raw_mutable_tail_q1:
             logger.warning_once(
-                "[ByteV2] experimental raw-tail Q1 requires the request "
-                "lifecycle to remain batch size 1; dynamic batching is not "
-                "supported"
+                "[ByteV2] experimental raw-tail Q1 is enabled; safe full pages "
+                "written by Q>1 dynamic batches are demoted back to compact "
+                "storage, cache writes must remain ordered on one CUDA stream, "
+                "and resumable/streaming sessions are rejected"
             )
         if raw_tail_requested and not self.hybrid_raw_mutable_tail_q1:
             logger.warning_once(
@@ -2017,22 +2048,29 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         self.direct_paged_prefill = (
             self.fa2_hybrid_raw_fallback and direct_paged_prefill_enabled
         )
-        cached_prefill_hydrate_requested = _cached_prefill_hydrate_to_raw_enabled()
-        if cached_prefill_hydrate_requested and not self.fa2_hybrid_raw_fallback:
+        cached_prefill_hydrate_mode = _cached_prefill_hydrate_to_raw_mode()
+        if (
+            cached_prefill_hydrate_mode == "enabled"
+            and not self.fa2_hybrid_raw_fallback
+        ):
             raise RuntimeError(
                 "BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW=1 requires "
                 "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
             )
+        self.cached_prefill_hydrate_to_raw_mode = (
+            cached_prefill_hydrate_mode if self.fa2_hybrid_raw_fallback else "disabled"
+        )
         self.cached_prefill_hydrate_to_raw = (
-            self.fa2_hybrid_raw_fallback and cached_prefill_hydrate_requested
+            self.cached_prefill_hydrate_to_raw_mode != "disabled"
         )
         if self.cached_prefill_hydrate_to_raw:
             logger.warning_once(
-                "[ByteV2] experimental B1 cached-prefill hydrate-to-raw is "
-                "enabled; sequences that exceed raw staging capacity retain "
-                "the hybrid reader"
+                "[ByteV2] experimental B1 cached-prefill hydrate-to-raw mode "
+                "is %s; auto mode requires Q >= %d, and sequences that exceed "
+                "raw staging capacity retain the hybrid reader",
+                self.cached_prefill_hydrate_to_raw_mode,
+                _BYTE_V2_CACHED_PREFILL_AUTO_MIN_QUERY_LEN,
             )
-        self.test_forced_raw_promotion = byte_v2_test_forced_raw_promotion_enabled()
         if self.test_forced_raw_promotion and not self.fa2_hybrid_raw_fallback:
             raise RuntimeError(
                 "BYTE_V2_TEST_FORCE_RAW_PROMOTION=1 requires "
@@ -2048,7 +2086,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             if (self.num_heads, self.num_kv_heads, self.head_size) != (32, 8, 128):
                 unsupported.append("local Hq=32, Hkv=8, and D=128 are required")
             if self.tile_policy != DEFAULT_BYTE_V2_TILE_POLICY:
-                unsupported.append("the default ByteV2 V5 tile policy is required")
+                unsupported.append("the default ByteV2 tile policy is required")
             if self.kv_sharing_target_layer_name is not None:
                 unsupported.append("cross-layer KV-cache sharing")
             if self.alibi_slopes is not None:
@@ -2078,6 +2116,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             num_kv_heads=self.num_kv_heads,
             raw_fallback_store=self.raw_fallback_store,
             hybrid_raw_mutable_tail_q1=self.hybrid_raw_mutable_tail_q1,
+            hybrid_raw_tail_fused_finalize=(_hybrid_raw_tail_fused_finalize_enabled()),
         )
         self.prefill_backend = _prefill_backend()
         self.decode_kernel_mode = _decode_kernel_mode()
@@ -3747,16 +3786,28 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         attn_metadata: ByteV2AttentionMetadata,
     ) -> bool:
         """Hydrate one complete B1 cached sequence, then run raw paged FA2."""
+        hydrate_mode = getattr(
+            self,
+            "cached_prefill_hydrate_to_raw_mode",
+            "enabled",
+        )
         if (
             not getattr(self, "cached_prefill_hydrate_to_raw", False)
+            or hydrate_mode == "disabled"
             or self.raw_fallback_store is None
             or not attn_metadata.causal
             or attn_metadata.max_query_len <= 1
+            or (
+                hydrate_mode == "auto"
+                and attn_metadata.max_query_len
+                < _BYTE_V2_CACHED_PREFILL_AUTO_MIN_QUERY_LEN
+            )
         ):
             return False
 
         num_actual_tokens = min(attn_metadata.num_actual_tokens, query.shape[0])
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+        is_prefilling = getattr(attn_metadata, "is_prefilling", None)
         if (
             num_actual_tokens <= 1
             or attn_metadata.max_query_len != num_actual_tokens
@@ -3764,13 +3815,21 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             or query_start_loc_cpu.device.type != "cpu"
             or query_start_loc_cpu.ndim != 1
             or query_start_loc_cpu.numel() < 2
+            or not isinstance(is_prefilling, torch.Tensor)
+            or is_prefilling.device.type != "cpu"
+            or is_prefilling.dtype != torch.bool
+            or is_prefilling.ndim != 1
+            or is_prefilling.numel() < query_start_loc_cpu.numel() - 1
         ):
             return False
         query_start_locs = [int(value) for value in query_start_loc_cpu.tolist()]
+        num_request_rows = len(query_start_locs) - 1
         if (
             query_start_locs[0] != 0
             or query_start_locs[1] != num_actual_tokens
             or any(value != num_actual_tokens for value in query_start_locs[2:])
+            or not bool(is_prefilling[0])
+            or bool(is_prefilling[1:num_request_rows].any())
         ):
             return False
 
@@ -3966,9 +4025,9 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         if self.logits_soft_cap is not None and self.logits_soft_cap > 0:
             return "logit softcap is unsupported"
         if self.tile_policy != DEFAULT_BYTE_V2_TILE_POLICY:
-            return "the default ByteV2 V5 tile policy is required"
+            return "the default ByteV2 tile policy is required"
         if attn_metadata.tile_policy != DEFAULT_BYTE_V2_TILE_POLICY:
-            return "metadata does not use the default ByteV2 V5 tile policy"
+            return "metadata does not use the default ByteV2 tile policy"
         if self.num_heads != 32 or self.num_kv_heads != 8 or self.head_size != 128:
             return "local Hq=32, Hkv=8, and D=128 are required"
         if query.ndim != 3 or query.shape != output.shape:
@@ -3990,7 +4049,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             or kv_cache.shape[1] != _BYTE_V2_FA2_PAGE_SIZE_BYTES
             or not kv_cache.is_contiguous()
         ):
-            return "KV cache must be contiguous V5 uint8 pages of 52096 bytes"
+            return "KV cache must be contiguous V6 uint8 pages of 50560 bytes"
 
         batch_size = output.shape[0]
         query_start_locs = attn_metadata.query_start_loc

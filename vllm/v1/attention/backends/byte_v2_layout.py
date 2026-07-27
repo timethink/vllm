@@ -875,6 +875,13 @@ class ByteV2PageLayoutV5(ByteV2PageLayoutV4):
 
 
 @dataclass(frozen=True, slots=True)
+class ByteV2PageLayoutV6(ByteV2PageLayoutV5):
+    """V5-compatible layout with a right-sized 256-entry page outlier pool."""
+
+    outlier_pool_entries: int = 256
+
+
+@dataclass(frozen=True, slots=True)
 class ByteV2FallbackStats:
     """Summary of page-local tile fallback and overlay potential."""
 

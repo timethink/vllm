@@ -822,6 +822,11 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        if request.resumable and self.scheduler.byte_v2_raw_mutable_tail_q1:
+            raise ValueError(
+                "ByteV2 raw-tail Q1 does not support resumable or streaming "
+                "sessions because paused sessions retain mutable KV tails"
+            )
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.

@@ -1,8 +1,8 @@
 // Copyright (c) 2026, ByteV2 contributors.
 //
-// ByteV2-specific FA2 launch path.  The attention mainloop is the original
-// FA2 split-KV implementation; only its global-to-shared K/V load policy is
-// selected as ByteV2 decode.
+// ByteV2/SplitZip-specific FA2 launch path.  The attention mainloop is the
+// original FA2 split-KV implementation; only its global-to-shared K/V load
+// policy changes.
 
 #pragma once
 
@@ -16,12 +16,30 @@
 namespace FLASH_NAMESPACE {
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_byte_v2_kernel, bool Is_causal,
-                            bool Split, bool ReuseKvSmemNonsplit) {
+                            bool Split, bool ReuseKvSmemNonsplit,
+                            bool SplitZipFormat) {
 #if defined(ARCH_SUPPORTS_FLASH)
-  using ExternalKvLoader =
+  using LegacyByteV2Loader =
       std::conditional_t<ReuseKvSmemNonsplit,
                          vllm::byte_v2::fa2::LoaderReuseKvSmemNonsplit,
                          vllm::byte_v2::fa2::Loader>;
+  using LegacySplitZipLoader =
+      std::conditional_t<ReuseKvSmemNonsplit,
+                         vllm::byte_v2::fa2::SplitZipLoaderReuseKvSmemNonsplit,
+                         vllm::byte_v2::fa2::SplitZipLoader>;
+  using LegacyExternalKvLoader =
+      std::conditional_t<SplitZipFormat, LegacySplitZipLoader,
+                         LegacyByteV2Loader>;
+  constexpr bool UseSharedPageDescriptor =
+      vllm::byte_v2::fa2::kReuseKvSmem && vllm::byte_v2::fa2::kStageMode != 0 &&
+      (Split || ReuseKvSmemNonsplit);
+  using SharedPageLoader =
+      std::conditional_t<SplitZipFormat,
+                         vllm::byte_v2::fa2::SplitZipLoaderSharedPageDescriptor,
+                         vllm::byte_v2::fa2::LoaderSharedPageDescriptor>;
+  using ExternalKvLoader =
+      std::conditional_t<UseSharedPageDescriptor, SharedPageLoader,
+                         LegacyExternalKvLoader>;
   FLASH_NAMESPACE::compute_attn_splitkv<
       Kernel_traits, Is_causal, /*Is_local=*/false, /*Has_alibi=*/false,
       /*Is_even_MN=*/false, /*Is_even_K=*/true, /*Is_softcap=*/false, Split,
@@ -46,7 +64,7 @@ inline bool byte_v2_fa2_reuse_kv_smem_nonsplit_enabled() {
   return enabled;
 }
 
-template <typename Kernel_traits, bool Is_causal>
+template <typename Kernel_traits, bool Is_causal, bool SplitZipFormat>
 void run_flash_byte_v2_splitkv_fwd(Flash_fwd_params& params,
                                    cudaStream_t stream) {
   static_assert(!Kernel_traits::Is_Q_in_regs,
@@ -64,32 +82,38 @@ void run_flash_byte_v2_splitkv_fwd(Flash_fwd_params& params,
                           params.seqlen_q % Kernel_traits::kBlockM == 0;
   const bool is_even_K = params.d == Kernel_traits::kHeadDim;
 
-  TORCH_CHECK(params.blockmask != nullptr,
-              "ByteV2 FA2 cache pointer is missing");
-  TORCH_CHECK(params.block_table != nullptr,
-              "ByteV2 FA2 requires a paged block table");
-  TORCH_CHECK(!is_even_MN, "ByteV2 FA2 expects varlen/paged dispatch");
+  constexpr const char* format_name = SplitZipFormat ? "SplitZip" : "ByteV2";
+  TORCH_CHECK(params.blockmask != nullptr, format_name,
+              " FA2 cache pointer is missing");
+  TORCH_CHECK(params.block_table != nullptr, format_name,
+              " FA2 requires a paged block table");
+  TORCH_CHECK(!is_even_MN, format_name, " FA2 expects varlen/paged dispatch");
   TORCH_CHECK(
       params.page_block_size == vllm::byte_v2::fa2::Policy::AllocBlockTokens,
-      "ByteV2 FA2 page block size must be ",
+      format_name, " FA2 page block size must be ",
       vllm::byte_v2::fa2::Policy::AllocBlockTokens);
-  TORCH_CHECK(params.k_batch_stride > 0,
-              "ByteV2 FA2 cache must contain at least one page");
-  TORCH_CHECK(is_even_K, "ByteV2 FA2 requires exact head dim 128");
-  TORCH_CHECK(params.knew_ptr == nullptr,
-              "ByteV2 FA2 does not append KV inside attention");
+  TORCH_CHECK(params.k_batch_stride > 0, format_name,
+              " FA2 cache must contain at least one page");
+  TORCH_CHECK(is_even_K, format_name, " FA2 requires exact head dim 128");
+  TORCH_CHECK((params.knew_ptr != nullptr) == SplitZipFormat, format_name,
+              " FA2 format marker mismatch");
+  if constexpr (SplitZipFormat) {
+    TORCH_CHECK(params.vnew_ptr == nullptr,
+                "SplitZip reader prototype does not support raw sidecars");
+  }
   if (params.vnew_ptr != nullptr) {
     TORCH_CHECK(params.k_ptr != nullptr && params.v_ptr != nullptr,
                 "ByteV2 hybrid FA2 raw staging pointers are missing");
     TORCH_CHECK(params.v_batch_stride > 0,
                 "ByteV2 hybrid FA2 raw staging must contain a slot");
   }
-  TORCH_CHECK(params.alibi_slopes_ptr == nullptr,
-              "ByteV2 FA2 does not support ALiBi");
-  TORCH_CHECK(params.softcap <= 0.0f, "ByteV2 FA2 does not support softcap");
+  TORCH_CHECK(params.alibi_slopes_ptr == nullptr, format_name,
+              " FA2 does not support ALiBi");
+  TORCH_CHECK(params.softcap <= 0.0f, format_name,
+              " FA2 does not support softcap");
   TORCH_CHECK(Is_causal ||
                   (params.window_size_left < 0 && params.window_size_right < 0),
-              "ByteV2 FA2 does not support local attention");
+              format_name, " FA2 does not support local attention");
 
   const int num_m_block =
       (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
@@ -99,21 +123,46 @@ void run_flash_byte_v2_splitkv_fwd(Flash_fwd_params& params,
   BOOL_SWITCH(params.num_splits > 1, Split, [&] {
     auto launch = [&](auto reuse_nonsplit_tag) {
       constexpr bool ReuseKvSmemNonsplit = decltype(reuse_nonsplit_tag)::value;
-      using ExternalKvLoader =
+      using LegacyByteV2Loader =
           std::conditional_t<ReuseKvSmemNonsplit,
                              vllm::byte_v2::fa2::LoaderReuseKvSmemNonsplit,
                              vllm::byte_v2::fa2::Loader>;
+      using LegacySplitZipLoader = std::conditional_t<
+          ReuseKvSmemNonsplit,
+          vllm::byte_v2::fa2::SplitZipLoaderReuseKvSmemNonsplit,
+          vllm::byte_v2::fa2::SplitZipLoader>;
+      using LegacyExternalKvLoader =
+          std::conditional_t<SplitZipFormat, LegacySplitZipLoader,
+                             LegacyByteV2Loader>;
+      constexpr bool UseSharedPageDescriptor =
+          vllm::byte_v2::fa2::kReuseKvSmem &&
+          vllm::byte_v2::fa2::kStageMode != 0 && (Split || ReuseKvSmemNonsplit);
+      using SharedPageLoader = std::conditional_t<
+          SplitZipFormat,
+          vllm::byte_v2::fa2::SplitZipLoaderSharedPageDescriptor,
+          vllm::byte_v2::fa2::LoaderSharedPageDescriptor>;
+      using ExternalKvLoader =
+          std::conditional_t<UseSharedPageDescriptor, SharedPageLoader,
+                             LegacyExternalKvLoader>;
       constexpr bool reuse_kv_smem =
           ExternalKvLoader::ReuseKvSmem &&
           (Split || ExternalKvLoader::ReuseKvSmemNonsplit);
-      constexpr size_t smem_size =
+      constexpr size_t attention_smem_size =
           reuse_kv_smem
               ? Kernel_traits::kSmemQSize + Kernel_traits::kSmemKVSize / 2
               : Kernel_traits::kSmemSize;
-      static_assert(!reuse_kv_smem || smem_size == 48 * 1024);
-      auto kernel =
-          &flash_fwd_splitkv_byte_v2_kernel<Kernel_traits, Is_causal, Split,
-                                            ReuseKvSmemNonsplit>;
+      constexpr size_t smem_size =
+          attention_smem_size + ExternalKvLoader::SharedStorageBytes;
+      static_assert(!reuse_kv_smem ||
+                    attention_smem_size ==
+                        vllm::byte_v2::fa2::kFa2ReuseSmemBytes);
+      static_assert(!UseSharedPageDescriptor ||
+                    ExternalKvLoader::SharedStorageBytes ==
+                        vllm::byte_v2::fa2::kSharedPageDescriptorBytes);
+      static_assert(UseSharedPageDescriptor ||
+                    ExternalKvLoader::SharedStorageBytes == 0);
+      auto kernel = &flash_fwd_splitkv_byte_v2_kernel<
+          Kernel_traits, Is_causal, Split, ReuseKvSmemNonsplit, SplitZipFormat>;
       if (smem_size >= 48 * 1024) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -181,9 +230,15 @@ void run_mha_byte_v2_fwd_splitkv_dispatch(Flash_fwd_params& params,
   static_assert(std::is_same_v<T, cutlass::bfloat16_t>);
   constexpr static int kBlockM = 64;
   constexpr static int kBlockN = 128;
-  run_flash_byte_v2_splitkv_fwd<
-      Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>,
-      Is_causal>(params, stream);
+  using KernelTraits =
+      Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>;
+  if (params.knew_ptr != nullptr) {
+    run_flash_byte_v2_splitkv_fwd<KernelTraits, Is_causal,
+                                  /*SplitZipFormat=*/true>(params, stream);
+  } else {
+    run_flash_byte_v2_splitkv_fwd<KernelTraits, Is_causal,
+                                  /*SplitZipFormat=*/false>(params, stream);
+  }
 }
 
 }  // namespace FLASH_NAMESPACE

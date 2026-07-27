@@ -10,7 +10,7 @@ from collections.abc import Sequence
 import torch
 
 from vllm.v1.attention.backends.byte_v2_layout import (
-    ByteV2PageLayoutV5,
+    ByteV2PageLayoutV6,
     ByteV2RawStagingLayout,
 )
 from vllm.v1.attention.backends.byte_v2_ops import (
@@ -66,17 +66,17 @@ def parse_args() -> argparse.Namespace:
     fatal_group.add_argument(
         "--inject-overflow",
         action="store_true",
-        help="Mark the first referenced V5 page overflowed before FA2 decode.",
+        help="Mark the first referenced V6 page overflowed before FA2 decode.",
     )
     fatal_group.add_argument(
         "--inject-fallback",
         action="store_true",
-        help="Set a fallback bit on the first referenced V5 page before decode.",
+        help="Set a fallback bit on the first referenced V6 page before decode.",
     )
     fatal_group.add_argument(
         "--stress-pool-overflow",
         action="store_true",
-        help="Construct one page whose outlier demand exceeds the V5 pool.",
+        help="Construct one page whose outlier demand exceeds the V6 pool.",
     )
     parser.add_argument(
         "--iterations",
@@ -184,8 +184,8 @@ def make_inputs(
         raise ValueError("query_len must be positive")
 
     device = torch.device("cuda")
-    layout = ByteV2PageLayoutV5()
-    assert layout.page_size_bytes == 52096
+    layout = ByteV2PageLayoutV6()
+    assert layout.page_size_bytes == 50560
 
     block_size = 16
     num_kv_heads = 8
@@ -606,7 +606,7 @@ def main() -> None:
         assert isinstance(byte_cache, torch.Tensor)
         assert isinstance(block_table, torch.Tensor)
         first_page = block_table[0, 0].to(torch.int64)
-        layout = ByteV2PageLayoutV5()
+        layout = ByteV2PageLayoutV6()
         if args.inject_overflow:
             byte_cache[first_page, layout.outlier_pool_overflow_offset] = 1
         else:

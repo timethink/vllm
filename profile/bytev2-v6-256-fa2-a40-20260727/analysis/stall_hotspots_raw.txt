@@ -1,0 +1,152 @@
+===== Stall hotspots for raw =====
+Total distinct (file, line) entries: 107
+
+Rank      Total File                            Line  Breakdown (stall: count)
+------------------------------------------------------------------------------------------------------------------------------------------------------
+   0       6927 mma_sm80.hpp                     247  math_pipe_throttle: 3823, wait: 2545, selected: 538, short_scoreboard: 21
+   1       3865 utils.h                          330  long_scoreboard: 3799, selected: 25, wait: 18, branch_resolving: 18, dispatch_stall: 5
+   2       3270 flash_fwd_kernel.h              1117  long_scoreboard: 3264, wait: 6
+   3       1594 flash_fwd_kernel.h              1076  long_scoreboard: 1580, selected: 10, wait: 4
+   4        963 flash_fwd_kernel.h              1087  barrier: 933, wait: 18, selected: 12
+   5        848 copy_sm80.hpp                     91  lg_throttle: 477, wait: 152, selected: 110, mio_throttle: 105, long_scoreboard: 3, no_instructions: 1
+   6        690 utils.h                          326  wait: 380, short_scoreboard: 139, selected: 118, no_instructions: 32, branch_resolving: 12, dispatch_stall: 9
+   7        536 softmax.h                         88  wait: 275, selected: 247, dispatch_stall: 11, no_instructions: 3
+   8        535 flash_fwd_kernel.h              1119  barrier: 530, selected: 3, wait: 2
+   9        481 copy_sm75.hpp                    119  mio_throttle: 218, wait: 139, selected: 124
+  10        377 flash_fwd_kernel.h               937  long_scoreboard: 377
+  11        239 utils.h                          106  wait: 120, selected: 116, dispatch_stall: 3
+  12        228 softmax.h                        160  wait: 121, selected: 105, dispatch_stall: 2
+  13        227 math_functions.hpp              1133  selected: 105, wait: 88, short_scoreboard: 34
+  14        153 mask.h                           160  long_scoreboard: 147, wait: 5, selected: 1
+  15        138 flash_fwd_kernel.h              1143  long_scoreboard: 132, wait: 4, selected: 2
+  16        132 copy_sm75.hpp                    179  selected: 122, wait: 10
+  17        125 numeric_conversion.h            1087  selected: 63, wait: 54, dispatch_stall: 8
+  18         87 utils.h                          332  wait: 45, branch_resolving: 26, selected: 16
+  19         86 utils.h                          151  mio_throttle: 59, wait: 22, selected: 5
+  20         84 block_info.h                      18  short_scoreboard: 84
+  21         63 flash_fwd_kernel.h              1129  wait: 43, selected: 17, dispatch_stall: 3
+  22         61 flash_fwd_kernel.h               625  wait: 29, selected: 18, short_scoreboard: 13, dispatch_stall: 1
+  23         57 utils.h                          118  short_scoreboard: 55, selected: 1, wait: 1
+  24         56 fill.hpp                          73  barrier: 41, mio_throttle: 11, wait: 3, selected: 1
+  25         44 copy.hpp                          60  mio_throttle: 17, wait: 14, drain: 9, selected: 2, branch_resolving: 1, lg_throttle: 1
+  26         42 pointer_base.hpp                 155  selected: 25, wait: 14, long_scoreboard: 3
+  27         37 flash_fwd_kernel.h              1092  mio_throttle: 19, wait: 16, selected: 2
+  28         34 flash_fwd_kernel.h              1011  barrier: 33, selected: 1
+  29         33 flash_fwd_kernel.h              1132  no_instructions: 22, branch_resolving: 6, selected: 5
+
+
+===== Per-stall-type top lines =====
+
+--- long_scoreboard ---
+      3799  utils.h:330
+      3264  flash_fwd_kernel.h:1117
+      1580  flash_fwd_kernel.h:1076
+       377  flash_fwd_kernel.h:937
+       147  mask.h:160
+       132  flash_fwd_kernel.h:1143
+         8  flash_fwd_kernel.h:1034
+         3  pointer_base.hpp:155
+         3  copy_sm80.hpp:91
+         2  sm_20_intrinsics.hpp:151
+
+--- short_scoreboard ---
+       139  utils.h:326
+        84  block_info.h:18
+        55  utils.h:118
+        34  math_functions.hpp:1133
+        21  mma_sm80.hpp:247
+        16  utils.h:158
+        13  flash_fwd_kernel.h:625
+         9  softmax.h:180
+         4  flash_fwd_kernel.h:563
+         2  flash_fwd_kernel.h:1021
+
+--- wait ---
+      2545  mma_sm80.hpp:247
+       380  utils.h:326
+       275  softmax.h:88
+       152  copy_sm80.hpp:91
+       139  copy_sm75.hpp:119
+       121  softmax.h:160
+       120  utils.h:106
+        88  math_functions.hpp:1133
+        54  numeric_conversion.h:1087
+        45  utils.h:332
+
+--- math_pipe_throttle ---
+      3823  mma_sm80.hpp:247
+
+--- mio_throttle ---
+       218  copy_sm75.hpp:119
+       105  copy_sm80.hpp:91
+        59  utils.h:151
+        21  utils.h:156
+        19  flash_fwd_kernel.h:1092
+        17  copy.hpp:60
+        16  flash_fwd_kernel.h:1095
+        11  fill.hpp:73
+         1  utils.h:155
+
+--- lg_throttle ---
+       477  copy_sm80.hpp:91
+        18  flash_fwd_kernel.h:1136
+         1  copy.hpp:60
+
+--- dispatch_stall ---
+        11  softmax.h:88
+         9  utils.h:326
+         8  numeric_conversion.h:1087
+         5  utils.h:330
+         3  utils.h:106
+         3  flash_fwd_kernel.h:1129
+         2  flash_fwd_kernel.h:621
+         2  softmax.h:160
+         1  flash_fwd_kernel.h:625
+         1  block_info.h:17
+
+--- drain ---
+         9  copy.hpp:60
+
+--- no_instructions ---
+        32  utils.h:326
+        25  flash_fwd_launch_template.h:41
+        22  flash_fwd_kernel.h:1132
+        19  flash_fwd_kernel.h:1069
+         4  flash_fwd_kernel.h:1090
+         3  softmax.h:88
+         1  copy_sm80.hpp:91
+         1  flash_fwd_kernel.h:1021
+         1  flash_fwd_kernel.h:631
+         1  swizzle_layout.hpp:217
+
+--- selected ---
+       538  mma_sm80.hpp:247
+       247  softmax.h:88
+       124  copy_sm75.hpp:119
+       122  copy_sm75.hpp:179
+       118  utils.h:326
+       116  utils.h:106
+       110  copy_sm80.hpp:91
+       105  math_functions.hpp:1133
+       105  softmax.h:160
+        63  numeric_conversion.h:1087
+
+--- branch_resolving ---
+        26  utils.h:332
+        18  utils.h:330
+        12  utils.h:326
+         8  flash_fwd_kernel.h:1090
+         6  flash_fwd_kernel.h:1132
+         2  flash_fwd_kernel.h:1205
+         2  flash_fwd_kernel.h:1069
+         1  flash_fwd_kernel.h:1021
+         1  copy.hpp:60
+         1  flash_fwd_kernel.h:1222
+
+--- barrier ---
+       933  flash_fwd_kernel.h:1087
+       530  flash_fwd_kernel.h:1119
+        41  fill.hpp:73
+        33  flash_fwd_kernel.h:1011
+        13  flash_fwd_kernel.h:533
+         6  flash_fwd_kernel.h:1268

@@ -601,6 +601,21 @@ struct ByteV2PageLayoutV5 {
   }
 };
 
+// V6 keeps the V5 dense payload and metadata ABI, but right-sizes the shared
+// page outlier pool from 1,024 to 256 entries. A single codec tile can still
+// consume the complete pool, so the existing compact writer and uint16
+// descriptor representation remain valid. Page-wide exhaustion must continue
+// to promote the authoritative raw sidecar before compact publication.
+template <typename Policy = DefaultByteV2TilePolicy,
+          typename CodecPayloadPolicy = ByteV2CodecPayloadPolicy<Policy>,
+          int NumKvHeads = 8, int PageHeaderBytes = 128,
+          int KvHeadMetaBytes = 96, int AlignmentBytes = 128,
+          int OutlierValueBits = 8, int OutlierPoolEntries = 256>
+using ByteV2PageLayoutV6 =
+    ByteV2PageLayoutV5<Policy, CodecPayloadPolicy, NumKvHeads, PageHeaderBytes,
+                       KvHeadMetaBytes, AlignmentBytes, OutlierValueBits,
+                       OutlierPoolEntries>;
+
 template <typename Policy = DefaultByteV2TilePolicy, int NumKvHeads = 8,
           int RawElementBytes = 2, int AlignmentBytes = 128>
 struct ByteV2RawStagingLayout {

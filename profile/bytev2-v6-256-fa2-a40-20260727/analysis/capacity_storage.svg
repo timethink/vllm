@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1050" height="610" viewBox="0 0 1050 610">
+<rect width="100%" height="100%" fill="white"/>
+<text x="525.0" y="35.0" font-size="21" text-anchor="middle" font-weight="bold" fill="#222">ByteV2 V6-256 storage and 20 GB E2E planner capacity</text>
+<line x1="70" y1="410" x2="435" y2="410" stroke="#333"/>
+<line x1="70" y1="80" x2="70" y2="410" stroke="#333"/>
+<text x="252.5" y="70.0" font-size="15" text-anchor="middle" font-weight="bold" fill="#222">Fixed bytes per 16-token page</text>
+<line x1="585" y1="410" x2="950" y2="410" stroke="#333"/>
+<line x1="585" y1="80" x2="585" y2="410" stroke="#333"/>
+<text x="767.5" y="70.0" font-size="15" text-anchor="middle" font-weight="bold" fill="#222">Planner KV capacity (tokens)</text>
+<line x1="70" y1="410.0" x2="435" y2="410.0" stroke="#e5e5e5"/>
+<text x="62.0" y="414.0" font-size="11" text-anchor="end" font-weight="normal" fill="#222">0K</text>
+<line x1="70" y1="315.7" x2="435" y2="315.7" stroke="#e5e5e5"/>
+<text x="62.0" y="319.7" font-size="11" text-anchor="end" font-weight="normal" fill="#222">20K</text>
+<line x1="70" y1="221.4" x2="435" y2="221.4" stroke="#e5e5e5"/>
+<text x="62.0" y="225.4" font-size="11" text-anchor="end" font-weight="normal" fill="#222">40K</text>
+<line x1="70" y1="127.1" x2="435" y2="127.1" stroke="#e5e5e5"/>
+<text x="62.0" y="131.1" font-size="11" text-anchor="end" font-weight="normal" fill="#222">60K</text>
+<rect x="105" y="101.0" width="62" height="309.0" fill="#4c78a8"/>
+<text x="136.0" y="93.0" font-size="11" text-anchor="middle" font-weight="bold" fill="#222">65,536</text>
+<text x="136.0" y="432.0" font-size="11" text-anchor="middle" font-weight="normal" fill="#222">Raw</text>
+<rect x="210" y="164.4" width="62" height="245.6" fill="#999999"/>
+<text x="241.0" y="156.4" font-size="11" text-anchor="middle" font-weight="bold" fill="#222">52,096</text>
+<text x="241.0" y="432.0" font-size="11" text-anchor="middle" font-weight="normal" fill="#222">V5-1024 ref.</text>
+<rect x="315" y="171.6" width="62" height="238.4" fill="#e45756"/>
+<text x="346.0" y="163.6" font-size="11" text-anchor="middle" font-weight="bold" fill="#222">50,560</text>
+<text x="346.0" y="432.0" font-size="11" text-anchor="middle" font-weight="normal" fill="#222">V6-256</text>
+<line x1="585" y1="410.0" x2="950" y2="410.0" stroke="#e5e5e5"/>
+<text x="577.0" y="414.0" font-size="11" text-anchor="end" font-weight="normal" fill="#222">0K</text>
+<line x1="585" y1="331.4" x2="950" y2="331.4" stroke="#e5e5e5"/>
+<text x="577.0" y="335.4" font-size="11" text-anchor="end" font-weight="normal" fill="#222">50K</text>
+<line x1="585" y1="252.9" x2="950" y2="252.9" stroke="#e5e5e5"/>
+<text x="577.0" y="256.9" font-size="11" text-anchor="end" font-weight="normal" fill="#222">100K</text>
+<line x1="585" y1="174.3" x2="950" y2="174.3" stroke="#e5e5e5"/>
+<text x="577.0" y="178.3" font-size="11" text-anchor="end" font-weight="normal" fill="#222">150K</text>
+<line x1="585" y1="95.7" x2="950" y2="95.7" stroke="#e5e5e5"/>
+<text x="577.0" y="99.7" font-size="11" text-anchor="end" font-weight="normal" fill="#222">200K</text>
+<rect x="655" y="170.2" width="82" height="239.8" fill="#4c78a8"/>
+<text x="696.0" y="162.2" font-size="12" text-anchor="middle" font-weight="bold" fill="#222">152,576</text>
+<text x="696.0" y="432.0" font-size="11" text-anchor="middle" font-weight="normal" fill="#222">Raw FA2</text>
+<rect x="805" y="105.0" width="82" height="305.0" fill="#e45756"/>
+<text x="846.0" y="97.0" font-size="12" text-anchor="middle" font-weight="bold" fill="#222">194,112</text>
+<text x="846.0" y="432.0" font-size="11" text-anchor="middle" font-weight="normal" fill="#222">ByteV2 V6</text>
+<text x="767.0" y="470.0" font-size="15" text-anchor="middle" font-weight="bold" fill="#b33b34">Measured planner capacity gain: +27.22%</text>
+<text x="252.0" y="470.0" font-size="14" text-anchor="middle" font-weight="bold" fill="#222">V6 fixed-page saving: 22.8516%</text>
+<text x="525.0" y="525.0" font-size="12" text-anchor="middle" font-weight="normal" fill="#555">V5 is a format-size reference only; no historical V5 latency is used as a same-binary comparison.</text>
+<text x="525.0" y="550.0" font-size="12" text-anchor="middle" font-weight="normal" fill="#555">Planner capacity includes ByteV2 raw-fallback sidecar and staging workspace; KV cache memory budget = 20 GB.</text>
+<text x="525.0" y="575.0" font-size="12" text-anchor="middle" font-weight="normal" fill="#555">Pool scan saw zero V6-256 overflow in the sampled 3,072 pages; production raw fallback remains required.</text>
+</svg>

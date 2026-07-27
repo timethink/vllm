@@ -81,6 +81,17 @@ def create_scheduler() -> Scheduler:
 
 
 class TestStreamingScheduler(unittest.TestCase):
+    def test_byte_v2_raw_tail_rejects_resumable_request(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.byte_v2_raw_mutable_tail_q1 = True
+        request = DummyRequest(
+            request_id="byte_v2_resumable",
+            resumable=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not support resumable"):
+            scheduler.add_request(request)
+
     def test_add_request(self):
         scheduler = create_scheduler()
 

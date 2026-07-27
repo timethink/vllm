@@ -17,12 +17,12 @@ def _plan(variant: str) -> dict:
         sidecar_bytes = workspace_bytes = 0
     elif variant == "hybrid":
         num_blocks = 100
-        compact_bytes = num_blocks * 52_096
+        compact_bytes = num_blocks * 50_560
         sidecar_bytes = 1_000
         workspace_bytes = 2_000
     else:
         num_blocks = 101
-        compact_bytes = num_blocks * 52_096
+        compact_bytes = num_blocks * 50_560
         sidecar_bytes = workspace_bytes = 0
     return {
         "available": True,
@@ -110,7 +110,7 @@ def test_analyze_run_writes_correctness_performance_and_memory(tmp_path: Path):
     assert summary["hybrid_state"]["raw_page_count_sum"] == 0
     assert summary["hybrid_state"]["observation_count"] == 4
     memory = summary["memory"]["median"]
-    expected_saving = 1.0 - (100 * 52_096 + 3_000) / (100 * 65_536)
+    expected_saving = 1.0 - (100 * 50_560 + 3_000) / (100 * 65_536)
     assert memory["same_capacity_memory_saving_ratio"] == pytest.approx(expected_saving)
     assert memory["fixed_budget_capacity_gain_ratio"] == pytest.approx(0.25)
 

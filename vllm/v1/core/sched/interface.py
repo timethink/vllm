@@ -34,6 +34,8 @@ class PauseState(enum.IntEnum):
 
 
 class SchedulerInterface(ABC):
+    byte_v2_raw_mutable_tail_q1: bool
+
     @abstractmethod
     def __init__(
         self,

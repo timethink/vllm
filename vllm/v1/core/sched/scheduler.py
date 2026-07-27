@@ -258,6 +258,7 @@ class Scheduler(SchedulerInterface):
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
+        self.byte_v2_raw_mutable_tail_q1 = kv_cache_config.byte_v2_raw_mutable_tail_q1
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
@@ -1820,6 +1821,11 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        if request.resumable and self.byte_v2_raw_mutable_tail_q1:
+            raise ValueError(
+                "ByteV2 raw-tail Q1 does not support resumable or streaming "
+                "sessions because paused sessions retain mutable KV tails"
+            )
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)

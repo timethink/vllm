@@ -180,7 +180,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Inspect raw staging immediately before each ByteV2 cache commit "
-            "and report the V5 outlier-pool demand. This disables the fused "
+            "and report the V6 outlier-pool demand. This disables the fused "
             "native raw-staging update and is not a performance mode."
         ),
     )
@@ -1066,6 +1066,9 @@ def _collect_kv_cache_plan(llm) -> dict[str, Any]:
             getattr(config, "byte_v2_raw_fallback_slots", 0)
         ),
         "raw_staging_slots": int(getattr(config, "byte_v2_raw_staging_slots", 0)),
+        "raw_mutable_tail_q1": bool(
+            getattr(config, "byte_v2_raw_mutable_tail_q1", False)
+        ),
     }
 
 

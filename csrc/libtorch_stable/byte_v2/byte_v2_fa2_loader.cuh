@@ -13,7 +13,8 @@
 
 namespace vllm::byte_v2::fa2 {
 
-using Layout = ByteV2PageLayoutV5<>;
+using Layout = ByteV2PageLayoutV6<>;
+using SplitZipLayout = ByteV2PageLayoutV5<>;
 using Policy = Layout::TilePolicy;
 using RawLayout = ByteV2RawStagingLayout<Policy, Layout::NumKvHeadsValue>;
 
@@ -27,6 +28,12 @@ static_assert(Layout::CodecExponentCodeBits == 4);
 static_assert(!Layout::IncludeRawPayloadValue);
 static_assert(Layout::OutlierEntriesPerTileValue <= 0x1ff);
 static_assert(Layout::OutlierPoolEntriesValue <= 0x7ff);
+static_assert(Layout::PageSizeBytes == 50560);
+static_assert(SplitZipLayout::PageSizeBytes == 52096);
+static_assert(SplitZipLayout::KvHeadRequiredMetaBytes ==
+              Layout::KvHeadRequiredMetaBytes);
+static_assert(SplitZipLayout::OutlierPoolBaseBytes ==
+              Layout::OutlierPoolBaseBytes);
 static_assert(RawLayout::SlotSizeBytes == 65536);
 static_assert(RawLayout::ValueBaseBytes == 32768);
 
@@ -65,6 +72,35 @@ static_assert(kSidebandPrefetchMode >= 0 && kSidebandPrefetchMode <= 3);
 // derived loader can opt the sufficiently large nonsplit grid into the same
 // schedule.
 static constexpr bool kReuseKvSmem = VLLM_BYTE_V2_FA2_REUSE_KV_SMEM != 0;
+
+// The reuse schedule has 48 KiB of FA2-owned shared memory: 16 KiB for Q and
+// one 32 KiB tile aliased by K and V.  Keep one descriptor for each 16-token
+// page after that region.  A K stage rebuilds the descriptors cooperatively;
+// the matching V stage consumes the same immutable snapshot.
+static constexpr int kFa2ReuseSmemBytes = 48 * 1024;
+static constexpr int kPagesPerFa2Tile = 128 / Policy::AllocBlockTokens;
+static constexpr int kHeadMetadataBytes = Layout::KvHeadRequiredMetaBytes;
+static_assert(kPagesPerFa2Tile == 8);
+static_assert(kHeadMetadataBytes == 96);
+
+struct alignas(16) SharedPageDescriptor {
+  int physical_page;
+  int raw_slot;
+  uint32_t overflow_marker;
+  uint32_t reserved;
+  uint8_t head_metadata[kHeadMetadataBytes];
+};
+
+static_assert(alignof(SharedPageDescriptor) == alignof(uint4));
+static_assert(sizeof(SharedPageDescriptor) == 112);
+static constexpr int kSharedPageDescriptorBytes =
+    kPagesPerFa2Tile * sizeof(SharedPageDescriptor);
+static_assert(kSharedPageDescriptorBytes == 896);
+
+__device__ __forceinline__ SharedPageDescriptor* shared_page_descriptors() {
+  extern __shared__ char smem_[];
+  return reinterpret_cast<SharedPageDescriptor*>(smem_ + kFa2ReuseSmemBytes);
+}
 
 __device__ __forceinline__ uint32_t load_u32(const uint8_t* page, int offset) {
   return *reinterpret_cast<const uint32_t*>(page + offset);
@@ -125,20 +161,77 @@ __device__ __forceinline__ uint4 decode_bf16x8(uint64_t lows, uint32_t codes,
           __byte_perm(lows_4567, highs_4567, kInterleaveHigh)};
 }
 
+// SplitZip stores one sign/mantissa byte and one 4-bit exponent-window code
+// per BF16 value.  The offline page encoder orders each contiguous 16-entry
+// codebook by exponent, so the exact exponent is base + code.  Reconstruct
+// both BF16 bytes here: unlike ByteV2, SplitZip's low plane does not retain
+// the exponent low bit.
+__device__ __forceinline__ uint32_t select_byte_high_bits(uint32_t yes,
+                                                          uint32_t no) {
+  uint32_t result;
+  // PTX LUT 0xe4 implements C ? A : B.  Selecting with 0x80808080 takes
+  // each byte's high bit from `yes` and all remaining bits from `no`.
+  asm("lop3.b32 %0, %1, %2, 0x80808080, 0xe4;"
+      : "=r"(result)
+      : "r"(yes), "r"(no));
+  return result;
+}
+
+__device__ __forceinline__ uint4 decode_splitzip_bf16x8(uint64_t sign_mantissas,
+                                                        uint32_t codes,
+                                                        uint8_t base) {
+  constexpr uint32_t kPackedNibbleMask = 0x0f0f0f0fu;
+  constexpr uint32_t kInterleaveLow = 0x5140u;
+  constexpr uint32_t kInterleaveHigh = 0x7362u;
+
+  const uint32_t even_codes = codes & kPackedNibbleMask;
+  const uint32_t odd_codes = (codes >> 4) & kPackedNibbleMask;
+  const uint32_t base_bytes = static_cast<uint32_t>(base) * 0x01010101u;
+  const uint32_t even_exponents = base_bytes + even_codes;
+  const uint32_t odd_exponents = base_bytes + odd_codes;
+  const uint32_t exponents_0123 =
+      __byte_perm(even_exponents, odd_exponents, kInterleaveLow);
+  const uint32_t exponents_4567 =
+      __byte_perm(even_exponents, odd_exponents, kInterleaveHigh);
+
+  const uint32_t sm_0123 = static_cast<uint32_t>(sign_mantissas);
+  const uint32_t sm_4567 = static_cast<uint32_t>(sign_mantissas >> 32);
+  const uint32_t exponent_lows_0123 = exponents_0123 << 7;
+  const uint32_t exponent_lows_4567 = exponents_4567 << 7;
+  const uint32_t exponent_highs_0123 = exponents_0123 >> 1;
+  const uint32_t exponent_highs_4567 = exponents_4567 >> 1;
+  const uint32_t lows_0123 = select_byte_high_bits(exponent_lows_0123, sm_0123);
+  const uint32_t lows_4567 = select_byte_high_bits(exponent_lows_4567, sm_4567);
+  const uint32_t highs_0123 =
+      select_byte_high_bits(sm_0123, exponent_highs_0123);
+  const uint32_t highs_4567 =
+      select_byte_high_bits(sm_4567, exponent_highs_4567);
+  return {__byte_perm(lows_0123, highs_0123, kInterleaveLow),
+          __byte_perm(lows_0123, highs_0123, kInterleaveHigh),
+          __byte_perm(lows_4567, highs_4567, kInterleaveLow),
+          __byte_perm(lows_4567, highs_4567, kInterleaveHigh)};
+}
+
+template <bool SplitZipFormat>
+__device__ __forceinline__ uint4 decode_codec_bf16x8(uint64_t lows,
+                                                     uint32_t codes,
+                                                     uint8_t base) {
+  if constexpr (SplitZipFormat) {
+    return decode_splitzip_bf16x8(lows, codes, base);
+  } else {
+    return decode_bf16x8(lows, codes, base);
+  }
+}
+
 // The persistent raw sidecar uses the existing ByteV2 staging layout:
 // [K/V, kv_head, row, dim].  Each FA2 copy thread owns sixteen aligned BF16
 // values for eight rows, so it can populate the final shared-memory tile with
 // the same 16-byte transactions as raw paged FA2.  Returning true tells the
 // post-copy decoder that this thread's page is already materialized BF16.
 template <typename DstTensor>
-__device__ __forceinline__ bool stage_raw_page_to_fa2_smem(
-    const uint8_t* raw_side_base, int num_raw_slots,
-    const int* page_to_raw_slot, int physical_page, int kv_head, int row0,
-    int valid_rows, DstTensor& dst) {
-  if (page_to_raw_slot == nullptr) {
-    return false;
-  }
-  const int raw_slot = page_to_raw_slot[physical_page];
+__device__ __forceinline__ bool stage_raw_slot_to_fa2_smem(
+    const uint8_t* raw_side_base, int num_raw_slots, int raw_slot, int kv_head,
+    int row0, int valid_rows, DstTensor& dst) {
   if (raw_slot == -1) {
     return false;
   }
@@ -176,6 +269,19 @@ __device__ __forceinline__ bool stage_raw_page_to_fa2_smem(
   return true;
 }
 
+template <typename DstTensor>
+__device__ __forceinline__ bool stage_raw_page_to_fa2_smem(
+    const uint8_t* raw_side_base, int num_raw_slots,
+    const int* page_to_raw_slot, int physical_page, int kv_head, int row0,
+    int valid_rows, DstTensor& dst) {
+  if (page_to_raw_slot == nullptr) {
+    return false;
+  }
+  return stage_raw_slot_to_fa2_smem(raw_side_base, num_raw_slots,
+                                    page_to_raw_slot[physical_page], kv_head,
+                                    row0, valid_rows, dst);
+}
+
 __device__ __forceinline__ bool thread_page_is_raw(int num_pages,
                                                    int num_raw_slots,
                                                    const int* page_to_raw_slot,
@@ -198,12 +304,14 @@ __device__ __forceinline__ bool thread_page_is_raw(int num_pages,
   return raw_slot >= 0;
 }
 
-template <bool IsValue, typename DstTensor, typename CoordTensor>
+template <bool IsValue, typename PageLayout = Layout, typename DstTensor,
+          typename CoordTensor>
 __device__ __forceinline__ void stage_tile_to_fa2_smem_scalar(
     const uint8_t* byte_v2_cache, const uint8_t* raw_side_base,
     const int* page_to_raw_slot, int64_t page_stride_bytes, int num_pages,
     int num_raw_slots, const int* block_table, int kv_head, int n_block,
     int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+  using Layout = PageLayout;
   constexpr int kElementsPerVector = 8;
   constexpr int kRowsPerThread = 8;
   constexpr int kDimVectorsPerThread = 2;
@@ -278,7 +386,8 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_scalar(
     }
   }
 
-  // V5 has no raw-payload fallback. A committed page carrying either an
+  // The compact page has no embedded raw-payload fallback. A committed page
+  // carrying either an
   // overflow marker or a fallback bit cannot be decoded exactly.
   if (load_u32(page, Layout::OutlierPoolOverflowOffset) != 0) {
     __trap();
@@ -336,12 +445,14 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_scalar(
   }
 }
 
-template <typename DstTensor, typename CoordTensor>
+template <bool SplitZipFormat = false, typename PageLayout = Layout,
+          typename DstTensor, typename CoordTensor>
 __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_scalar(
     const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int num_pages,
     int num_raw_slots, const int* page_to_raw_slot, const int* block_table,
     int n_block, int block_n, int valid_rows, DstTensor& dst,
     const CoordTensor& coords) {
+  using Layout = PageLayout;
   constexpr int kElementsPerVector = 8;
   constexpr int kRowsPerThread = 8;
   constexpr int kDimVectorsPerThread = 2;
@@ -399,7 +510,7 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_scalar(
         const uint4 staged = *reinterpret_cast<const uint4*>(&dst(0, m, k));
         const uint64_t lows = static_cast<uint64_t>(staged.x) |
                               (static_cast<uint64_t>(staged.y) << 32);
-        decoded = decode_bf16x8(lows, staged.z, base);
+        decoded = decode_codec_bf16x8<SplitZipFormat>(lows, staged.z, base);
       }
       *reinterpret_cast<uint4*>(&dst(0, m, k)) = decoded;
     }
@@ -427,8 +538,15 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_scalar(
       if (m >= 0 && m < kRowsPerThread && v >= 0 && v < kElementsPerVector &&
           row0 + m < valid_rows) {
         auto* dst_bytes = reinterpret_cast<uint8_t*>(&dst(v, m, k));
-        dst_bytes[1] = static_cast<uint8_t>(
+        const uint16_t replacement = static_cast<uint16_t>(
             Layout::OutlierEntryPolicy::decode_value_bits(entry));
+        if constexpr (SplitZipFormat) {
+          auto* dst_bits = reinterpret_cast<uint16_t*>(dst_bytes);
+          *dst_bits =
+              static_cast<uint16_t>((*dst_bits & 0x807fu) | (replacement << 7));
+        } else {
+          dst_bytes[1] = static_cast<uint8_t>(replacement);
+        }
       }
     }
   }
@@ -444,12 +562,15 @@ __device__ __forceinline__ uint8_t* paired_vector_slot(DstTensor& dst, int m,
   return own_slot + partner_delta;
 }
 
-template <bool IsValue, typename DstTensor, typename CoordTensor>
+template <bool IsValue, bool UseSharedPageDescriptor,
+          typename PageLayout = Layout, typename DstTensor,
+          typename CoordTensor>
 __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
     const uint8_t* byte_v2_cache, const uint8_t* raw_side_base,
     const int* page_to_raw_slot, int64_t page_stride_bytes, int num_pages,
     int num_raw_slots, const int* block_table, int kv_head, int n_block,
     int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+  using Layout = PageLayout;
   constexpr int kRowsPerThread = 8;
 
   CUTE_STATIC_ASSERT_V(cute::size<0>(dst) == cute::Int<8>{});
@@ -473,38 +594,119 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
   // one thread while retaining FA2's final shared-memory layout.
   const int tidx = static_cast<int>(threadIdx.x);
   const int row0 = kRowsPerThread * (tidx >> 3);
+  const int page_in_tile = tidx / Policy::CodecDimBlock;
+  SharedPageDescriptor* descriptor = nullptr;
+  int physical_page = -1;
+  int raw_slot = -1;
+
+  if constexpr (UseSharedPageDescriptor && !IsValue) {
+    // Every warp owns two complete 16-thread page groups. Keep all 32 lanes
+    // participating through the warp barrier, including a padded page group,
+    // so a partial final tile never reads its padded block-table entries.
+    const bool page_valid =
+        page_in_tile * Policy::AllocBlockTokens < valid_rows;
+    const int lane_in_warp = tidx & (warpSize - 1);
+    const int lane_in_page = tidx & (Policy::CodecDimBlock - 1);
+    const int leader_lane = lane_in_warp & ~(Policy::CodecDimBlock - 1);
+    uint32_t overflow_marker = 0;
+    if (page_valid && lane_in_page == 0) {
+      const int logical_page =
+          n_block * (block_n / Policy::AllocBlockTokens) + page_in_tile;
+      physical_page = block_table[logical_page];
+      if (physical_page < 0 || physical_page >= num_pages) {
+        __trap();
+      }
+      if (page_to_raw_slot != nullptr) {
+        raw_slot = page_to_raw_slot[physical_page];
+        if (raw_slot < -1 || raw_slot >= num_raw_slots) {
+          __trap();
+        }
+      }
+      if (raw_slot < 0) {
+        const uint8_t* page =
+            byte_v2_cache +
+            static_cast<int64_t>(physical_page) * page_stride_bytes;
+        overflow_marker =
+            load_u32_early(page, Layout::OutlierPoolOverflowOffset);
+      }
+    }
+    physical_page = __shfl_sync(0xffffffffu, physical_page, leader_lane);
+    raw_slot = __shfl_sync(0xffffffffu, raw_slot, leader_lane);
+
+    descriptor = shared_page_descriptors() + page_in_tile;
+    if (page_valid && lane_in_page == 0) {
+      descriptor->physical_page = physical_page;
+      descriptor->raw_slot = raw_slot;
+      descriptor->overflow_marker = overflow_marker;
+      descriptor->reserved = 0;
+    }
+    if (page_valid && raw_slot < 0 &&
+        lane_in_page < kHeadMetadataBytes / sizeof(uint4)) {
+      const uint8_t* page =
+          byte_v2_cache +
+          static_cast<int64_t>(physical_page) * page_stride_bytes;
+      const int chunk_offset = lane_in_page * sizeof(uint4);
+      const uint4 metadata_chunk = *reinterpret_cast<const uint4*>(
+          page + Layout::kv_head_meta_offset(kv_head) + chunk_offset);
+      *reinterpret_cast<uint4*>(descriptor->head_metadata + chunk_offset) =
+          metadata_chunk;
+    }
+    __syncwarp();
+  }
+
   if (row0 >= valid_rows) {
     return;
   }
+
+  if constexpr (UseSharedPageDescriptor) {
+    descriptor = shared_page_descriptors() + page_in_tile;
+    if constexpr (IsValue) {
+      physical_page = descriptor->physical_page;
+      raw_slot = descriptor->raw_slot;
+    }
+    if (physical_page < 0 || physical_page >= num_pages || raw_slot < -1 ||
+        raw_slot >= num_raw_slots) {
+      __trap();
+    }
+  } else {
+    const int logical_page =
+        n_block * (block_n / Policy::AllocBlockTokens) + page_in_tile;
+    physical_page = block_table[logical_page];
+    if (physical_page < 0 || physical_page >= num_pages) {
+      __trap();
+    }
+  }
+
   const int side = tidx & 1;
   const int dst_k = side;
   const int dim_tile = 4 * side + ((tidx & 7) >> 1);
-  const int logical_page = n_block * (block_n / Policy::AllocBlockTokens) +
-                           tidx / Policy::CodecDimBlock;
-  const int physical_page = block_table[logical_page];
-  if (physical_page < 0 || physical_page >= num_pages) {
-    __trap();
-  }
-  if (stage_raw_page_to_fa2_smem(raw_side_base, num_raw_slots, page_to_raw_slot,
-                                 physical_page, kv_head, row0, valid_rows,
-                                 dst)) {
-    return;
+  if constexpr (UseSharedPageDescriptor) {
+    if (stage_raw_slot_to_fa2_smem(raw_side_base, num_raw_slots, raw_slot,
+                                   kv_head, row0, valid_rows, dst)) {
+      return;
+    }
+  } else {
+    if (stage_raw_page_to_fa2_smem(raw_side_base, num_raw_slots,
+                                   page_to_raw_slot, physical_page, kv_head,
+                                   row0, valid_rows, dst)) {
+      return;
+    }
   }
   const uint8_t* page =
       byte_v2_cache + static_cast<int64_t>(physical_page) * page_stride_bytes;
   uint32_t prefetched_overflow_marker = 0;
-  if constexpr (kSidebandPrefetchMode >= 1) {
+  if constexpr (!UseSharedPageDescriptor && kSidebandPrefetchMode >= 1) {
     prefetched_overflow_marker =
         load_u32_early(page, Layout::OutlierPoolOverflowOffset);
   }
   uint32_t prefetched_fallback_mask = 0;
-  if constexpr (kSidebandPrefetchMode >= 2) {
+  if constexpr (!UseSharedPageDescriptor && kSidebandPrefetchMode >= 2) {
     prefetched_fallback_mask =
         load_u32_early(page, IsValue ? Layout::v_fallback_mask_offset(kv_head)
                                      : Layout::k_fallback_mask_offset(kv_head));
   }
   uint32_t prefetched_outlier_mask = 0;
-  if constexpr (kSidebandPrefetchMode >= 3) {
+  if constexpr (!UseSharedPageDescriptor && kSidebandPrefetchMode >= 3) {
     prefetched_outlier_mask =
         load_u32_early(page, IsValue ? Layout::v_outlier_mask_offset(kv_head)
                                      : Layout::k_outlier_mask_offset(kv_head));
@@ -550,9 +752,12 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
     }
   }
 
-  // V5 has no raw payload from which to recover an invalid compressed page.
+  // A compact page has no embedded raw payload from which to recover an
+  // invalid compressed page.
   uint32_t overflow_marker;
-  if constexpr (kSidebandPrefetchMode >= 1) {
+  if constexpr (UseSharedPageDescriptor) {
+    overflow_marker = descriptor->overflow_marker;
+  } else if constexpr (kSidebandPrefetchMode >= 1) {
     overflow_marker = prefetched_overflow_marker;
   } else {
     overflow_marker = load_u32(page, Layout::OutlierPoolOverflowOffset);
@@ -561,20 +766,33 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
     __trap();
   }
   uint32_t fallback_mask;
-  if constexpr (kSidebandPrefetchMode >= 2) {
+  uint32_t outlier_mask;
+  if constexpr (UseSharedPageDescriptor) {
+    const int head_metadata_offset = Layout::kv_head_meta_offset(kv_head);
+    fallback_mask =
+        load_u32(descriptor->head_metadata,
+                 (IsValue ? Layout::v_fallback_mask_offset(kv_head)
+                          : Layout::k_fallback_mask_offset(kv_head)) -
+                     head_metadata_offset);
+    outlier_mask = load_u32(descriptor->head_metadata,
+                            (IsValue ? Layout::v_outlier_mask_offset(kv_head)
+                                     : Layout::k_outlier_mask_offset(kv_head)) -
+                                head_metadata_offset);
+  } else if constexpr (kSidebandPrefetchMode >= 2) {
     fallback_mask = prefetched_fallback_mask;
   } else {
     fallback_mask =
         load_u32(page, IsValue ? Layout::v_fallback_mask_offset(kv_head)
                                : Layout::k_fallback_mask_offset(kv_head));
   }
-  uint32_t outlier_mask;
-  if constexpr (kSidebandPrefetchMode >= 3) {
-    outlier_mask = prefetched_outlier_mask;
-  } else {
-    outlier_mask =
-        load_u32(page, IsValue ? Layout::v_outlier_mask_offset(kv_head)
-                               : Layout::k_outlier_mask_offset(kv_head));
+  if constexpr (!UseSharedPageDescriptor) {
+    if constexpr (kSidebandPrefetchMode >= 3) {
+      outlier_mask = prefetched_outlier_mask;
+    } else {
+      outlier_mask =
+          load_u32(page, IsValue ? Layout::v_outlier_mask_offset(kv_head)
+                                 : Layout::k_outlier_mask_offset(kv_head));
+    }
   }
   const int codec_tile_idx =
       IsValue ? Layout::v_tile_index(dim_tile) : Layout::k_tile_index(dim_tile);
@@ -583,17 +801,37 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
     __trap();
   }
 
-  const uint8_t base = page[IsValue ? Layout::v_base_offset(kv_head, dim_tile)
-                                    : Layout::k_base_offset(kv_head, dim_tile)];
+  const int head_metadata_offset = Layout::kv_head_meta_offset(kv_head);
+  const uint8_t base =
+      UseSharedPageDescriptor
+          ? descriptor->head_metadata
+                [(IsValue ? Layout::v_base_offset(kv_head, dim_tile)
+                          : Layout::k_base_offset(kv_head, dim_tile)) -
+                 head_metadata_offset]
+          : page[IsValue ? Layout::v_base_offset(kv_head, dim_tile)
+                         : Layout::k_base_offset(kv_head, dim_tile)];
   const bool has_outlier = (outlier_mask & tile_bit) != 0;
   int count = 0;
   int pool_index = 0;
   if (has_outlier) {
-    count = IsValue ? Layout::v_outlier_count(page, kv_head, dim_tile)
-                    : Layout::k_outlier_count(page, kv_head, dim_tile);
-    pool_index = IsValue
-                     ? Layout::v_outlier_pool_index(page, kv_head, dim_tile)
-                     : Layout::k_outlier_pool_index(page, kv_head, dim_tile);
+    if constexpr (UseSharedPageDescriptor) {
+      count = static_cast<int>(load_u16(
+          descriptor->head_metadata,
+          (IsValue ? Layout::v_outlier_count_offset(kv_head, dim_tile)
+                   : Layout::k_outlier_count_offset(kv_head, dim_tile)) -
+              head_metadata_offset));
+      pool_index = static_cast<int>(load_u16(
+          descriptor->head_metadata,
+          (IsValue ? Layout::v_outlier_pool_index_offset(kv_head, dim_tile)
+                   : Layout::k_outlier_pool_index_offset(kv_head, dim_tile)) -
+              head_metadata_offset));
+    } else {
+      count = IsValue ? Layout::v_outlier_count(page, kv_head, dim_tile)
+                      : Layout::k_outlier_count(page, kv_head, dim_tile);
+      pool_index = IsValue
+                       ? Layout::v_outlier_pool_index(page, kv_head, dim_tile)
+                       : Layout::k_outlier_pool_index(page, kv_head, dim_tile);
+    }
     if (count < 0 || count > Layout::OutlierEntriesPerTileValue ||
         pool_index < 0 ||
         pool_index + count > Layout::OutlierPoolEntriesValue) {
@@ -612,15 +850,21 @@ __device__ __forceinline__ void stage_tile_to_fa2_smem_paired_16(
   constexpr int kMetadataOffset = kStageMode == 1 ? 8 : 0;
   auto* metadata_slot = paired_vector_slot(dst, kMetadataRow, dst_k, side);
   *reinterpret_cast<uint32_t*>(metadata_slot + kMetadataOffset) = packed_meta;
-  *reinterpret_cast<int*>(metadata_slot + kMetadataOffset + 4) = physical_page;
+  if constexpr (!UseSharedPageDescriptor) {
+    *reinterpret_cast<int*>(metadata_slot + kMetadataOffset + 4) =
+        physical_page;
+  }
 }
 
-template <typename DstTensor, typename CoordTensor>
+template <bool UseSharedPageDescriptor, bool SplitZipFormat = false,
+          typename PageLayout = Layout, typename DstTensor,
+          typename CoordTensor>
 __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
     const uint8_t* byte_v2_cache, int64_t page_stride_bytes, int num_pages,
     int num_raw_slots, const int* page_to_raw_slot, const int* block_table,
     int n_block, int block_n, int valid_rows, DstTensor& dst,
     const CoordTensor& coords) {
+  using Layout = PageLayout;
   constexpr int kElementsPerVector = 8;
   constexpr int kRowsPerThread = 8;
   CUTE_STATIC_ASSERT_V(cute::size<0>(dst) == cute::Int<8>{});
@@ -646,9 +890,22 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
     }
     return;
   }
-  if (thread_page_is_raw(num_pages, num_raw_slots, page_to_raw_slot,
-                         block_table, n_block, block_n)) {
-    return;
+  const SharedPageDescriptor* descriptor = nullptr;
+  if constexpr (UseSharedPageDescriptor) {
+    descriptor = shared_page_descriptors() + tidx / Policy::CodecDimBlock;
+    if (descriptor->physical_page < 0 ||
+        descriptor->physical_page >= num_pages || descriptor->raw_slot < -1 ||
+        descriptor->raw_slot >= num_raw_slots) {
+      __trap();
+    }
+    if (descriptor->raw_slot >= 0) {
+      return;
+    }
+  } else {
+    if (thread_page_is_raw(num_pages, num_raw_slots, page_to_raw_slot,
+                           block_table, n_block, block_n)) {
+      return;
+    }
   }
 
   constexpr int kHasOutlierShift = 8;
@@ -662,7 +919,9 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
   const uint32_t packed_meta =
       *reinterpret_cast<const uint32_t*>(metadata_slot + kMetadataOffset);
   const int physical_page =
-      *reinterpret_cast<const int*>(metadata_slot + kMetadataOffset + 4);
+      UseSharedPageDescriptor
+          ? descriptor->physical_page
+          : *reinterpret_cast<const int*>(metadata_slot + kMetadataOffset + 4);
   const uint8_t base = static_cast<uint8_t>(packed_meta);
   const bool has_outlier = ((packed_meta >> kHasOutlierShift) & 1u) != 0;
   const int count = static_cast<int>((packed_meta >> kCountShift) & kCountMask);
@@ -684,9 +943,9 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
                                   (static_cast<uint64_t>(staged_lows.y) << 32);
         const uint64_t high_lows = static_cast<uint64_t>(staged_lows.z) |
                                    (static_cast<uint64_t>(staged_lows.w) << 32);
-        low_decoded =
-            decode_bf16x8(low_lows, static_cast<uint32_t>(staged_codes), base);
-        high_decoded = decode_bf16x8(
+        low_decoded = decode_codec_bf16x8<SplitZipFormat>(
+            low_lows, static_cast<uint32_t>(staged_codes), base);
+        high_decoded = decode_codec_bf16x8<SplitZipFormat>(
             high_lows, static_cast<uint32_t>(staged_codes >> 32), base);
       }
       auto* low_slot = side == 0 ? own_slot : partner_slot;
@@ -718,9 +977,9 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
           const uint64_t high_lows =
               static_cast<uint64_t>(staged_lows.z) |
               (static_cast<uint64_t>(staged_lows.w) << 32);
-          low_decoded = decode_bf16x8(
+          low_decoded = decode_codec_bf16x8<SplitZipFormat>(
               low_lows, static_cast<uint32_t>(staged_codes), base);
-          high_decoded = decode_bf16x8(
+          high_decoded = decode_codec_bf16x8<SplitZipFormat>(
               high_lows, static_cast<uint32_t>(staged_codes >> 32), base);
         }
         auto* low_slot = side == 0 ? own_slot : partner_slot;
@@ -758,8 +1017,15 @@ __device__ __forceinline__ void decode_staged_tile_to_fa2_smem_paired_16(
           outlier_dim < kElementsPerVector
               ? low_slot + 2 * outlier_dim
               : high_slot + 2 * (outlier_dim - kElementsPerVector);
-      dst_bytes[1] = static_cast<uint8_t>(
+      const uint16_t replacement = static_cast<uint16_t>(
           Layout::OutlierEntryPolicy::decode_value_bits(entry));
+      if constexpr (SplitZipFormat) {
+        auto* dst_bits = reinterpret_cast<uint16_t*>(dst_bytes);
+        *dst_bits =
+            static_cast<uint16_t>((*dst_bits & 0x807fu) | (replacement << 7));
+      } else {
+        dst_bytes[1] = static_cast<uint8_t>(replacement);
+      }
     }
   }
 }
@@ -771,6 +1037,7 @@ struct Loader {
   static constexpr int Threads = 128;
   static constexpr bool ReuseKvSmem = kReuseKvSmem;
   static constexpr bool ReuseKvSmemNonsplit = false;
+  static constexpr int SharedStorageBytes = 0;
 
   template <bool IsValue, typename Params, typename DstTensor,
             typename CoordTensor>
@@ -791,7 +1058,7 @@ struct Loader {
           num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
           valid_rows, dst, coords);
     } else {
-      fa2::stage_tile_to_fa2_smem_paired_16<IsValue>(
+      fa2::stage_tile_to_fa2_smem_paired_16<IsValue, false>(
           byte_v2_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
           num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
           valid_rows, dst, coords);
@@ -814,7 +1081,7 @@ struct Loader {
           page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
           coords);
     } else {
-      fa2::decode_staged_tile_to_fa2_smem_paired_16(
+      fa2::decode_staged_tile_to_fa2_smem_paired_16<false>(
           byte_v2_cache, PageSizeBytes, num_pages, num_raw_slots,
           page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
           coords);
@@ -824,6 +1091,180 @@ struct Loader {
 
 struct LoaderReuseKvSmemNonsplit : Loader {
   static constexpr bool ReuseKvSmemNonsplit = true;
+};
+
+// This variant is selected only when FA2 aliases K and V shared memory. K
+// builds one page descriptor cooperatively per 16-thread group and V reuses
+// it, while the legacy Loader remains available to the non-reuse schedule.
+struct LoaderSharedPageDescriptor : Loader {
+  static constexpr bool ReuseKvSmemNonsplit = true;
+  static constexpr int SharedStorageBytes = kSharedPageDescriptorBytes;
+
+  template <bool IsValue, typename Params, typename DstTensor,
+            typename CoordTensor>
+  __device__ static __forceinline__ void stage_tile_to_fa2_smem(
+      const Params& params, const int* block_table, int kv_head, int n_block,
+      int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* byte_v2_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* raw_slot_base =
+        reinterpret_cast<const uint8_t*>(IsValue ? params.v_ptr : params.k_ptr);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
+    if constexpr (kStageMode == 0) {
+      fa2::stage_tile_to_fa2_smem_scalar<IsValue>(
+          byte_v2_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
+    } else {
+      fa2::stage_tile_to_fa2_smem_paired_16<IsValue, true>(
+          byte_v2_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
+    }
+  }
+
+  template <typename Params, typename DstTensor, typename CoordTensor>
+  __device__ static __forceinline__ void decode_staged_tile_to_fa2_smem(
+      const Params& params, const int* block_table, int n_block, int block_n,
+      int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* byte_v2_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
+    if constexpr (kStageMode == 0) {
+      fa2::decode_staged_tile_to_fa2_smem_scalar(
+          byte_v2_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
+    } else {
+      fa2::decode_staged_tile_to_fa2_smem_paired_16<true>(
+          byte_v2_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
+    }
+  }
+};
+
+// Reader-only SplitZip page variants reuse the V5 envelope and asynchronous
+// staging schedule.  Their dense plane contains sign/mantissa bytes rather
+// than ByteV2 low bytes, and pooled 2-byte entries carry the true exponent
+// rather than a replacement high byte.  The page writer is intentionally
+// outside the realtime attention path.
+struct SplitZipLoader : Loader {
+  static constexpr int PageSizeBytes = SplitZipLayout::PageSizeBytes;
+
+  template <bool IsValue, typename Params, typename DstTensor,
+            typename CoordTensor>
+  __device__ static __forceinline__ void stage_tile_to_fa2_smem(
+      const Params& params, const int* block_table, int kv_head, int n_block,
+      int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* splitzip_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* raw_slot_base =
+        reinterpret_cast<const uint8_t*>(IsValue ? params.v_ptr : params.k_ptr);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
+    if constexpr (kStageMode == 0) {
+      fa2::stage_tile_to_fa2_smem_scalar<IsValue, SplitZipLayout>(
+          splitzip_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
+    } else {
+      fa2::stage_tile_to_fa2_smem_paired_16<IsValue, false, SplitZipLayout>(
+          splitzip_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
+    }
+  }
+
+  template <typename Params, typename DstTensor, typename CoordTensor>
+  __device__ static __forceinline__ void decode_staged_tile_to_fa2_smem(
+      const Params& params, const int* block_table, int n_block, int block_n,
+      int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* splitzip_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
+    if constexpr (kStageMode == 0) {
+      fa2::decode_staged_tile_to_fa2_smem_scalar<true, SplitZipLayout>(
+          splitzip_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
+    } else {
+      fa2::decode_staged_tile_to_fa2_smem_paired_16<false, true,
+                                                    SplitZipLayout>(
+          splitzip_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
+    }
+  }
+};
+
+struct SplitZipLoaderReuseKvSmemNonsplit : SplitZipLoader {
+  static constexpr bool ReuseKvSmemNonsplit = true;
+};
+
+struct SplitZipLoaderSharedPageDescriptor : SplitZipLoader {
+  static constexpr bool ReuseKvSmemNonsplit = true;
+  static constexpr int SharedStorageBytes = kSharedPageDescriptorBytes;
+
+  template <bool IsValue, typename Params, typename DstTensor,
+            typename CoordTensor>
+  __device__ static __forceinline__ void stage_tile_to_fa2_smem(
+      const Params& params, const int* block_table, int kv_head, int n_block,
+      int block_n, int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* splitzip_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* raw_slot_base =
+        reinterpret_cast<const uint8_t*>(IsValue ? params.v_ptr : params.k_ptr);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
+    if constexpr (kStageMode == 0) {
+      fa2::stage_tile_to_fa2_smem_scalar<IsValue, SplitZipLayout>(
+          splitzip_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
+    } else {
+      fa2::stage_tile_to_fa2_smem_paired_16<IsValue, true, SplitZipLayout>(
+          splitzip_cache, raw_slot_base, page_to_raw_slot, PageSizeBytes,
+          num_pages, num_raw_slots, block_table, kv_head, n_block, block_n,
+          valid_rows, dst, coords);
+    }
+  }
+
+  template <typename Params, typename DstTensor, typename CoordTensor>
+  __device__ static __forceinline__ void decode_staged_tile_to_fa2_smem(
+      const Params& params, const int* block_table, int n_block, int block_n,
+      int valid_rows, DstTensor& dst, const CoordTensor& coords) {
+    const auto* splitzip_cache =
+        reinterpret_cast<const uint8_t*>(params.blockmask);
+    const auto* page_to_raw_slot =
+        reinterpret_cast<const int*>(params.vnew_ptr);
+    const int num_pages = static_cast<int>(params.k_batch_stride);
+    const int num_raw_slots = static_cast<int>(params.v_batch_stride);
+    if constexpr (kStageMode == 0) {
+      fa2::decode_staged_tile_to_fa2_smem_scalar<true, SplitZipLayout>(
+          splitzip_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
+    } else {
+      fa2::decode_staged_tile_to_fa2_smem_paired_16<true, true, SplitZipLayout>(
+          splitzip_cache, PageSizeBytes, num_pages, num_raw_slots,
+          page_to_raw_slot, block_table, n_block, block_n, valid_rows, dst,
+          coords);
+    }
+  }
 };
 
 }  // namespace vllm::byte_v2::fa2

@@ -2850,3 +2850,1529 @@ Artifacts:
 - `profile/byte-v2-memory-pressure-a40-20260721/screening/`
 - `profile/byte-v2-memory-pressure-a40-20260721/screening_confirm/`
 - `profile/byte-v2-memory-pressure-a40-20260721/diagnostic/`
+
+### Cooperative Batch-32 Writer and Realtime E2E Path
+
+The batch-32 writer cliff identified above is now removed on the realtime
+path. The implementation does not invoke two independent 16-token writers.
+Instead, one thread first validates all 17--32 input tokens, merges rows by
+physical page, rejects duplicate `(page, row)` entries, checks every raw map
+and staging bound, and only then claims the unique pages. A single
+`grid=(8, unique_pages)` hydrate launch lets the GPU schedule the page CTAs in
+hardware waves. The existing compact commit, raw persist/map-last publication,
+transient release, QK, softmax, PV, split reduction, and FA2 combine code are
+unchanged.
+
+The cooperative prepare limit is 32 instead of 16. The default dispatch uses
+the new limit; setting
+`BYTE_V2_HYBRID_COOPERATIVE_WRITER_LIMIT=16` restores the old generic dispatch
+inside the same compiled extension for paired A/B measurements. The only
+accepted values are 16 and 32, and an invalid value raises before launching a
+kernel. This switch changes no custom-op schema and is read once per process,
+so CUDA Graph replay contains only the captured kernel launches.
+
+An interleaved CUDA-event microbenchmark used one append per request, distinct
+physical pages, 100 warmups, 1,000 measured Graph replays, and the actual
+hybrid FA2 reader as a bitwise oracle:
+
+| Batch | Old limit 16 | Cooperative limit 32 | Change |
+| ---: | ---: | ---: | ---: |
+| 8 | 30.656 us | 29.696 us | -3.13% |
+| 16 | 42.928 us | 41.984 us | -2.20% |
+| 17 | 388.096 us | 44.032 us | -88.65% |
+| 32 | 391.136 us | 75.776 us | -80.63% |
+
+All four candidate cases have zero hybrid/raw output and LSE mismatches, clean
+transient state, and a fully returned persistent allocator. The N8/N16
+differences are within the approximately 1-us event quantization and show no
+regression. N17 and N32 no longer fall into the two-owner-CTA generic path.
+
+Correctness coverage now includes the old and new dispatch boundaries
+`N={16,17,32,33}`, an N32 CUDA Graph reset/replay/dummy cycle, a duplicate
+slot split across token indices 0 and 31, and 32 unique pages with only 31
+staging slots. The latter two cases trap before successful publication. The
+compact and existing-raw source cases, page permutations, adaptive CTA cases,
+logical BF16 cache reads, FA2 output/LSE, page flags, and allocator partition
+remain exact against the generic reference. Compute Sanitizer reports zero
+memcheck errors, zero synccheck errors on the N32 Graph replay, and zero
+racecheck hazards.
+
+The clean fixed-budget E2E gate used one A40, BF16 Llama-3.1-8B-Instruct,
+batch 32, a 4,096-token prompt per request, 256 forced output tokens, compiled
+CUDA Graph execution, no speculation, no prefix caching, and the exact
+20,000,000,000-byte KV budget. Three control/candidate runs were ordered
+control/candidate, candidate/control, and control/candidate:
+
+| Round | Old writer seconds / tok/s | B32 writer seconds / tok/s |
+| ---: | ---: | ---: |
+| 1 | 47.131210 / 173.813 | 40.817264 / 200.699 |
+| 2 | 47.719661 / 171.669 | 40.961616 / 199.992 |
+| 3 | 47.388192 / 172.870 | 40.725993 / 201.149 |
+
+The medians are 47.388192 versus 40.817264 seconds and 172.870 versus
+200.699 tok/s. The new writer therefore reduces wall time by 13.8662% and
+raises TPS by 16.0984%. Control varies by 1.25% across the three runs and the
+candidate by 0.58%, so the signal is much larger than run-to-run noise. Every
+candidate and control request matches the raw FA2 token sequence exactly,
+both schedulers report zero preemptions, and all candidate runs finish with
+32 initialized layers, `fatal=0`, no authoritative raw pages, and all 1,472
+sidecar slots free.
+
+Two adjacent raw FA2 references have a 35.268312-second and 232.277-tok/s
+median. Relative to that reference, the old ByteV2 path was 34.3648% slower in
+wall time and 25.5760% lower in TPS. The new path is 15.7335% slower and
+13.5949% lower in TPS. It removes 54.2161% of the absolute ByteV2/raw wall gap
+without using the compression capacity advantage or inducing raw preemption.
+
+Request-level medians show where the improvement occurs:
+
+| Metric | Old writer | B32 writer | Raw FA2 |
+| --- | ---: | ---: | ---: |
+| Queue | 9.336711 s | 9.290619 s | 5.909442 s |
+| First-token latency | 16.203130 s | 16.142097 s | 11.887259 s |
+| Decode span | 30.983789 s | 24.473965 s | 23.232500 s |
+| Engine E2E | 47.186614 s | 40.615751 s | 35.119429 s |
+
+The writer change reduces the median decode span by 21.01%, while first-token
+latency is effectively unchanged. After this optimization, only about 1.24
+seconds of the median request gap to raw is in decode, whereas about 4.25
+seconds is present before the first token. For the E2E objective, initial and
+mixed prefill consequently become a higher-priority target than another Q1
+decode micro-optimization.
+
+An instrumented B32/P4096/D1 replay localizes that prefill gap. With the
+default 128-slot cross-layer workspace, each four-request 16,384-token
+prefill step is split into 12 staging waves and cannot retain one complete
+exact-BF16 lease. The hybrid Q4096 cache-reader call accumulates 4,334.596 ms,
+versus 1,926.284 ms for raw FA2; the multi-token writer accumulates 439.502 ms.
+These are nested event scopes and must not be added together, but the
+approximately 2.41-second attention difference matches the observed D1 wall
+gap.
+
+The existing `BYTE_V2_FA2_RAW_STAGING_SLOTS` switch provides a no-code upper
+bound. A conservative 1,028-slot workspace fits all four 4,096-token requests
+in one staging wave. At D1 it changes ByteV2 from 21.167044 to 19.046222
+seconds, while the paired raw result is 18.819670 seconds; tokens remain exact.
+However, the full D256 result is only 40.343576 seconds and 203.056 tok/s,
+about 1.16% faster than the 128-slot candidate median. It also consumes about
+59 MB more shared transient storage and reduces the fixed-budget plan from
+11,933 to 11,897 compact blocks.
+
+The small D256 gain has a structural explanation. Once the first prompt group
+starts decoding, later prompt groups share a scheduler step with requests that
+already have cached context. The current `has_cached_context` decision routes
+the entire mixed batch through the hybrid cache prefill reader, so the larger
+workspace only helps the first pure-prefill group. Increasing the default
+workspace is therefore not retained as the next main-path optimization.
+
+The mixed-prefill route remains the structural TTFT target, but a direct
+implementation review found that splitting cached Q1 requests out of a mixed
+FA2 batch changes the GQA/split dispatch unless it uses a special dispatch
+sentinel. The lower-risk nonsplit 48-KiB K/V shared-memory alias was therefore
+executed first; its result is recorded below.
+
+Artifacts:
+
+- `profile/byte-v2-realtime-writer-b32-a40-20260721/control_r{1,2,3}.jsonl`
+- `profile/byte-v2-realtime-writer-b32-a40-20260721/candidate_r{1,2,3}.jsonl`
+- `profile/byte-v2-realtime-writer-b32-a40-20260721/prefill_profile_candidate.jsonl`
+- `profile/byte-v2-realtime-writer-b32-a40-20260721/prefill_slots1028_d1.jsonl`
+- `profile/byte-v2-realtime-writer-b32-a40-20260721/slots1028_d256_r1.jsonl`
+
+### Realtime Nonsplit FA2 K/V Alias
+
+The B17--32 Q1 attention cliff is now removed without replacing the FA2
+attention implementation. The ByteV2 external loader has a dedicated
+nonsplit capability. When enabled, `sK` and `sV` alias the same 32-KiB shared
+tile and use the already validated serialized schedule
+`K -> QK -> V -> PV -> next K`. Q, QK, masking, softmax, PV, output stores,
+split reduction, and the original combine kernel are unchanged. Raw FA2 is
+unchanged at the specialization, code-path, and launch-behavior level.
+
+`BYTE_V2_FA2_REUSE_KV_SMEM_NONSPLIT` accepts only `0` or `1`. It is read once
+per process before the first nonsplit launch, so CUDA Graph replay contains a
+fixed kernel. The validated realtime path is now the default when the variable
+is unset; `0` restores the prior 80-KiB nonsplit kernel in the same binary.
+Split-K always uses its established 48-KiB specialization and does not inspect
+the nonsplit selector.
+
+The shared-memory lifetime is safe for both output types. Nonsplit BF16 output
+uses the original 16-KiB Q region and cannot overwrite the aliased K/V region.
+Split-K FP32 output is larger and can overlap it, so the original split
+epilogue barrier remains intact. The launch and device-side reuse predicates
+are identical, preventing a 48/80-KiB layout mismatch.
+
+NCU on A40 at B17/C4096 confirms the intended resource transition:
+
+| Metric | Prior nonsplit | K/V alias |
+| --- | ---: | ---: |
+| Shared memory per CTA | 82.94 KiB | 50.18 KiB |
+| Shared-memory occupancy limit | 1 CTA/SM | 2 CTAs/SM |
+| Registers per thread | 243 | 241 |
+| Grid / waves per SM | 136 / 1.62 | 136 / 0.81 |
+| Instrumented kernel time | 703.97 us | 502.66 us |
+
+There is no local-memory allocation in either nonsplit specialization. The
+instrumented duration includes NCU overhead; the interleaved CUDA-event result
+below is the performance gate.
+
+The isolated Graph benchmark uses 100 warmups, 500 measured replays, three
+independent inputs, and interleaved hybrid/raw events. The key long-context
+medians are:
+
+| Context / batch | Prior ByteV2 | K/V alias | Change | Raw FA2 |
+| --- | ---: | ---: | ---: | ---: |
+| 4096 / 16 | 411.648 us | 411.648 us | 0.00% | 483.328 us |
+| 4096 / 17 | 594.944 us | 432.128 us | -27.37% | 492.544 us |
+| 4096 / 32 | 1168.384 us | 860.160 us | -26.38% | 1006.592 us |
+
+The B16-to-B17 ByteV2 jump falls from 44.53% to 4.98%. At context 1024, B16,
+B17, and B32 improve by 23.2--23.9%. A separate small-active-batch gate covers
+`B={1,2,4,8}` and contexts 128, 1024, and 4096. Eight of twelve candidate
+medians are identical to control; the other four differ by only
+0.512--1.024 us with no consistent regression. A host batch threshold is
+therefore not retained.
+
+Correctness covers one tile, multiple tiles, the masking-to-unmasked boundary,
+ragged lengths, permuted pages, shared prefixes, outliers, compact pages,
+authoritative raw-sidecar pages, explicit split 4, CUDA Graph replay, and both
+selector values. All direct output and LSE comparisons are bitwise exact.
+The candidate/control timing matrices add 78 exact output/LSE checks. Invalid
+selector values fail before launch. Compute Sanitizer reports zero memcheck
+errors, zero synccheck errors, and zero racecheck hazards.
+
+The fixed-20-GB B32/P4096/D256 realtime E2E gate uses the same model and flags
+as the cooperative-writer experiment. Runs are ordered ByteV2/raw,
+raw/ByteV2, and ByteV2/raw:
+
+| Round | ByteV2 seconds / tok/s | Raw FA2 seconds / tok/s |
+| ---: | ---: | ---: |
+| 1 | 36.842101 / 222.354 | 35.254802 / 232.366 |
+| 2 | 37.145369 / 220.539 | 35.301522 / 232.058 |
+| 3 | 37.157137 / 220.469 | 35.320769 / 231.932 |
+
+The medians are 37.145369 seconds and 220.539 tok/s for ByteV2, versus
+35.301522 seconds and 232.058 tok/s for raw. The remaining ByteV2 gap is
+5.2231% in wall time and 4.9639% in TPS. Relative to the preceding B32 writer
+checkpoint, the alias reduces ByteV2 wall time by 8.9959% and raises TPS by
+9.8852%. Relative to the original generic-writer checkpoint, the combined
+writer and alias changes remove 84.51% of the absolute wall gap to raw.
+This percentage uses the original 35.268312-second raw reference as a fixed
+denominator. If each checkpoint instead uses its contemporaneous raw median,
+the removed gap is 84.79%.
+
+All six E2E token arrays have the same SHA-256 digest and are elementwise
+identical. All runs generate exactly 8,192 output tokens with zero
+preemptions. Every ByteV2 run ends with `fatal=0`, no authoritative raw pages,
+and all 1,472 raw-sidecar slots free.
+
+Request-level medians show that the remaining realtime issue has moved out of
+steady decode. Each table entry is the median of the three per-run request
+medians, where each run contains 32 requests; the 96 requests are not pooled:
+
+| Metric | B32 writer | K/V alias | Raw FA2 |
+| --- | ---: | ---: | ---: |
+| Queue | 9.290619 s | 8.888568 s | 5.915375 s |
+| First-token latency | 16.142097 s | 15.403290 s | 11.889541 s |
+| Decode span | 24.473965 s | 21.540014 s | 23.254867 s |
+| Engine E2E | 40.615751 s | 36.943001 s | 35.151962 s |
+
+Dividing those median decode spans by the 255 post-first-token intervals gives
+a derived per-request mean ITL of 84.47 ms for ByteV2 versus 91.20 ms for raw.
+ByteV2 therefore has 7.37% lower median decode-span and derived-ITL latency in
+this saturated workload, equivalent to a 7.96% reciprocal speedup. Its 5.22%
+E2E deficit is before the first token, including queue time; queue and TTFT are
+not additive. These request metrics localize the gap to pre-first-token work,
+while the preceding D1 replay identifies initial and mixed prefill routing as
+the concrete source. The next realtime optimization should address that route
+while preserving the exact paged-FA2 reduction path, not another Q1 reduction
+kernel.
+
+Artifacts:
+
+- `profile/byte-v2-realtime-nonsplit-alias-a40-20260721/pair_r1.jsonl`
+- `profile/byte-v2-realtime-nonsplit-alias-a40-20260721/byte_r2.jsonl`
+- `profile/byte-v2-realtime-nonsplit-alias-a40-20260721/raw_r2.jsonl`
+- `profile/byte-v2-realtime-nonsplit-alias-a40-20260721/pair_r3.jsonl`
+- `profile/byte-v2-realtime-nonsplit-alias-a40-20260721/README.md`
+
+### Direct Raw-Paged Initial and Mixed Prefill
+
+The realtime pre-first-token gap is now reduced by preserving the original
+FA2 attention implementation while changing only where its K/V pages come
+from. For every scheduler step, the metadata builder recognizes only the
+strict request layout
+
+```text
+[cached context] * N + [initial context] * M
+```
+
+and constructs one plan shared by all 32 layers. The cached prefix continues
+to use the ByteV2 hybrid FA2 reader. The initial suffix views the current BF16
+K/V projections directly as 16-token raw pages and calls the original paged
+FA2 `varlen_fwd`. There is no K/V copy and no change to QK, masking, softmax,
+PV, split reduction, or the FA2 combine implementation.
+
+Initial requests are grouped so every internal request boundary is page
+aligned. A ragged group may round its final page up into rows belonging to the
+following group, but those borrowed rows are beyond that request's exact
+sequence length and are masked by FA2. All group shapes, devices, dtypes,
+strides, metadata extents, and rounded backing-storage bounds are checked
+before either the cached or direct side launches. An interleaved request
+layout, missing metadata, an unsupported projection layout, or insufficient
+padded storage returns to the existing whole-batch hybrid reader.
+
+The implementation preserves fused-QKV views rather than calling
+`contiguous()`. FA2 receives K/V page strides such as
+`(98,304, 6,144, 128, 1)` as well as dense
+`(16,384, 1,024, 128, 1)`. K and V are validated independently because the
+production projection can make K dense after rotary embedding while V keeps
+the fused 6,144-element row stride.
+
+Splitting a cached Q1 prefix out of a mixed batch would normally let FA2
+rewrite causal Q1 into its noncausal GQA-swapped decode dispatch. The cached
+sub-batch therefore passes `max_seqlen_q=2` as a legal dispatch upper bound
+while its real `cu_seqlens_q` still describes one query. This retains causal
+QK, Hq=32/Hkv=8, and `num_splits=0`, matching the original mixed-batch
+topology. The same sentinel is applied to a direct group whose actual maximum
+query length is one.
+
+`seq_lens_cpu_upper_bound` supplies the plan when the deprecated exact CPU
+copy is absent. It is exact for prefill rows; an optimistic async-spec decode
+row remains classified as cached and never becomes a direct initial row. The
+fast path is enabled by default only when hybrid raw fallback is enabled.
+`BYTE_V2_FA2_DIRECT_PREFILL=0` restores the whole-batch hybrid route.
+Explicitly setting it to `1` without hybrid fallback is an error.
+
+The checked-in CUDA oracle covers a cached Q1 request followed by ragged Q13
+and aligned Q16 initial requests, permuted compact pages, an authoritative raw
+sidecar page, forced outliers, different K/V row strides, and the ragged
+group borrowing three masked rows from the following request. Split output
+and LSE are bitwise identical to one whole-batch hybrid FA2 call. CPU tests
+cover the production `[Q1*4, 4092, 4096*3]` plan, pure initial batches,
+interleaved rejection, missing metadata, padded and unpadded final ragged
+groups, zero-copy pointers, dispatch sentinels, and the rollback selector.
+Compute Sanitizer memcheck on the ragged CUDA oracle reports zero errors.
+
+The fixed-budget E2E gate is unchanged: one A40, BF16
+Llama-3.1-8B-Instruct, batch 32, a 4,096-token synthetic prompt per request,
+compiled CUDA Graph execution, no speculation, no prefix caching,
+`max_model_len=max_num_batched_tokens=16,384`, and an exact
+20,000,000,000-byte KV budget. D1 and D8 are single paired structural gates;
+D256 uses three runs:
+
+| Decode | ByteV2 seconds / tok/s | Raw FA2 seconds / tok/s | Wall / TPS delta |
+| ---: | ---: | ---: | ---: |
+| 1 | 18.889139 / 1.694 | 18.728313 / 1.709 | +0.8587% / -0.8514% |
+| 8 | 19.954998 / 12.829 | 19.378501 / 13.211 | +2.9749% / -2.8890% |
+| 256, round 1 | 35.758325 / 229.094 | 35.471358 / 230.947 | +0.8090% / -0.8025% |
+| 256, round 2 | 35.969210 / 227.750 | 35.240496 / 232.460 | +2.0678% / -2.0259% |
+| 256, round 3 | 35.882546 / 228.300 | 35.200043 / 232.727 | +1.9389% / -1.9020% |
+
+Using the same independent per-backend three-run median convention as the
+preceding checkpoint, D256 is 35.882546 seconds and 228.300 tok/s for ByteV2,
+versus 35.240496 seconds and 232.460 tok/s for raw. The remaining gap is
+1.8219% in wall time and 1.7893% in TPS. Relative to the preceding ByteV2
+median, wall time improves by 3.3997% and TPS by 3.5193%; the wall gap to raw
+falls from 5.2231% to 1.8219%, removing 65.12% of that remaining gap. The
+contemporaneous raw median moves by only 0.17%.
+
+The instrumented replay is a separate run from the clean measurement and its
+scopes are nested, so its CUDA totals must not be summed as a wall-time
+breakdown. It nevertheless provides an unambiguous route witness:
+
+| Decode | Direct raw-paged calls | Cached hybrid calls |
+| ---: | ---: | ---: |
+| 1 | 256 | 0 |
+| 8 | 480 | 256 |
+| 256 | 480 | 256 |
+
+The D8/D256 counts match one pure-initial step, seven mixed steps with two
+direct groups and one cached group, one cached tail, and 32 layers. With the
+selector unset, D8 independently reproduces 480/256 calls and the raw token
+hash, proving that the validated route is the default rather than an
+explicit-selector-only result.
+
+All paired D1, D8, and D256 token lists are elementwise equal to raw. The
+compact JSON SHA-256 values are respectively
+`d41b66ef7a1b5f0a92306a18b9589adf90082343bcb3cc1ab3dc5eecef467caa`,
+`17fa1308b01be4604311dc0093e6cfdcd77897edb91ec82502588056d6622dcb`,
+and `e37702d6c177d8be3406057a2aec2a06bcbd88a66a332134faee92ffada126f5`.
+Every ByteV2 run has zero preemptions, `fatal=0`, 32 initialized layers, no
+remaining authoritative raw pages, and all 1,472 sidecar slots returned.
+
+D256 request metrics are the median of the three per-run request medians:
+
+| Metric | ByteV2 | Raw FA2 | Difference |
+| --- | ---: | ---: | ---: |
+| Queue | 8.362678 s | 5.901312 s | +2.461367 s |
+| First-token latency | 14.496855 s | 11.864798 s | +2.632056 s |
+| Decode span | 21.183672 s | 23.227210 s | -2.043538 s |
+| Engine E2E | 35.680226 s | 35.091697 s | +0.588528 s |
+
+The realtime decode span is 8.80% lower than raw, while queue and TTFT remain
+higher. In the profiled prefill replay, ByteV2 direct plus cached attention is
+about 145 ms above the corresponding raw attention scopes, and the ByteV2
+multi-token writer is about 445 ms above raw reshape/cache. These totals are
+not additive due to nesting, but their scale agrees with the remaining
+approximately 0.59-second request-E2E difference. The next realtime target is
+therefore the prefill writer and per-layer Python/metadata launch overhead,
+not the steady Q1 attention kernel.
+
+The memory result is unchanged. Under the same 20-GB budget, ByteV2 exposes
+190,928 tokens versus 152,576 for raw, a 25.1363% capacity increase and a
+20.0825% reduction in complete bytes per capacity token, including sidecar
+and staging workspace. The current checkpoint therefore supports the narrow
+claim of approximately 20% complete KV-memory reduction with less than a 2%
+median TPS loss on this one realtime workload; broader models, prompt mixes,
+sampling modes, and task-accuracy evaluation remain required for a paper
+claim.
+
+Artifacts:
+
+- `profile/byte-v2-realtime-direct-prefill-a40-20260721/README.md`
+- `profile/byte-v2-realtime-direct-prefill-a40-20260721/profile_d1_v2.jsonl`
+- `profile/byte-v2-realtime-direct-prefill-a40-20260721/profile_d8_v1.jsonl`
+- `profile/byte-v2-realtime-direct-prefill-a40-20260721/profile_d256_v1.jsonl`
+- `profile/byte-v2-realtime-direct-prefill-a40-20260721/e2e_d256_r{2,3}.jsonl`
+- `profile/byte-v2-realtime-direct-prefill-a40-20260721/default_unset_d8.jsonl`
+
+The final ByteV2 layout suite reports 331 passed and one skipped test. The
+profile-script suite reports 21 passed; Ruff and Mypy 3.12 pass on the changed
+Python sources.
+
+### Current-Stage Attribution, Host Sync, Writer Waves, and Page Reset
+
+The 2026-07-22 B32/P4096/D8 attribution run uses the same one-A40, compiled,
+no-speculation, no-prefix-cache, fixed-20-GB configuration. Its clean baseline
+is 20.076101 seconds and 12.751 tok/s for ByteV2 versus 19.759393 seconds and
+12.956 tok/s for raw, a +1.6028% latency / -1.5775% TPS gap with exact tokens.
+The trace separates the ByteV2-specific work as follows:
+
+| Category | ByteV2 | Raw | Active-time delta |
+| --- | ---: | ---: | ---: |
+| Attention main | 2508.352 ms | 2363.151 ms | +145.201 ms |
+| KV writer | 500.114 ms | 71.154 ms | +428.960 ms |
+| Whole compact-page zero | 162.023 ms | 0 | +162.023 ms |
+| Raw-sidecar reset | 1.045 ms | 0 | +1.045 ms |
+| Scheduler metadata | 0.281 ms | 0.267 ms | +0.013 ms |
+| FA2 combine | 0.889 ms | 0.921 ms | -0.032 ms |
+
+The host trace also contains 576 pageable device-to-host copies of sequence
+lengths, 44,032 bytes total, and 591 stream synchronizations. Their correlated
+host API duration is approximately 18.93 seconds because each small copy
+drains queued GPU work. This time is a wait-attribution signal, not additive
+work.
+
+The first optimization keeps `seq_lens_cpu_upper_bound` distinct from exact
+`seq_lens_cpu`, uses it only for fail-closed prefill routing, and derives group
+query offsets from the existing GPU `query_start_loc`. Pageable sequence-length
+D2H falls from 576 calls to zero, explicit stream synchronization from 591 to
+zero, and pageable H2D from 47 to 32 calls, removing the 15 direct-plan copies.
+The nine direct-plan builds fall from 84.812 to 4.121 ms, while 576 cached-route
+checks fall from 19,011.896 to 9.113 ms. A six-run same-binary comparison gives
+20.360816 seconds for the emulated legacy path and 20.305072 seconds for the
+new path at the median. The approximately 0.27% difference is within adjacent
+pair noise, so the conclusion is mechanism cleanup and enqueue-ahead behavior,
+not a material E2E speedup.
+
+The second optimization targets actual writer work. A request segment formerly
+assumed an unknown first row and could use only `16 * 128 - 15 = 2033` tokens
+per staging wave. For exact sequence length `S`, CPU upper bound `U`, and query
+length `q`, the metadata contract gives `U >= S >= q`; therefore `U == q`
+strictly proves zero context even in async speculative mode. Such a request is
+page aligned and Q4096 can use `2048 + 2048` rather than
+`2033 + 2033 + 30`. Cached and untrusted rows keep the conservative formula.
+Writer launches fall from 11,456 to 7,872 and writer active time from 498.024
+to 463.264 ms. The 864 traced three-page prepare/hydrate/commit/persist tail
+chains disappear, removing 3,584 launches and 34.760 ms of measured GPU work.
+The isolated clean pair remains noisy at a +2.737% ByteV2/raw gap, so only the
+kernel-work reduction, not a separately resolved E2E improvement, is claimed.
+
+The third optimization fixes the page-lifecycle zeroing scope. Scheduler block
+reporting and raw-sidecar reset remain unchanged, but a reclaimed ByteV2 compact
+page now clears only its aligned 896-byte metadata prefix rather than all
+52,096 bytes. The Triton kernel carries separate logical-page stride and reset
+length constants; this distinction is required so block `N` remains addressed
+at `N * 52,096` while only 896 bytes are written. Ordinary FullAttention pages
+still receive a full reset. A poison-page CUDA test verifies zero metadata,
+bitwise-preserved compact payload, untouched neighboring pages, and unchanged
+ordinary FullAttention behavior.
+
+Nsight Systems reports 17 page-reset launches in both modes. Their active time
+falls from 161.538 to 2.910 ms, a 158.629-ms or 98.20% reduction. Raw-sidecar
+reset remains 544 launches / 1.044 ms, and the aligned writer remains 7,872
+launches / 462.355 ms. A same-binary ABBA clean comparison gives:
+
+| Reset mode | Runs | Median |
+| --- | --- | ---: |
+| Full 52,096-byte page | 20.288808 s, 20.305449 s | 20.297128 s |
+| 896-byte metadata prefix | 20.169632 s, 20.203821 s | 20.186727 s |
+
+Metadata-only reset therefore saves 110.402 ms E2E, reducing latency by
+0.5439% and increasing TPS by 0.5469%. All A/B, clean paired, and Nsys replay
+tokens are elementwise equal to raw. The clean paired structural gate is
+19.944278 seconds for ByteV2 versus 19.717589 seconds for raw, a +1.1497%
+latency gap; two additional ByteV2 runs are 20.165657 and 20.163319 seconds,
+so a new multi-run ByteV2/raw headline is intentionally not inferred from one
+raw sample.
+
+The complete ByteV2 layout suite now reports 334 passed and one skipped test.
+Focused staging, page-reset, profile-script, runner-reset, and cache-config
+tests report 71 passed; worker utility tests report three passed. Ruff,
+Mypy 3.12, and `git diff --check` pass. The remaining trace-visible targets
+are the approximately +391-ms writer and +137-ms attention-main active-time
+deltas; the FA2 combine path remains unchanged.
+
+Artifacts:
+
+- `profile/byte-v2-current-stage-attribution-a40-20260722/REPORT.md`
+- `profile/byte-v2-host-sync-elision-a40-20260722/REPORT.md`
+- `profile/byte-v2-initial-prefill-aligned-waves-v2-a40-20260722/REPORT.md`
+- `profile/byte-v2-metadata-only-page-reset-a40-20260722/REPORT.md`
+
+### Full-Wave Hybrid Writer Vectorization and Parallel Outlier Commit
+
+The next 2026-07-22 iteration targets the largest remaining stage-attribution
+delta: the ByteV2 writer. In the metadata-only-reset trace it accounts for
+7,872 launches and 462.355 ms, versus 512 launches and 71.154 ms for raw FA2.
+Hydrate plus commit contributes 444.721 ms, or 96.19% of the ByteV2 total.
+
+For a strictly verified, aligned 16-row page with unit K/V inner stride and
+16-byte-compatible token/head strides, the multi-token hydrate kernel now
+copies token-major K/V into the existing raw-staging layout with aligned
+16-byte operations. It retains the complete global slot scan,
+duplicate detection, allocator claims, metadata clear, persist, release, and
+fallback lifecycle. Partial or cached-page hydration keeps the existing
+element-wise source selection and decode, and Q<=32 keeps its small hydrate
+kernel. Aligned staging and commit may still use 16-bit accesses on those
+paths; non-unit-inner-stride or unaligned K/V selects the complete control
+specialization. The commit specialization emits outlier entries
+cooperatively with a deterministic CTA prefix rank, preserving the existing
+row-major payload.
+
+The isolated 2,048-token/128-page writer median falls from 161.165 to
+97.043 us, a 39.79% reduction. Nsight Compute attributes this to:
+
+| Kernel | Control | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Hydrate | 112.608 us | 44.000 us | -60.93% |
+| Hydrate global-load instructions | 141,440 | 26,752 | -81.09% |
+| Hydrate global-store instructions | 266,112 | 20,352 | -92.35% |
+| Commit | 84.672 us | 63.264 us | -25.28% |
+| Commit global-load instructions | 627,242 | 397,218 | -36.67% |
+| Commit barrier-stall samples | 1,656 | 949 | -42.69% |
+
+In the production B32/P4096/D8 profile window, multi-token hydrate falls from
+275.831 to 155.589 ms and commit from 168.890 to 128.626 ms. Total writer
+active time is 301.924 ms, down 160.431 ms or 34.70%, with the same 7,872
+launches. This removes 41.01% of the historical ByteV2-versus-raw writer gap.
+
+The same-binary GPU 0 ABBA E2E medians improve from 20.183409 to 20.138438
+seconds (-0.223%), below the 0.5% noise gate. Three clean repetitions on GPU 3
+give 20.071428 seconds / 12.754 tok/s for control and 19.863649 seconds /
+12.888 tok/s for the candidate, a -1.035% latency / +1.046% TPS change. A
+candidate/raw pair is 19.594585 versus 19.684155 seconds, but separate raw
+samples drift by 67.089 ms; this is therefore an observed positive ByteV2
+direction, not a general claim that ByteV2 is faster than raw.
+
+All six GPU 3 ByteV2 outputs share the same 32-by-8 token array, and both raw
+pairs are elementwise exact. The complete layout suite reports 334 passed and
+one skipped test. Compute Sanitizer reports zero memcheck errors, synccheck
+errors, and racecheck hazards. The validated specialization is default-on;
+`BYTE_V2_HYBRID_FULL_WAVE_WRITER_CANDIDATE=0` is the rollback and same-binary
+control switch, while invalid values fail closed.
+
+The writer remains 301.924 ms versus 71.154 ms for raw. The next profile-led
+target is the cached-tail generic hydrate: `grid.x=3,4,5,7,9` consumes
+61.592 ms in 160 launches because it must reconstruct pre-existing compact
+rows. A cooperative page decode followed by appended-row overlay is the next
+candidate; commit histogram/global-load latency follows after that.
+
+Artifacts:
+
+- `profile/byte-v2-prefill-writer-full-wave-a40-20260722/REPORT.md`
+- `profile/byte-v2-prefill-writer-full-wave-a40-20260722/analysis/summary.json`
+- `profile/byte-v2-prefill-writer-full-wave-a40-20260722/reports/`
+
+### Cached-Tail Cooperative Hydrate
+
+The next 2026-07-22 iteration expands the existing cooperative small-writer
+route to the residual production cached-tail waves. The preceding generic
+hydrate assigns one CTA to each 16-token input chunk. A wave can contain many
+different partially populated pages, so its few CTAs process pages serially
+even though the page reconstructions are independent.
+
+The cooperative route first runs a fail-closed prepare kernel. It validates
+every
+slot, duplicate row, page index, staging capacity, and persistent-raw mapping
+before changing allocator state, then builds a deterministic unique-page list
+and row mask. Hydration launches eight 256-thread CTA shards for every active
+staging slot. The shards reconstruct disjoint portions of one compact or
+authoritative-raw page and overlay the new BF16 rows. A per-slot completion
+count lets only the final shard clear compact metadata and publish the staging
+mapping. Commit, persistent-raw fallback, release, the full-wave writer, and
+all attention kernels are unchanged.
+
+The specialization remains bounded. Both the input-token count and active
+staging capacity must be at most 144. Retained transient staging above the
+previous 32-token boundary continues through the generic route. For ordinary
+persist-and-release writer calls, `BYTE_V2_HYBRID_COOPERATIVE_WRITER_LIMIT`
+selects the process-wide boundary:
+
+- unset or `144`: validated candidate and new default;
+- `32`: same-binary rollback to the preceding dispatch;
+- `16`: legacy boundary experiment.
+
+Any other value fails before launch. Both timing arms keep
+`BYTE_V2_HYBRID_FULL_WAVE_WRITER_CANDIDATE=1`, so this A/B changes only the
+cached-tail dispatch.
+
+The final default-on extension installed for the closing smoke test has
+SHA-256
+`7d98f48b6074c38e4188241b160592d4524094f290331d9e689851377c3f3a91`.
+Recording the binary digest prevents the final selector result from being
+confused with an earlier in-place build.
+
+The formal micro, NCU, Nsys, and E2E artifacts predate this final default-only
+rebuild, and their collection-binary hash was not archived. Those A/B runs set
+the selector explicitly to `32` or `144`; the rebuild changed only the unset
+host default, not either selected route or its device kernel. Accordingly, the
+final hash identifies the closing smoke, focused tests, and sanitizer runs,
+while source equivalence links those checks to the earlier formal performance
+evidence.
+
+#### Production Shapes
+
+A diagnostic-only shape probe recorded the real B32/P4096/D8 writer inputs.
+It copied slot mappings to the CPU only in the separate replay and was not
+used for E2E timing. The five residual waves occur once per layer, or 32 times
+each in the profile window:
+
+| Shape | Unique pages / capacity | Rows contributed per page | Control hydrate grid | Candidate hydrate grid |
+| --- | ---: | --- | ---: | ---: |
+| `n37.capacity18` | 17 / 18 | 15x1, 1x6, 1x16 | 3 | `(8,18,1)` = 144 CTAs |
+| `n56.capacity23` | 22 / 23 | 19x1, 1x5, 2x16 | 4 | `(8,23,1)` = 184 CTAs |
+| `n79.capacity28` | 27 / 28 | 23x1, 1x8, 3x16 | 5 | `(8,28,1)` = 224 CTAs |
+| `n106.capacity33` | 32 / 33 | 27x1, 1x15, 4x16 | 7 | `(8,33,1)` = 264 CTAs |
+| `n133.capacity35` | 34 / 35 | 27x1, 1x10, 6x16 | 9 | `(8,35,1)` = 280 CTAs |
+
+The shapes are not synthetic one-token-per-page cases. Each combines many
+cached one-row request tails with a partial prompt page and zero or more full
+pages. The spare staging slot is intentionally harmless: its CTA shards see
+no prepared physical page and return.
+
+#### Isolated Writer Results
+
+The shape probe preserves aggregate row/page histograms rather than the full
+slot array. The harness therefore rebuilds mappings consistent with those
+histograms in production dispatch order, seeds the existing compact prefix,
+and times the complete fused operation, including prepare/hydrate, commit,
+persist, and release. Each number below is the mean of two independent
+21-trial medians; each trial contains 500 CUDA-event iterations after 20
+warmups.
+
+| Shape | 32-token control | 144-token candidate | Change | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `n37.capacity18` | 156.808 us | 55.432 us | -64.65% | 2.83x |
+| `n56.capacity23` | 209.867 us | 80.935 us | -61.44% | 2.59x |
+| `n79.capacity28` | 266.398 us | 117.538 us | -55.88% | 2.27x |
+| `n106.capacity33` | 319.762 us | 164.097 us | -48.68% | 1.95x |
+| `n133.capacity35` | 317.756 us | 206.602 us | -34.98% | 1.54x |
+
+Every run is canonically BF16-identical to the independent generic
+prepare/hydrate/append/commit reference. The observed production shapes use
+compact source pages and allocate no authoritative raw-sidecar page.
+
+After the final rebuild, an additional `n106.capacity33` smoke test left the
+selector unset and measured 164.710407 us, versus 320.624657 us with the
+explicit `32` rollback, a 48.628% reduction. Both arms produced the same
+canonical BF16 SHA-256,
+`6f0052ec5665aa46499cb086b718b4bca286c100f6810f48984f0473bb4bf4f5`.
+This five-trial, 100-iteration smoke is not substituted for the full micro
+table; it verifies that the final binary really resolves unset to the expanded
+144-token non-retained path.
+
+#### Nsight Compute Attribution
+
+On the representative `n106.capacity33` shape, the full NCU replay changes
+the generic seven-CTA hydrate into one serialized prepare plus a 264-CTA
+hydrate:
+
+| Kernel | Grid / block | Waves per SM | Duration | Elapsed SM throughput |
+| --- | --- | ---: | ---: | ---: |
+| Generic hydrate | `7x1x1 / 256` | 0.0139 | 535.168 us | 0.589% |
+| Candidate prepare | `1x1x1 / 1` | 0.0007 | 191.040 us | 0.035% |
+| Candidate hydrate | `8x33x1 / 256` | 0.5238 | 21.888 us | 15.406% |
+
+Prepare plus hydrate is 212.928 us, 60.21% below the replayed control. The
+hydrate body alone is 95.91% lower. This is a parallelism result rather than a
+memory-work elimination result: control DRAM reads/writes are 1.234/0.482 MB,
+while candidate prepare plus hydrate reads/writes 1.150/0.476 MB. The candidate
+hydrate also has higher active long-scoreboard and barrier exposure, but
+spreading independent page work across the A40 converts that exposure into a
+much shorter elapsed kernel.
+
+#### Production Nsight Systems Attribution
+
+The production comparison reconstructs the profile window by reverse-pairing
+the last 2,304 persist launches, excluding warmup ambiguity. Across the five
+target shapes, the control generic hydrate consumes 60.201464 ms. The
+candidate hydrate consumes 2.819711 ms, but that number is not the complete
+replacement: routing these shapes also adds 20.184436 ms of serialized
+prepare. The valid comparison is therefore 60.201464 versus 23.004147 ms, a
+37.197317-ms or 61.79% reduction. Prepare is already 87.74% of the candidate
+target path.
+
+| Production writer component | Control | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Five cached-tail hydrate paths, including incremental prepare | 60.201464 ms | 23.004147 ms | -61.79% |
+| Commit | 122.887201 ms | 122.611493 ms | -0.22% |
+| Persist/release | 7.895231 ms | 7.893451 ms | unchanged |
+| Complete writer | 277.973809 ms | 241.675473 ms | -36.298336 ms / -13.06% |
+
+An independent CUDA-event profile of all 2,304 multi-token writer operations
+measures 290.263200 versus 254.075904 ms, a 36.187296-ms or 12.47% reduction.
+The agreement in absolute saving confirms that the Nsys window reconstruction
+captures the production effect. Commit and persist do not materially move;
+the reduction comes from the intended cached-tail route.
+
+#### E2E, Raw FA2, and Tokens
+
+The clean gate keeps the same one-A40, compiled B32/P4096/D8 workload, exact
+20,000,000,000-byte KV budget, and 256 total output tokens. Two ByteV2 arms
+and the paired raw references measure:
+
+| Run | 32-token control | 144-token candidate | Candidate minus control |
+| ---: | ---: | ---: | ---: |
+| 1 | 19.540829 s / 13.100775 tok/s | 19.285086 s / 13.274507 tok/s | -255.743 ms |
+| 2 | 19.418547 s / 13.183272 tok/s | 19.438668 s / 13.169627 tok/s | +20.121 ms |
+
+The two-run means are 19.479688 seconds for control and 19.361877 seconds for
+the candidate, nominally -0.605% latency and +0.608% TPS. The second comparison
+reverses direction, and the within-arm spans are 122.3 and 153.6 ms. This is
+therefore not a resolved E2E speedup claim; the production kernel reduction is
+the retained evidence.
+
+The candidate's paired raw reference is 19.199749 seconds / 13.333508 tok/s,
+leaving only +0.444% wall time / -0.443% TPS in that sample. The other raw
+reference is 19.187286 seconds / 13.342168 tok/s. All six output arrays are
+elementwise identical, all runs emit 256 tokens, and every run has zero
+preemptions. The optimization changes writer scheduling, not model numerics.
+
+#### Validation and Next Step
+
+The complete ByteV2 layout suite reports 337 passed and one skipped test. New
+coverage checks unset/16/32/144 selector behavior, invalid-value failure,
+canonical production `n106.capacity33` output, the retained-staging boundary,
+CUDA Graph workspace reuse, cross-boundary duplicate rows, and staging-capacity
+overflow. Compute Sanitizer reports zero memcheck errors, zero synccheck
+errors, and zero racecheck hazards, errors, or warnings.
+
+The final focused selector, production-n106, retained-staging, and maximum
+boundary run reports eight passed tests. Its explicit edge cases include
+retained-transient N32/N33 and persist-and-release token/capacity pairs
+`144/144`, `144/145`, and `145/145`. The complete-suite result remains the
+337-passed, one-skipped result above.
+
+The cooperative hydrate is adopted and default-on because it removes 61.79%
+of the measured target path with exact output and a strict rollback. Its new
+bottleneck is explicit: the one-thread prepare consumes 20.184436 of the
+candidate path's 23.004147 ms. The next experiment should parallelize or
+hierarchically compact the bounded 144-token page/row descriptors while
+preserving deterministic staging-slot order and the current validate-before-
+mutation contract. Only after prepare falls should the broader writer return
+to commit histogram and global-load latency, which now dominate total writer
+time.
+
+Artifacts:
+
+- `profile/byte-v2-cached-tail-cooperative-hydrate-a40-20260722/harness/`
+- `profile/byte-v2-cached-tail-cooperative-hydrate-a40-20260722/reports/`
+- `profile/byte-v2-cached-tail-cooperative-hydrate-a40-20260722/analysis/`
+
+### B1 Cached-Prefill Full-Prefix Hydrate-to-Raw FA2 (2026-07-24)
+
+#### Motivation and Result
+
+The direct raw-paged initial-prefill route above already preserves the
+original FA2 path for the first scheduler chunk. The remaining long-prefill
+regression came from later cached chunks: the hybrid reader reconstructed the
+same compressed KV tiles inside many Q-tile consumers. At Q16K/S32K, the
+balanced hybrid shape measured 115.083 ms versus 73.558 ms for raw, a 56.45%
+regression despite reading 48.19% fewer DRAM bytes. In the corresponding
+production sweep, the accumulated TTFT gap reached 19.90% at 32K and 33.36%
+at 65K.
+
+The new default-off experiment moves reconstruction out of the attention
+reader. For each layer and cached-prefill chunk, it materializes the complete
+KV prefix once into the existing BF16 raw-staging workspace, constructs a
+dense local page table, and invokes the original raw FA2 `varlen_fwd`.
+QK, causal masking, softmax, PV, split selection, and combine remain
+unchanged. The operation count therefore changes from repeated decode work
+near O(QK) to one O(K) hydrate before the unchanged O(QK) attention.
+
+On A40, 200 balanced iterations at Q16K/S32K measured:
+
+| Distribution | Raw FA2 | Hydrate + raw FA2 | Production mirror |
+| --- | ---: | ---: | ---: |
+| Compact-safe | 78.6212 ms | 79.0738 ms (+0.576%) | 79.0170 ms (+0.503%) |
+| Forced in-page outlier | 78.6017 ms | 79.0047 ms (+0.513%) | 79.0738 ms (+0.601%) |
+
+The production mirror includes descriptor initialization and release. Both
+candidate outputs and FP32 LSE tensors are bitwise identical to raw FA2 in
+both distributions. The sub-0.1% inversion between the safe core and mirror
+medians is timing noise, not negative bookkeeping cost.
+
+Five clean, alternating-order E2E pairs give:
+
+| Context | Median paired TTFT gap | MAD | Range | Candidate wins |
+| ---: | ---: | ---: | ---: | ---: |
+| 32,768 | +0.057% | 1.070% | -1.624% to +2.085% | 2/5 |
+| 65,536 | -0.226% | 0.140% | -0.365% to +0.374% | 3/5 |
+
+Within this measured A40/B1/16K-chunk/32K--65K boundary, the correct
+interpretation is raw-equivalent performance within observed run-to-run
+variability and removal of the old structural regression, not a stable
+ByteV2 speedup. No predefined statistical equivalence margin/test was run.
+At 32K, the candidate-first subgroup median is -0.111% while the raw-first
+subgroup is +1.606%, directly exposing inter-process/order drift. The 65K
+range also crosses zero.
+
+#### Code Route and Lifecycle
+
+`BYTE_V2_FA2_CACHED_PREFILL_HYDRATE_TO_RAW` controls the route. It accepts
+only unset, `0`, or `1` and defaults to off. Explicit enablement requires
+`BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1`; a contradictory configuration fails at
+initialization.
+
+`ByteV2RawStagingManager.stage_cached_prefill()` accepts the effective-B1
+scheduler block-table row and target sequence length. For
+`P = ceil(seq_len / 16)`, it:
+
+1. validates that all P physical pages fit the block table, raw workspace,
+   and descriptors;
+2. sets exact valid rows, including a partial final page;
+3. calls the existing hybrid hydrate op, which selects compact reconstruction
+   or the authoritative raw-sidecar copy per physical page;
+4. reuses the fixed `staging_to_physical_block[:P]` descriptor as local page
+   IDs `[0, ..., P - 1]`.
+
+`byte_v2_fa2_raw_staging_prefill_attention()` now accepts
+`block_tables_are_staging_slots=True`. In this mode, it passes those local
+page IDs directly to the original raw FA2 and avoids the advanced-index
+temporary `block_to_staging_slot[block_tables]`.
+
+The forward route wraps FA2 in `try/finally` and always calls
+`release_cached_prefill()`. Hydrate failures also trigger release. Descriptor
+initialization, hydrate, raw FA2, and release all use the current CUDA stream.
+Safety depends on the existing single-lane shared-workspace invariant:
+`block_to_staging_slot` stays quiescent throughout this full-prefix route.
+The route must not be generalized to concurrent u-batching or another stream
+without replacing that lifecycle.
+
+No new attention CUDA kernel was added for this experiment. It reuses
+`byte_v2_hydrate_raw_staging_from_hybrid_cache()` and the installed original
+FA2 binary.
+
+#### Selector and Fallback
+
+The route requires:
+
+- the feature selector and hybrid raw-fallback store;
+- causal attention and `max_query_len > 1`;
+- `max_query_len == num_actual_tokens`;
+- CPU query starts of `[0, Q, Q, ...]`, so only the first effective row is
+  nonempty while trailing padded zero-length rows remain legal;
+- `seq_len == max_seq_len > Q`, proving a cached prefix is present;
+- a CPU sequence upper bound equal to `max_seq_len`; it is exact for the
+  supported prefill case, but the selector does not independently prove
+  exactness in asynchronous speculative decode;
+- valid CUDA int32 device sequence lengths and block table; a production
+  padded table is supported as long as its last-dimension stride is one;
+- enough block-table columns and staging slots for the complete prefix.
+
+An ordinary shape, layout, or capacity miss has no side effects and returns to
+the generic hybrid reader. In this experiment, with direct prefill enabled,
+the first no-cache scheduler chunk continues to use the existing direct
+raw-paged initial-prefill route. An active initial-prefill staging lease is an
+invariant violation and fails closed rather than taking the ordinary fallback.
+
+The selector currently infers prefill from shape rather than consuming an
+explicit `is_prefilling` flag. An effective-B1 Q>1 asynchronous speculative
+decode could therefore enter this route. Exact device sequence lengths still
+make the raw FA2 mask numerically safe, but the hydrate may be unnecessary.
+Token padding can conversely cause a conservative fallback. A production
+extension should add explicit semantics and route counters.
+
+Physical page IDs retain the existing scheduler block-table trusted-input
+boundary. The hydrate kernel rejects negative IDs but does not independently
+check an ID against `kv_cache.shape[0]`.
+
+#### Production Evidence and Attribution
+
+The formal workload uses one A40, Llama-3.1-8B-Instruct BF16, B1, a 16,384
+scheduler chunk, a 131,072 model limit, 16 output tokens, compiled/CUDA-Graph
+Q1 decode, no prefix caching, and an exact 20,000,000,000-byte KV budget.
+Candidate runs use 4,096 staging slots.
+
+Only uniform Q1 decode is graph-captured. The Q>1 cached-prefill route in this
+experiment executes eagerly even though the full E2E run is compiled.
+
+All 20 clean JSON records pass the protocol gates:
+
+- candidate/raw prompt SHA and all 16 token IDs match at each context;
+- instrumented replay tokens match their clean request;
+- `performance_valid_for_tps=true`;
+- clean and replay preemptions are zero;
+- candidate `fatal=0`, `raw_page_count=0`, and
+  `free_count=slot_count=1472`.
+
+Route counts prove that the experiment did not silently retain the hybrid
+reader. At 32K, 32 hydrate calls cover one cached chunk across 32 layers. At
+65K, 96 calls cover three cached chunks. The raw-staging FA2 counts are 64 and
+128 because they include the initial chunk as well. The existing profile name
+`initial_raw` also labels the new cached calls; the analysis identifies them
+by scheduler step and Q/S shape rather than that stale label.
+
+The first instrumented pair illustrates the new residual:
+
+| Context | Hydrate + raw-FA2 attention vs raw | Writer delta | Net of these leaves |
+| ---: | ---: | ---: | ---: |
+| 32K | -52.344 ms | +33.656 ms | -18.688 ms |
+| 65K | -76.025 ms | +67.895 ms | -8.130 ms |
+
+Only non-overlapping attention and writer leaves are combined; parent
+`forward`, `prefill_from_cache`, shape, and op scopes are nested and must not
+be summed. This one replay is mechanism evidence, not a clean speedup claim.
+It shows that the attention regression is gone and the multi-token writer now
+consumes most of the remaining margin.
+
+#### Memory Tradeoff
+
+The 4,096-slot workspace covers 65,536 tokens and occupies 268,515,340 bytes
+(256.076 MiB). It is shared serially across all 32 layers, not allocated per
+layer. The same plan also contains a 97,982,592-byte (93.443-MiB) hybrid raw
+sidecar.
+
+Under the fixed 20-GB budget:
+
+| Plan | Blocks | Token capacity | Total planned bytes |
+| --- | ---: | ---: | ---: |
+| ByteV2 candidate | 11,777 | 188,432 | 19,999,604,876 |
+| Raw FA2 | 9,536 | 152,576 | 19,998,441,472 |
+
+The candidate provides 35,856 more theoretical allocator token slots, or
+23.500% higher capacity. At the same 188,432-token capacity, raw requires
+24,698,159,104 bytes, so the complete candidate KV plan reservation is
+4,698,554,228 bytes, or 19.024%, lower. The ByteV2 compact KV page/tensor
+footprint, including metadata and outlier storage, is 20.508% lower per block.
+These are KV-planner figures, not total GPU memory or a measured allocator
+peak.
+
+A 65,536-token occupied-block working-set model needs its own denominator.
+For 4,096 logical prompt blocks, compact KV plus the 256.076-MiB scratch is
+17.382% lower than raw occupied blocks; charging the full 93.443-MiB sidecar
+pool as well gives 16.241%. Using the observed 4,097 peak-resident blocks
+changes them only to approximately 17.383% and 16.242%. These are attribution
+estimates, not measured active-peak savings: vLLM has already reserved the
+complete KV plan and does not release it with a smaller request working set.
+
+The workspace is runner-owned, preallocated, and resident for the process
+lifetime; only its request contents are temporary. Its capacity grows
+linearly with the configured slot ceiling, making this a deliberate prefill
+latency/capacity tradeoff rather than a zero-copy design. The default 128
+slots cover only 2,048 tokens. The 4,096-slot experiment covers 65K; 131K
+would require approximately 8,192 slots, or 512 MiB. A longer sequence
+currently falls back safely to hybrid and can recover the old regression.
+
+At 65K, observed peak KV pressure is only 34.79% for the candidate and 42.96%
+for raw. Both allocator capacities exceed the 131,072 engine model limit, so
+the 23.5% slot increase does not raise this experiment's single-request
+maximum context. It is a concurrency-capacity proposition, while this fast
+path is currently validated only at B1; memory-saturated multi-request TPS
+has not been demonstrated.
+
+#### Validation, Scope, and Next Step
+
+Focused CPU/static tests report 24 passed. CUDA bitwise source/path tests
+report three passed and cover compact-safe, compact-outlier, authoritative
+raw-sidecar pages, page permutation, and a partial final page. The latter
+three boundaries have correctness coverage but not isolated/E2E performance
+coverage. The complete attention-layout plus staging-workspace suite reports
+370 passed and one skipped test. Related Python files also pass `py_compile`,
+Ruff, and `git diff --check`.
+
+The validated production-performance boundary is one A40, TP1/PP1,
+Llama-3.1-8B, BF16, 32 Q heads, 8 KV heads, head size 128, causal B1,
+speculation disabled, temperature zero, synthetic-repeat prompts, prefix
+caching disabled, 16K chunked cached-prefill, and 16 generated tokens. It
+does not yet cover ragged B>1, dynamic batching, DBO/u-batching, multi-stream
+workspace users, KV connectors/offload, DCP, another GPU, or another head
+shape. It inherits the complete Current Support Boundary above, including its
+ALiBi, sliding/local attention, softcap, non-decoder, cache-sharing, sleep, and
+parallel-context exclusions. Q1 decode intentionally continues through the
+existing ByteV2 decode route and must not perform full-prefix hydrate per
+token.
+
+The next prefill optimization should target the multi-token writer, which now
+dominates the controllable residual. After that, the route needs adaptive
+workspace planning, explicit prefill/route counters, and a batched local-page
+namespace with a concurrency-safe lifecycle before B>1 testing.
+
+Artifacts:
+
+- `profile/byte-v2-cached-prefill-hydrate-to-raw-a40-20260724/REPORT.md`
+- `profile/byte-v2-cached-prefill-hydrate-to-raw-a40-20260724/harness/`
+- `profile/byte-v2-cached-prefill-hydrate-to-raw-a40-20260724/reports/`
+
+### A40 Long-Q1 Shared Split-20 Selector (2026-07-25)
+
+#### Motivation and Isolated Evidence
+
+The final long-decode study used one request, a 65,536-token context, BF16
+Llama-3.1-8B, 32 query heads, eight KV heads, head size 128, 16-token pages,
+compiled Q1 decode, no speculation or prefix caching, and an exact
+20,000,000,000-byte KV budget. Before changing split selection, clean ABBA
+runs on three physical A40s showed ByteV2 TPOT 1.57% to 3.74% below raw for
+both 256- and 512-token generations.
+
+An Nsight Systems replay over 255 decode steps attributed the per-token
+difference as follows:
+
+| Leaf/category | Raw | ByteV2 | ByteV2 minus raw |
+| --- | ---: | ---: | ---: |
+| Main attention | 13.0717 ms | 11.9993 ms | -1.0723 ms |
+| Original FA2 combine | 0.3453 ms | 0.3167 ms | -0.0286 ms |
+| KV writer | 0.0833 ms | 0.4572 ms | +0.3739 ms |
+| Common model/runtime | 22.8873 ms | 22.9267 ms | +0.0394 ms |
+| GPU envelope | 37.4172 ms | 36.9033 ms | -0.5138 ms |
+
+The stock FA2 heuristic selected 18 splits at 65K. With eight effective heads
+this launches 144 CTAs, while the measured ByteV2 specialization can keep two
+CTAs resident on each of the A40's 84 SMs. An explicit split sweep therefore
+tested 16, 18, 20, 21, and 24 with the complete main-plus-original-combine
+call, 12 warmups, 200 CUDA-event iterations, and three independent
+repetitions.
+
+At 65K, split 20 reduced ByteV2 attention by 3.57% for compact-safe pages and
+8.50% for the forced-outlier stress distribution relative to split 18.
+Split 21 was faster for the outlier stress case but slower for safe data;
+split 24 regressed sharply from tail-wave and combine overhead. Split 20 was
+therefore selected as the distribution-independent compromise.
+
+The multi-length sweep produced:
+
+| Sequence length | Safe split-20 delta | Forced-outlier delta |
+| ---: | ---: | ---: |
+| 4,099 | -1.59% | -3.13% |
+| 16,384 | +0.93% | 0.00% |
+| 32,768 | -5.67% | -10.00% |
+| 65,536 | -3.57% | -8.50% |
+| 131,072 | -2.18% | -5.38% |
+| 188,416 | -2.13% | -6.27% |
+
+The production interval is conservatively limited to inclusive
+[32,768, 131,072]. At 16K there is no stable gain. At 188K raw FA2 regresses
+0.705%, the length exceeds the current model/E2E validation limit, and fixed
+20-GB raw capacity cannot support an equal-length production comparison.
+
+#### Shared Selector and Bitwise Contract
+
+The change is in vendored FA2 `set_params_splitkv()`, represented by
+`cmake/patches/vllm_flash_attn_byte_v2.patch`. An automatic call selects 20
+only when all of the following hold:
+
+- the cached device name is exactly `NVIDIA A40` and it reports 84 SMs;
+- dtype is BF16 and softcap is disabled;
+- attention is paged with a 16-token page;
+- the FA2 Q1/GQA transpose is active;
+- the post-transpose shape is B1, eight effective heads, eight KV heads,
+  `max_seqlen_q=4`, and head size 128;
+- `32768 <= max_seqlen_k <= 131072`.
+
+Every miss uses the original FA2 heuristic. Any explicit positive split count
+bypasses the new selector.
+
+The selector is deliberately shared by raw and ByteV2 rather than placed in a
+ByteV2-only Python wrapper. Both calls continue through the same split tree
+and the original `flash_fwd_splitkv_combine_kernel`; QK, masking, softmax, PV,
+and combine code are unchanged. Same-split ByteV2/raw BF16 output and FP32 LSE
+were bitwise identical at every tested length and distribution. Different
+split trees are not required to be bitwise identical, which is why changing
+only ByteV2 would violate the raw-bitwise contract.
+
+Boundary tests compare auto, explicit 18, and explicit 20 at 32,767, 32,768,
+65,536 safe/outlier, 131,072, and 131,073. Auto matches explicit 20 only
+inside the intended interval and explicit 18 remains distinct. Additional
+GQA2 and softcap near-miss tests match the stock explicit-18 result.
+The final complete attention-layout test file reports 371 passed and one
+skipped test on the validated A40 build.
+
+#### Diagnostic and Final Production E2E
+
+Before installing the selector, a palindromic diagnostic run compared ByteV2
+auto/split-20 and raw auto/split-20 on three A40s. Split 20 improved ByteV2
+TPOT by 1.22%, 1.23%, and 2.33%, while raw changed by -0.17%, -0.16%, and
++0.03%. All 24 diagnostic requests had identical prompts/tokens and passed
+preemption, fallback, fatal, and staging-resource gates.
+
+After the exact-device and softcap gates were installed, a fresh production
+raw/Byte/Byte/raw ABBA run gave:
+
+| Physical A40 | Raw TPOT | ByteV2 TPOT | ByteV2 vs raw |
+| ---: | ---: | ---: | ---: |
+| 0 | 40.1751 ms | 38.2970 ms | -4.675% |
+| 1 | 40.2138 ms | 38.3139 ms | -4.724% |
+| 4 | 36.2226 ms | 34.8600 ms | -3.762% |
+
+All six raw/Byte pairs matched all 256 output tokens. Every run was
+performance-valid with zero preemptions; ByteV2 reported zero fatal events,
+zero authoritative raw pages, and all 1,472 raw-fallback sidecar slots free. Trace
+records show auto requests, zero diagnostic forced calls, and observed Q1
+calls. A separate production run before the final scope gates gave
+-4.615%, -4.480%, and -3.899%, confirming the result is repeatable and that
+the cached device-property check has no visible TPOT cost.
+
+The fixed-budget allocator capacities remain 188,432 tokens for ByteV2 and
+152,576 for raw, a 23.50% increase. Within the validated 65K B1 shape this is
+therefore a simultaneous capacity and latency result, not merely a
+capacity-for-latency trade.
+
+#### Scope and Next Step
+
+This is a narrow A40 shape specialization, not a generic FA2 heuristic. It
+does not claim results for another GPU, B>1, another GQA ratio, page size,
+dtype, head dimension, softcap, local/sliding attention, or sequence length
+outside the gated interval. Forced outliers are a route stress test rather
+than a production distribution estimate.
+
+The largest remaining ByteV2-specific positive decode cost is the writer:
+approximately +0.3739 ms/token in the pre-selector Nsight Systems replay. The
+next optimization should reduce append/commit/persist launches and metadata
+work while preserving this shared split selector, original FA2 combine, and
+same-shape bitwise gate. It must be retained only after another clean
+multi-GPU ABBA E2E comparison.
+
+Artifacts:
+
+- `profile/bytev2-final-long-decode-e2e-a40-20260725/REPORT.md`
+- `profile/bytev2-final-long-decode-e2e-a40-20260725/analysis/`
+- `profile/bytev2-final-long-decode-e2e-a40-20260725/reports/`
+- `profile/bytev2-fa2-split-sweep-a40-20260725/analysis/`
+- `profile/bytev2-fa2-split-sweep-a40-20260725/reports/`
+
+### A40 Q1 Raw-Tail Dynamic Demotion (2026-07-26)
+
+#### Motivation and Lifecycle
+
+The fused Q1 raw-tail path removed the largest remaining ByteV2-specific
+decode-writer cost, but its initial lifecycle could leave a page authoritative
+in the persistent BF16 sidecar after dynamic scheduling returned from Q1 to
+Q>1. That was correct but could steadily consume raw slots and erode the
+capacity benefit.
+
+The non-retained Q>1 update now runs compact commit, safe raw-page demotion,
+and raw fallback persistence on the same CUDA stream. The new one-CTA,
+128-thread demotion kernel scans touched staging descriptors and reclaims a
+mapped raw slot only when the page is full, compact outlier-pool overflow is
+zero, and no compact tile requires fallback. Partial and unsafe pages retain
+their raw mapping. The retained prefill update is unchanged.
+
+This does not alter QK, masking, softmax, PV, split selection, or the original
+FA2 combine kernel. It is a cache-writer lifecycle change.
+
+#### Dynamic-Batching Correctness
+
+A two-request witness uses a 257-token scheduler budget. Request A completes a
+4,096-token prefill and executes one pure Q1 step, allocating one raw tail in
+each of 32 layers. Request B then arrives with a 3,840-token prompt. Fifteen
+mixed steps schedule A Q1 plus B Q256, so A's page becomes full while both
+requests remain live.
+
+Eager and compiled ByteV2 runs match eager and compiled raw FA2 in every token
+and in the normalized 33-step scheduler trace. Request A produces 18 tokens
+and request B produces two. In the final default-on compiled lifecycle run:
+
+| Checkpoint | Slots | Free | Raw pages | Fatal | Live requests |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| after pure Q1 | 1,536 | 1,504 | 32 | 0 | 1 |
+| after mixed step 15 | 1,536 | 1,536 | 0 | 0 | 2 |
+| after finish | 1,536 | 1,536 | 0 | 0 | 0 |
+
+All layers have the same 48-slot state for this two-request configuration.
+The captured auto plan has 11,930 compact blocks, 128 staging slots, and
+`max_num_seqs=2`; therefore `11930 // 256 + 2 == 48`, with no explicit slot
+override. Reclamation occurs online rather than as a side effect of request
+completion or cache reset.
+
+Focused CUDA tests cover safe and overlay demotion, partial continuation,
+unsafe retention, same-wave reuse, multiple pages, CUDA Graph replay, and
+dummy no-op behavior. Memcheck, racecheck, and synccheck report zero errors
+for the focused witness.
+
+#### Cost Attribution
+
+ABBA CUDA-event measurements of the complete Q>1 update give:
+
+| Staging capacity | Demotion off | Demotion on | Delta |
+| ---: | ---: | ---: | ---: |
+| 33 | 164.721 us | 166.745 us | +2.024 us |
+| 128 | 95.503 us | 97.792 us | +2.289 us |
+
+Nsight Systems isolates the new kernel at 1.565 us per layer. Prepare,
+hydrate, compact commit, and persist each move by no more than about 0.03 us.
+The kernel alone contributes about 0.050 ms across 32 layers; the complete
+measured update delta of 2.024 us per layer corresponds to about 0.065 ms per
+Q>1 engine step. This is about 1% of the measured 6--7 ms ByteV2/raw
+difference in the dynamic mixed-prefill trace, so demotion is not the dominant
+residual.
+
+A fresh compiled B8 off/on/on/off process bracket has identical prompts and
+tokens. Off averages 7.312474 s and on averages 7.222381 s. The -1.232%
+difference is treated only as a no-regression result because it is below
+whole-process variation, not as a raw-tail speedup.
+
+#### Capacity-Safe Default
+
+Raw-tail Q1 is now implicit only when the existing experimental hybrid mode
+is enabled. It remains globally off when
+`BYTE_V2_FA2_HYBRID_RAW_FALLBACK` is off, and
+`BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1=0` is the rollback.
+
+For ordinary requests, the planner reserves:
+
+```text
+raw slots per ByteV2 layer =
+    max(1, num_blocks // 256) + max_num_seqs
+```
+
+`max_num_seqs` bounds one mutable partial tail per running request. The first
+term is the pre-existing empirical reserve for full unsafe pages.
+`BYTE_V2_FA2_RAW_FALLBACK_SLOTS` keeps its historical total-slot meaning and
+must be at least the sum above when raw-tail Q1 is active. Override planning,
+automatic block search, final multi-rank shrink, and the minimal CUDA Graph
+cache all account for the resolved requirement.
+
+The installed native ABI must contain both the Q1
+`fuse_commit_finalize` schema and the Q>1 `demote_safe_raw_pages` schema. An
+implicit request falls back to the legacy writer if they are missing; an
+explicit raw-tail opt-in fails closed. The resolved capability is carried in
+`KVCacheConfig`, keeping the planner, scheduler, CUDA Graph cache, and
+attention path consistent. Worker workspace binding also compares the planned
+bit with every active attention implementation and rejects a mismatch, so
+heterogeneous extension installs fail closed.
+
+Resumable or streaming sessions retain KV outside the ordinary running set,
+so `max_num_seqs` cannot bound their tails. They are rejected in
+`EngineCore.preprocess_add_request`, whose multiprocess input path returns a
+request-scoped error. The scheduler repeats the check as defense in depth.
+
+At the common 32-layer, `max_num_seqs=256` default, the tail term alone costs
+536,903,680 bytes, or 512.031 MiB, of persistent sidecar memory. This is
+charged to the KV planner rather than hidden as a temporary peak.
+
+#### Final 65K Check
+
+The final default-on B1 check uses compiled execution, a 65,536-token prompt,
+257 generated tokens, auto split selection, and a 20,000,000,000-byte KV
+budget. All output token IDs exactly match the raw FA2 bracket. Using
+`decode_seconds / 256`, the fresh raw/Byte/Byte/raw ABBA gives a ByteV2 mean
+TPOT of 38.131789 ms versus a raw mean of 40.199216 ms, or -5.143%.
+Relative to the earlier `reports/e2e-long-default.jsonl` single run
+(38.150527 ms), the fresh ByteV2 mean changes by -0.049%; relative to
+`reports/e2e-long-capacity.jsonl` (38.176678 ms), it changes by -0.118%.
+Both are within process variation. Both ByteV2 plans explicitly report
+`raw_mutable_tail_q1=true`; all four runs are performance-valid, have zero
+preemptions, and use the same prompt and 257 output tokens.
+
+The fixed-budget plan contains 11,775 ByteV2 blocks or 188,400 token slots,
+versus 9,536 raw blocks or 152,576 token slots. That is 23.479% more token
+capacity. At the same 188,400-token capacity, the complete ByteV2 plan is
+19.024% smaller than raw. Its final allocator has all 1,472 slots free, zero
+raw pages, and no fatal state.
+
+The B1 plan still has 46 slots per layer because the compact block count falls
+from 11,777 to 11,775 and crosses the integer unsafe-reserve boundary:
+`11775 // 256 + 1 == 46`. The tail reserve is active even though the final
+slot count is unchanged.
+
+The scope remains A40/SM86, one writer stream, the established Llama-3.1-8B
+BF16 ByteV2 shape, and non-resumable requests. Prefix sharing does not create
+additional mutable tails because partial blocks are not shared. The unsafe
+reserve is still empirical rather than a guarantee for arbitrary unsafe-page
+density. Wider preemption, connector/offload, PP/DCP, and multi-stream
+coverage remains future work.
+
+All workers must use the same extension ABI and initialization environment,
+and selectors must remain unchanged after initialization. Unsupported
+resumable requests currently use the general request-error response and
+therefore surface as an HTTP 500 rather than a dedicated configuration 4xx.
+
+The measured demotion cost is too small to be the next optimization target.
+For Q>1/mixed prefill, the remaining work stays in the existing prepare and
+multi-token writer path. For long Q1 decode, the raw-tail writer plus shared
+split-20 selector already preserves the measured ByteV2 latency advantage.
+
+Final regression results are 394 passed and one skipped for the complete
+attention-layout file, 88 passed for the complete KV-planner file, 35 passed
+for the staging-workspace plus profile-script files, and one passed for the
+multiprocess request-scoped rejection. Related Python files pass Ruff format,
+Ruff check, and `git diff --check`.
+
+Artifacts:
+
+- `profile/bytev2-q1-raw-tail-dynamic-demotion-a40-20260726/REPORT.md`
+- `profile/bytev2-q1-raw-tail-dynamic-demotion-a40-20260726/analysis/`
+- `profile/bytev2-q1-raw-tail-dynamic-demotion-a40-20260726/harness/`
+- `profile/bytev2-q1-raw-tail-dynamic-demotion-a40-20260726/reports/`
+
+### A40 Q>1 Bounded Parallel Prepare (2026-07-26)
+
+The remaining cooperative-writer bottleneck for non-retained waves with at
+most 144 input tokens was the single-thread
+`prepare_small_multi_token_hybrid_staging` kernel. On the representative
+`n106.capacity33` shape, Nsight Systems measured 137.460 us in prepare,
+12.460 us in hydrate/append, 11.296 us in compact commit, 2.319 us in persist,
+and 1.562 us in safe demotion. Prepare was therefore the only material target
+in that route.
+
+A new single-CTA, 256-thread kernel parallelizes clean-descriptor checks,
+token page/row parsing, bounded prefix scans, duplicate-row detection, and
+per-page validation. Stable first-occurrence ranks preserve the serialized
+kernel's staging-slot order. Thread zero publishes the already validated
+descriptors in that order, retaining the existing fail-closed behavior.
+Hydrate, compact commit, persist, demotion, attention, split selection, and
+the original FA2 combine kernel are unchanged.
+
+The candidate applies only to non-retained cooperative waves with `N<=144`.
+Retained staging stays on the serialized control and `N>144` stays on the
+generic writer. `BYTE_V2_HYBRID_PARALLEL_PREPARE=0` restores the serialized
+kernel; unset or `1` selects the validated default, and any other value fails
+closed. Publication retains the established single-stream, quiescent
+allocator contract.
+
+ABBA CUDA-event measurements of the complete update give:
+
+| Production-reconstructed shape | Serialized | Parallel | Delta |
+| --- | ---: | ---: | ---: |
+| `n37.capacity18` | 57.488 us | 40.507 us | -29.538% |
+| `n56.capacity23` | 83.032 us | 46.978 us | -43.422% |
+| `n79.capacity28` | 119.427 us | 53.875 us | -54.889% |
+| `n106.capacity33` | 166.245 us | 59.348 us | -64.301% |
+| `n133.capacity35` | 209.016 us | 63.958 us | -69.400% |
+
+The dedicated `n106` bracket confirms 166.690 us versus 59.651 us. Nsight
+Systems measures prepare itself at 137.460 us versus 30.080 us (-78.12%);
+hydrate, commit, persist, and demote each change by less than 0.10 us. A
+generic `n2048.capacity128` non-routing guardrail is unchanged at 97.761 us
+versus 97.756 us.
+
+All candidate/control cache outputs are canonical BF16 exact. Focused tests
+cover selector values, invalid selector handling, retained and maximum
+boundaries, CUDA Graph replay, invalid maps, nearby and far duplicate rows,
+capacity overflow, dirty descriptors, and pool exhaustion. Candidate
+memcheck and synccheck report zero errors; racecheck reports zero hazards,
+errors, or warnings.
+
+The complete attention-layout regression reports 400 passed and one skipped.
+The focused optimization gate reports 17 passed with 384 deselected; after
+pinning the fatal subprocesses explicitly to the candidate, all eight
+fail-closed probes pass again.
+
+The E2E result is deliberately narrower than the kernel result. A compiled
+B32/P4096/D8 ByteV2-only ABBA bracket is 20.182256 seconds for control versus
+20.253688 seconds for the candidate, a nominal +0.354% inside the 0.5%
+no-regression threshold and below the observed process drift. Tokens and KV
+plans are exact and preemptions are zero. The same tokens match the prior
+same-prompt raw FA2 reference, but this round has no fresh raw performance
+arm and therefore makes no claim about changing the raw gap.
+
+The dynamic `Q1 + Q256` negative control is +0.112% and the B1/65K
+long-context negative control is +0.009% in wall time. Both are exact and
+performance-valid. They do not exercise this optimization: `N=257` and the
+long prefill chunks exceed the 144-token limit. The local improvement closes
+the profiled prepare bottleneck. Applying the five measured writer-wave
+savings once per layer gives only 11.857 ms, or 0.0588% of the 20.182-second
+B32 control E2E time, consistent with the absence of a resolvable E2E gain.
+
+The next E2E target is the generic `N>144` mixed-wave writer. For the observed
+`Q1 + Q256` structure, the preferred experiment is page-centric: keep the 16
+fresh full pages on the existing aligned vector writer and cooperatively
+hydrate only the cached partial tail. A simpler cooperative-limit extension
+to at least 257 tokens can first serve as an upper-bound experiment, but must
+not displace the optimized full-page path without data.
+
+Artifacts:
+
+- `profile/bytev2-qgt1-parallel-prepare-a40-20260726/REPORT.md`
+- `profile/bytev2-qgt1-parallel-prepare-a40-20260726/analysis/`
+- `profile/bytev2-qgt1-parallel-prepare-a40-20260726/reports/`
+
+### A40 SplitZip Fixed-Page FA2 Reader Prototype (2026-07-26)
+
+A reader-only experiment replaces ByteV2's dense reconstruction with
+SplitZip sign/mantissa plus contiguous-16 exponent-window decode inside the
+current external FA2 loader. It deliberately reuses the 52,096-byte V5 page,
+cp.async staging, 896-byte shared page descriptor, QK/softmax/PV mainloop,
+split reduction, and original FA2 combine kernel. Separate calibrated windows
+are K 115--130 and V 110--125. The offline page packer stores even codes in
+the low nibble, pooled entries as `(true_exp << 8) | local_pos`, and now masks
+invalid partial-tail rows from escape-pool accounting.
+
+On A40, batch-1 Q1 single-call median-of-three latencies for
+raw/ByteV2/SplitZip are 57.344/61.440/62.464 us at 4K,
+137.216/120.832/121.856 us at 16K, and
+466.944/407.552/411.648 us at 65K. SplitZip is therefore 8.93% slower than raw
+at 4K but 11.19% and 11.84% faster at 16K and 65K. A 20-call/event explicit
+same-split confirmation gives SplitZip gains of 10.25% and 11.44% at 16K and
+65K. At long lengths it remains 1%--2% slower than ByteV2 despite identical
+resident bytes, isolating dense exponent reconstruction as the next format
+optimization target.
+
+All nine main repetitions and nine batched confirmations are output/LSE
+bitwise exact against same-split raw FA2. Independent fixed-page decoding,
+an exponent 0--254 escape stress page, and a ragged/permuted/shared-prefix
+case with partial tails also pass bitwise. Real-capture SplitZip escape rate
+is 0.024426%, maximum demand is 15 entries/page and two entries/tile, and no
+page overflows.
+
+This prototype proves direct realtime consumption but not a production vLLM
+cache format. It has no online writer or raw overflow fallback, does not
+support arbitrary Top-16 LUT pages, and uses the same fixed allocation as
+ByteV2. Its capacity saving is therefore 20.508%, not the public SplitZip
+variable-payload result of 23.341%. The next gate is a 65K ByteV2/SplitZip NCU
+comparison followed by packed-integer reconstruction work.
+
+Artifacts:
+
+- `profile/bytev2-splitzip-fa2-reader-a40-20260726/reports/REPORT.md`
+- `profile/bytev2-splitzip-fa2-reader-a40-20260726/reports/aggregate.json`
+- `profile/bytev2-splitzip-fa2-reader-a40-20260726/plots/`
+- `profile/bytev2-splitzip-fa2-reader-a40-20260726/raw/`
+
+### A40 SplitZip FA2 Reconstruction NCU Optimization (2026-07-26)
+
+The follow-up 65K NCU comparison confirms that SplitZip's residual ByteV2
+gap is reconstruction arithmetic, not metadata or DRAM traffic. With Q1 and
+explicit split 20, the strict same-GPU serial profiles execute 41,528,425
+instructions for ByteV2 and 44,963,623 for SplitZip (+8.27%). SplitZip uses
+255 rather than 250 registers/thread and raises ALU-pipe activity from 19.27%
+to 23.18%, while DRAM bytes differ by only 0.10%. Both paths keep the same
+160-CTA grid, 51,072-byte shared allocation, two-CTA/SM limit, tensor-core
+mainloop, split output, and original combine kernel.
+
+The retained change expresses reconstruction of each BF16 byte as an explicit
+single `lop3.b32` select with the per-byte `0x80808080` mask. It replaces the
+compiler's separate mask and merge instructions without changing the
+SplitZip wire or escape patch. SASS contains one LOP3 for each selection and
+the dynamic instruction count falls exactly by 2,097,152 to 42,866,471
+(-4.66%). This removes 61.0% of the baseline SplitZip-vs-ByteV2 instruction
+excess. ALU activity falls to 21.02%; registers remain 255 and local
+loads/stores remain zero.
+
+The final installed binary's NCU main-kernel duration improves from 451.424
+to 448.352 us (-0.68%). An earlier build of the identical retained source
+measures 444.928 us (-1.44%), exposing replay/run variation despite identical
+instructions. Final three-round event timing moves the mean of SplitZip
+repetition medians from 411.204 to 410.897 us (-0.075%), while raw-normalized
+latency moves from 0.88547x to 0.88489x. The first retained build measures
+410.428 us, so no event-level speedup is claimed. The result is retained for
+its exact structural improvement and lack of regression. At 77.61% of peak
+DRAM-read throughput, with long scoreboard the largest stall ratio, the
+removed ALU instructions are mostly hidden behind the memory critical path.
+
+A second attempt reordered the same reconstruction into two lexical scopes
+to shorten live ranges. It retained 255 registers and the identical
+42,866,471 instructions. Its 410.445-us event result is indistinguishable
+from both retained builds, so it was rejected.
+
+The final bitwise gates cover the repeated real capture at 65K, every finite
+BF16 exponent 0--254 in one pressure tile with 240 escape entries, and the
+ragged `[4099,2051]` topology with 64 shared-prefix blocks, physical-page
+permutation, and two three-row tails. Output and LSE mismatch counts are zero
+throughout, with no page overflow.
+
+This establishes the format-preserving optimization limit more clearly.
+The retained kernel remains 1,338,046 instructions and five registers/thread
+above ByteV2; two retained-source NCU runs put its duration gap at
+0.55%--1.32%, while final CUDA events put it at 1.42%. Eliminating that
+remaining reconstruction requires changing the resident wire to retain the
+exponent low bit, which is effectively ByteV2's layout. For a realtime
+product path, the preferred architecture is therefore SplitZip as an
+archive/transport representation with background conversion into ByteV2
+resident pages, rather than repeatedly paying canonical SplitZip
+reconstruction in attention.
+
+Artifacts:
+
+- `profile/bytev2-splitzip-fa2-ncu-a40-20260726/REPORT.md`
+- `profile/bytev2-splitzip-fa2-ncu-a40-20260726/reports/`
+- `profile/bytev2-splitzip-fa2-ncu-a40-20260726/analysis/`
+- `profile/bytev2-splitzip-fa2-ncu-a40-20260726/harness/`
+
+### A40 ByteV2 V6-256 Fixed-Page Integration (2026-07-27)
+
+The production ByteV2 layout now retains the V5 metadata and dense payload
+ABI while reducing the page-wide outlier pool from 1,024 to 256 entries. The
+page therefore changes from 52,096 to 50,560 bytes: fixed storage saving
+against the 65,536-byte raw BF16 page increases from 20.5078% to 22.8516%.
+SplitZip and the diagnostic sideband-high format intentionally retain their
+V5 52,096-byte envelope; both require the larger pool for their existing
+reader or fixed-256-entry-per-overlay contract.
+
+The pool choice is supported by an exact production-allocation scan of a
+32-layer Llama-3.1-8B natural-text capture. Calibration has 1,024 pages with
+mean/P99/max demand 3.980/15/29 entries; evaluation has 2,048 pages with
+3.514/9/27. Capacity 256 has zero observed overflow for full pages and every
+`valid_rows=1..16` prefix. This is not a distribution-wide safety proof:
+the capture is one model, batch one, short natural-text prefill KV, and does
+not cover code, multilingual input, long-context distributions, multiple
+batches, or decode tails.
+
+For that reason V6 production is explicitly tied to the authoritative hybrid
+raw sidecar. The cache planner and engine workspace binder reject compact-only
+V6 configurations unless `BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1` is set. The
+low-level legacy decoder also traps on a fallback tile when the compact page
+has no embedded raw payload, preventing standalone diagnostic calls from
+silently continuing with invalid compressed values. The direct compact-only
+writer remains available only as a fail-closed low-level diagnostic path.
+
+Same-run Q1 CUDA-event medians show 50.688 versus 49.101 us at 4K
+(V6 +3.15%), 118.630 versus 133.734 us at 16K (-11.29%), and 406.579 versus
+465.856 us at 65K (-12.71%). All ByteV2 output and LSE comparisons are
+bitwise exact against same-split raw FA2. A 65K-context, 128-output-token
+production ABBA run also produces the same 128 tokens in all four requests.
+Its median TPOT is 38.162 ms for V6 versus 40.201 ms for raw (-5.07%), while
+median TTFT is 1.13% higher; a single ABBA block does not establish a stable
+prefill regression or improvement.
+
+With a 20 GB KV budget, the measured planner capacity is 152,576 tokens for
+raw and 194,112 for V6 (+27.22%), including the hybrid raw sidecar and shared
+staging workspace. Historical V5 capacity is 188,432 tokens, so V6 adds
+5,680 tokens (+3.01%) over that earlier format.
+
+NCU explains the long-sequence result structurally. Raw/V6 DRAM read is
+299.619/241.886 MB (-19.27%); achieved occupancy is 8.44%/15.55%; and the
+long-scoreboard ratio is 4.578/2.487. V6 shifts some pressure to decode and
+shared-memory dependencies: its short-scoreboard ratio rises from 0.149 to
+0.794, and NCU flags uncoalesced global loads and shared-store bank
+conflicts. NCU replay duration is diagnostic only and is not substituted for
+CUDA-event or E2E latency.
+
+Shrinking the unused pool tail is primarily a capacity improvement, not a
+reader-traffic optimization. Historical V5 NCU reads 242.148 MB and current
+V6 reads 241.886 MB, only 0.108% less, because unused pool bytes were never
+loaded on the hot path. The historical V5 result also comes from a different
+binary and is not used as a strict causal latency A/B.
+
+The focused sideband, page-size, legacy fallback, hybrid overflow-promotion,
+planner, and binder gates all pass. The complete attention-layout regression
+reports 403 passed and one skipped.
+
+Artifacts:
+
+- `profile/bytev2-v6-256-fa2-a40-20260727/REPORT.md`
+- `profile/bytev2-v6-256-fa2-a40-20260727/analysis/`
+- `profile/bytev2-v6-256-fa2-a40-20260727/reports/`
+- `profile/bytev2-v6-pool-demand-a40-20260727/REPORT.md`

@@ -711,6 +711,9 @@ def bind_byte_v2_raw_staging_workspace(
         getattr(kv_cache_config, "byte_v2_raw_staging_workspace_bytes", 0)
     )
     num_raw_slots = int(getattr(kv_cache_config, "byte_v2_raw_fallback_slots", 0))
+    planned_raw_tail_q1 = bool(
+        getattr(kv_cache_config, "byte_v2_raw_mutable_tail_q1", False)
+    )
     num_blocks = int(getattr(kv_cache_config, "num_blocks", 0))
     if use_ubatching and (num_staging_slots > 0 or planned_bytes > 0):
         raise RuntimeError(
@@ -727,6 +730,25 @@ def bind_byte_v2_raw_staging_workspace(
         spec_fn = getattr(impl, "raw_staging_workspace_spec", None)
         if not callable(spec_fn):
             continue
+        runtime_hybrid_fallback = getattr(
+            impl,
+            "fa2_hybrid_raw_fallback",
+            None,
+        )
+        if runtime_hybrid_fallback is False:
+            raise RuntimeError(
+                "ByteV2 V6-256 cannot bind a compact-only engine; "
+                "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1 and its planned raw "
+                "sidecar are required"
+            )
+        runtime_raw_tail_q1 = bool(getattr(impl, "hybrid_raw_mutable_tail_q1", False))
+        if runtime_raw_tail_q1 != planned_raw_tail_q1:
+            raise RuntimeError(
+                "ByteV2 raw-tail Q1 capability mismatch: planner resolved "
+                f"{planned_raw_tail_q1}, but attention resolved "
+                f"{runtime_raw_tail_q1}. All workers must use the same native "
+                "extension and initialization environment."
+            )
         seen_impls.add(id(impl))
         spec = spec_fn(layer.kv_cache, num_staging_slots)
         if spec is not None:

@@ -1853,6 +1853,45 @@ def test_byte_v2_raw_fallback_sidecar_formula_and_explicit_slots():
     ) == num_layers * (4 * num_blocks + 65_540 * explicit_slots + 8)
 
 
+def test_byte_v2_auto_slots_reserve_tails_and_validate_explicit_total():
+    assert (
+        kv_cache_utils.get_byte_v2_raw_fallback_slots(
+            512,
+            mutable_tail_slots=8,
+        )
+        == 10
+    )
+    assert (
+        kv_cache_utils.get_byte_v2_raw_fallback_slots(
+            512,
+            explicit_slots=7,
+            mutable_tail_slots=8,
+        )
+        == 7
+    )
+    with pytest.raises(ValueError, match="at least 10 total slots"):
+        kv_cache_utils._validate_byte_v2_raw_fallback_slots(512, 7, 8)
+    kv_cache_utils._validate_byte_v2_raw_fallback_slots(512, 10, 8)
+
+
+def test_byte_v2_raw_tail_runtime_resolution_tracks_native_abi(monkeypatch):
+    from vllm.v1.attention.backends import byte_v2_ops
+
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.delenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", raising=False)
+    monkeypatch.setattr(
+        byte_v2_ops,
+        "byte_v2_hybrid_raw_tail_q1_is_available",
+        lambda: False,
+    )
+
+    assert not kv_cache_utils._byte_v2_raw_mutable_tail_q1_runtime_enabled()
+
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "1")
+    with pytest.raises(RuntimeError, match="native raw-tail Q1"):
+        kv_cache_utils._byte_v2_raw_mutable_tail_q1_runtime_enabled()
+
+
 def test_byte_v2_raw_staging_workspace_formula():
     num_blocks = 512
     num_staging_slots = 128
@@ -1868,7 +1907,7 @@ def test_byte_v2_raw_staging_workspace_formula():
 
 def test_byte_v2_raw_fallback_block_planner_exact_floor_boundary():
     page_bytes = new_byte_v2_kv_cache_spec().page_size_bytes
-    assert page_bytes == 52_096
+    assert page_bytes == 50_560
     num_blocks = 512
     available_memory = kv_cache_utils._get_byte_v2_total_cache_bytes(
         num_blocks, page_bytes, 1
@@ -1888,8 +1927,15 @@ def test_byte_v2_raw_fallback_block_planner_exact_floor_boundary():
     )
 
 
-def test_byte_v2_raw_fallback_budget_is_default_off(monkeypatch):
-    monkeypatch.delenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", raising=False)
+@pytest.mark.parametrize("hybrid_value", [None, "0"])
+def test_byte_v2_v6_planner_requires_hybrid_raw_fallback(
+    monkeypatch,
+    hybrid_value,
+):
+    if hybrid_value is None:
+        monkeypatch.delenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", raising=False)
+    else:
+        monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", hybrid_value)
     monkeypatch.delenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", raising=False)
     monkeypatch.delenv("BYTE_V2_FA2_RAW_STAGING_SLOTS", raising=False)
     spec = new_byte_v2_kv_cache_spec()
@@ -1897,29 +1943,31 @@ def test_byte_v2_raw_fallback_budget_is_default_off(monkeypatch):
     available_memory = spec.page_size_bytes * num_blocks
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
 
-    config = get_kv_cache_configs(vllm_config, [{"byte_v2": spec}], [available_memory])[
-        0
-    ]
-
-    assert config.num_blocks == num_blocks
-    assert config.kv_cache_tensors == [
-        KVCacheTensor(size=available_memory, shared_by=["byte_v2"])
-    ]
-    assert config.byte_v2_raw_fallback_slots == 0
-    assert config.byte_v2_raw_fallback_sidecar_bytes == 0
-    assert config.byte_v2_raw_staging_slots == 0
-    assert config.byte_v2_raw_staging_workspace_bytes == 0
-    assert config.has_byte_v2_layers
-    assert not config.needs_kv_cache_zeroing
+    with pytest.raises(ValueError, match="V6-256 requires.*HYBRID_RAW_FALLBACK=1"):
+        get_kv_cache_configs(
+            vllm_config,
+            [{"byte_v2": spec}],
+            [available_memory],
+        )
 
 
 def test_byte_v2_raw_fallback_budget_with_explicit_slots(monkeypatch):
     monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
-    monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "3")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "1")
+    monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "5")
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
+        lambda: True,
+    )
     spec = new_byte_v2_kv_cache_spec()
     num_blocks = 17
+    mutable_tail_slots = 4
     sidecar_bytes = kv_cache_utils.get_byte_v2_raw_fallback_sidecar_bytes(
-        num_blocks, 1, 3
+        num_blocks,
+        1,
+        5,
+        mutable_tail_slots,
     )
     workspace_bytes = kv_cache_utils.get_byte_v2_raw_staging_workspace_bytes(
         num_blocks, 128
@@ -1928,6 +1976,7 @@ def test_byte_v2_raw_fallback_budget_with_explicit_slots(monkeypatch):
         spec.page_size_bytes * num_blocks + sidecar_bytes + workspace_bytes
     )
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.scheduler_config.max_num_seqs = mutable_tail_slots
 
     config = get_kv_cache_configs(vllm_config, [{"byte_v2": spec}], [available_memory])[
         0
@@ -1935,10 +1984,11 @@ def test_byte_v2_raw_fallback_budget_with_explicit_slots(monkeypatch):
 
     assert config.num_blocks == num_blocks
     assert config.kv_cache_tensors[0].size == spec.page_size_bytes * num_blocks
-    assert config.byte_v2_raw_fallback_slots == 3
+    assert config.byte_v2_raw_fallback_slots == 5
     assert config.byte_v2_raw_fallback_sidecar_bytes == sidecar_bytes
     assert config.byte_v2_raw_staging_slots == 128
     assert config.byte_v2_raw_staging_workspace_bytes == workspace_bytes
+    assert config.byte_v2_raw_mutable_tail_q1
     assert config.needs_kv_cache_zeroing
     assert (
         sum(tensor.size for tensor in config.kv_cache_tensors)
@@ -1963,6 +2013,7 @@ def test_byte_v2_test_forced_raw_diagnostic_is_budgeted_only_when_enabled(
 
 def test_byte_v2_raw_staging_slot_override_is_budgeted(monkeypatch):
     monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "0")
     monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "3")
     monkeypatch.setenv("BYTE_V2_FA2_RAW_STAGING_SLOTS", "4")
     spec = new_byte_v2_kv_cache_spec()
@@ -2044,6 +2095,7 @@ def test_byte_v2_hybrid_unsupported_runtime_config_fails_closed(
 
 def test_byte_v2_raw_fallback_override_fails_closed(monkeypatch):
     monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "0")
     monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "1")
     spec = new_byte_v2_kv_cache_spec()
     num_blocks = 10
@@ -2069,8 +2121,62 @@ def test_byte_v2_raw_fallback_override_fails_closed(monkeypatch):
     )
 
 
+def test_byte_v2_raw_tail_override_reserves_max_num_seqs(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "1")
+    monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "4")
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
+        lambda: True,
+    )
+    spec = new_byte_v2_kv_cache_spec()
+    num_blocks = 10
+    mutable_tail_slots = 4
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.scheduler_config.max_num_seqs = mutable_tail_slots
+    vllm_config.cache_config.num_gpu_blocks_override = num_blocks
+
+    with pytest.raises(ValueError, match="at least 5 total slots"):
+        get_kv_cache_configs(
+            vllm_config,
+            [{"byte_v2": spec}],
+            [1 << 30],
+        )
+
+    monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "5")
+    required_memory = kv_cache_utils._get_byte_v2_total_cache_bytes(
+        num_blocks,
+        spec.page_size_bytes,
+        1,
+        5,
+        mutable_tail_slots=mutable_tail_slots,
+    )
+    with pytest.raises(ValueError, match="cannot honor num_gpu_blocks_override"):
+        get_kv_cache_configs(
+            vllm_config,
+            [{"byte_v2": spec}],
+            [required_memory - 1],
+        )
+
+    config = get_kv_cache_configs(
+        vllm_config,
+        [{"byte_v2": spec}],
+        [required_memory],
+    )[0]
+    assert config.num_blocks == num_blocks
+    assert config.byte_v2_raw_fallback_slots == 5
+    assert (
+        sum(tensor.size for tensor in config.kv_cache_tensors)
+        + config.byte_v2_raw_fallback_sidecar_bytes
+        + config.byte_v2_raw_staging_workspace_bytes
+        == required_memory
+    )
+
+
 def test_byte_v2_raw_fallback_counts_mixed_actual_layers(monkeypatch):
     monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "0")
     monkeypatch.delenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", raising=False)
     byte_v2_spec = new_byte_v2_kv_cache_spec()
     full_spec = new_kv_cache_spec()
@@ -2115,19 +2221,33 @@ def test_byte_v2_raw_fallback_counts_mixed_actual_layers(monkeypatch):
 
 def test_byte_v2_raw_fallback_recomputed_after_multi_rank_shrink(monkeypatch):
     monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "1")
     monkeypatch.delenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", raising=False)
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
+        lambda: True,
+    )
     spec = new_byte_v2_kv_cache_spec()
     larger_num_blocks = 600
     smaller_num_blocks = 511
+    mutable_tail_slots = 4
     available_memory = [
         kv_cache_utils._get_byte_v2_total_cache_bytes(
-            larger_num_blocks, spec.page_size_bytes, 1
+            larger_num_blocks,
+            spec.page_size_bytes,
+            1,
+            mutable_tail_slots=mutable_tail_slots,
         ),
         kv_cache_utils._get_byte_v2_total_cache_bytes(
-            smaller_num_blocks, spec.page_size_bytes, 1
+            smaller_num_blocks,
+            spec.page_size_bytes,
+            1,
+            mutable_tail_slots=mutable_tail_slots,
         ),
     ]
     vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.scheduler_config.max_num_seqs = mutable_tail_slots
 
     configs = get_kv_cache_configs(
         vllm_config,
@@ -2136,13 +2256,15 @@ def test_byte_v2_raw_fallback_recomputed_after_multi_rank_shrink(monkeypatch):
     )
 
     expected_sidecar_bytes = kv_cache_utils.get_byte_v2_raw_fallback_sidecar_bytes(
-        smaller_num_blocks, 1
+        smaller_num_blocks,
+        1,
+        mutable_tail_slots=mutable_tail_slots,
     )
     assert [config.num_blocks for config in configs] == [
         smaller_num_blocks,
         smaller_num_blocks,
     ]
-    assert [config.byte_v2_raw_fallback_slots for config in configs] == [1, 1]
+    assert [config.byte_v2_raw_fallback_slots for config in configs] == [5, 5]
     assert [config.byte_v2_raw_fallback_sidecar_bytes for config in configs] == [
         expected_sidecar_bytes,
         expected_sidecar_bytes,
@@ -2262,6 +2384,7 @@ def test_scheduler_config_promotes_byte_v2_reset_across_workers():
             kv_cache_groups=worker_1_groups,
             byte_v2_raw_fallback_slots=1,
             byte_v2_raw_fallback_sidecar_bytes=65_588,
+            byte_v2_raw_mutable_tail_q1=True,
         ),
     ]
 
@@ -2270,6 +2393,7 @@ def test_scheduler_config_promotes_byte_v2_reset_across_workers():
     assert scheduler_config.kv_cache_groups == worker_0_groups
     assert not scheduler_config.has_byte_v2_layers
     assert scheduler_config.byte_v2_raw_fallback_slots == 1
+    assert scheduler_config.byte_v2_raw_mutable_tail_q1
     assert scheduler_config.needs_kv_cache_zeroing
 
 

@@ -37,6 +37,7 @@ from vllm.v1.kv_cache_interface import (
     byte_v2_hybrid_raw_fallback_enabled,
     byte_v2_raw_staging_slots,
     byte_v2_test_forced_raw_promotion_enabled,
+    resolve_byte_v2_hybrid_raw_mutable_tail_q1,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -113,23 +114,58 @@ def _byte_v2_raw_fallback_slots_override() -> int | None:
     return slots
 
 
+def _byte_v2_raw_mutable_tail_q1_runtime_enabled() -> bool:
+    """Resolve the requested raw-tail path against the loaded native ABI."""
+    from vllm.v1.attention.backends.byte_v2_ops import (
+        byte_v2_hybrid_raw_tail_q1_is_available,
+    )
+
+    return resolve_byte_v2_hybrid_raw_mutable_tail_q1(
+        native_available=byte_v2_hybrid_raw_tail_q1_is_available(),
+        hybrid_raw_fallback=True,
+    )
+
+
 def get_byte_v2_raw_fallback_slots(
-    num_blocks: int, explicit_slots: int | None = None
+    num_blocks: int,
+    explicit_slots: int | None = None,
+    mutable_tail_slots: int = 0,
 ) -> int:
     """Return persistent raw fallback slots allocated per ByteV2 layer."""
     if num_blocks < 0:
         raise ValueError("num_blocks must be non-negative")
+    if mutable_tail_slots < 0:
+        raise ValueError("mutable_tail_slots must be non-negative")
     if explicit_slots is not None:
         if explicit_slots <= 0:
             raise ValueError("explicit_slots must be positive")
         return explicit_slots
-    return max(1, num_blocks // 256)
+    return max(1, num_blocks // 256) + mutable_tail_slots
+
+
+def _validate_byte_v2_raw_fallback_slots(
+    num_blocks: int,
+    explicit_slots: int | None,
+    mutable_tail_slots: int,
+) -> None:
+    """Fail closed when an explicit total cannot cover tails plus reserve."""
+    if explicit_slots is None or mutable_tail_slots == 0:
+        return
+    required_slots = mutable_tail_slots + max(1, num_blocks // 256)
+    if explicit_slots < required_slots:
+        raise ValueError(
+            f"{_BYTE_V2_RAW_FALLBACK_SLOTS_ENV}={explicit_slots} is too small "
+            "for raw-tail Q1: at least "
+            f"{required_slots} total slots are required for "
+            f"max_num_seqs={mutable_tail_slots} plus the raw fallback reserve"
+        )
 
 
 def get_byte_v2_raw_fallback_sidecar_bytes(
     num_blocks: int,
     num_byte_v2_layers: int,
     explicit_slots: int | None = None,
+    mutable_tail_slots: int = 0,
 ) -> int:
     """Return persistent ByteV2 sidecar bytes for one worker.
 
@@ -143,7 +179,11 @@ def get_byte_v2_raw_fallback_sidecar_bytes(
         raise ValueError("num_byte_v2_layers must be non-negative")
     if num_byte_v2_layers == 0:
         return 0
-    raw_slots = get_byte_v2_raw_fallback_slots(num_blocks, explicit_slots)
+    raw_slots = get_byte_v2_raw_fallback_slots(
+        num_blocks,
+        explicit_slots,
+        mutable_tail_slots,
+    )
     bytes_per_layer = (
         _BYTE_V2_INT32_BYTES * num_blocks
         + (_BYTE_V2_RAW_PAGE_BYTES + _BYTE_V2_INT32_BYTES) * raw_slots
@@ -223,6 +263,7 @@ def _get_byte_v2_total_cache_bytes(
     num_byte_v2_layers: int,
     explicit_slots: int | None = None,
     raw_staging_slots: int = BYTE_V2_DEFAULT_RAW_STAGING_SLOTS,
+    mutable_tail_slots: int = 0,
 ) -> int:
     """Return compact KV, persistent sidecars, and one shared workspace."""
     return (
@@ -231,6 +272,7 @@ def _get_byte_v2_total_cache_bytes(
             num_blocks,
             num_byte_v2_layers,
             explicit_slots,
+            mutable_tail_slots,
         )
         + get_byte_v2_raw_staging_workspace_bytes(
             num_blocks,
@@ -245,6 +287,7 @@ def _get_max_num_blocks_with_byte_v2_sidecar(
     num_byte_v2_layers: int,
     explicit_slots: int | None = None,
     raw_staging_slots: int = BYTE_V2_DEFAULT_RAW_STAGING_SLOTS,
+    mutable_tail_slots: int = 0,
 ) -> int:
     """Find the largest block count whose full ByteV2 allocation fits."""
     if pool_bytes_per_block <= 0:
@@ -258,6 +301,7 @@ def _get_max_num_blocks_with_byte_v2_sidecar(
         num_byte_v2_layers,
         explicit_slots,
         raw_staging_slots,
+        mutable_tail_slots,
     )
     if minimum_bytes > available_memory:
         raise ValueError(
@@ -276,6 +320,7 @@ def _get_max_num_blocks_with_byte_v2_sidecar(
             num_byte_v2_layers,
             explicit_slots,
             raw_staging_slots,
+            mutable_tail_slots,
         )
         if required <= available_memory:
             low = mid
@@ -1914,6 +1959,9 @@ def generate_scheduler_kv_cache_config(
     cfg.byte_v2_raw_fallback_slots = max(
         worker_cfg.byte_v2_raw_fallback_slots for worker_cfg in kv_cache_configs
     )
+    cfg.byte_v2_raw_mutable_tail_q1 = any(
+        worker_cfg.byte_v2_raw_mutable_tail_q1 for worker_cfg in kv_cache_configs
+    )
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2230,9 +2278,16 @@ def get_kv_cache_configs(
     # required when ByteV2 persistent sidecars consume part of that budget.
     profiled_available_memory = list(available_memory)
     byte_v2_raw_fallback_enabled = byte_v2_hybrid_raw_fallback_enabled()
-    byte_v2_hybrid_active = byte_v2_raw_fallback_enabled and any(
+    has_byte_v2_layers = any(
         _get_num_byte_v2_layers(groups) > 0 for groups in projected_groups_per_worker
     )
+    if has_byte_v2_layers and not byte_v2_raw_fallback_enabled:
+        raise ValueError(
+            "ByteV2 V6-256 requires BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1; "
+            "the compact-only writer cannot preserve pages whose outlier "
+            "demand exceeds the 256-entry pool"
+        )
+    byte_v2_hybrid_active = byte_v2_raw_fallback_enabled and has_byte_v2_layers
     if byte_v2_hybrid_active:
         _validate_byte_v2_hybrid_runtime_config(vllm_config)
     raw_slots_override = (
@@ -2242,6 +2297,12 @@ def get_kv_cache_configs(
         byte_v2_raw_staging_slots()
         if byte_v2_hybrid_active
         else BYTE_V2_DEFAULT_RAW_STAGING_SLOTS
+    )
+    mutable_tail_enabled = (
+        byte_v2_hybrid_active and _byte_v2_raw_mutable_tail_q1_runtime_enabled()
+    )
+    mutable_tail_slots = (
+        vllm_config.scheduler_config.max_num_seqs if mutable_tail_enabled else 0
     )
     planned_compact_memory = list(available_memory)
 
@@ -2274,6 +2335,7 @@ def get_kv_cache_configs(
                     num_byte_v2_layers,
                     raw_slots_override,
                     raw_staging_slots,
+                    mutable_tail_slots,
                 )
                 if required_bytes > avail_mem:
                     raise ValueError(
@@ -2302,6 +2364,7 @@ def get_kv_cache_configs(
                 num_byte_v2_layers,
                 raw_slots_override,
                 raw_staging_slots,
+                mutable_tail_slots,
             )
             adjusted_memory.append(num_blocks * bytes_per_block)
         planned_compact_memory = adjusted_memory
@@ -2353,13 +2416,21 @@ def get_kv_cache_configs(
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 
         if byte_v2_raw_fallback_enabled and kv_cache_config.has_byte_v2_layers:
+            _validate_byte_v2_raw_fallback_slots(
+                min_num_blocks,
+                raw_slots_override,
+                mutable_tail_slots,
+            )
             raw_slots = get_byte_v2_raw_fallback_slots(
-                min_num_blocks, raw_slots_override
+                min_num_blocks,
+                raw_slots_override,
+                mutable_tail_slots,
             )
             sidecar_bytes = get_byte_v2_raw_fallback_sidecar_bytes(
                 min_num_blocks,
                 kv_cache_config.num_byte_v2_layers,
                 raw_slots_override,
+                mutable_tail_slots,
             )
             staging_workspace_bytes = get_byte_v2_raw_staging_workspace_bytes(
                 min_num_blocks,
@@ -2382,6 +2453,7 @@ def get_kv_cache_configs(
             kv_cache_config.byte_v2_raw_staging_workspace_bytes = (
                 staging_workspace_bytes
             )
+            kv_cache_config.byte_v2_raw_mutable_tail_q1 = mutable_tail_enabled
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

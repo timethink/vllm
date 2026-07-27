@@ -1,0 +1,282 @@
+{
+  "comparison_policy": {
+    "v5": "format-size reference only; historical V5 latency is not used for same-binary causal claims",
+    "v6_vs_raw": "same-run paired data"
+  },
+  "e2e": {
+    "bytev2": {
+      "all_performance_valid": true,
+      "capacity_tokens": 194112,
+      "label": "ByteV2 V6-256",
+      "median_engine_e2e_seconds": 27.604720998555422,
+      "median_tpot_ms": 38.16236085790085,
+      "median_ttft_ms": 22761.173009872437,
+      "runs": 2,
+      "total_preemptions": 0
+    },
+    "comparison": {
+      "abba_order": [
+        "raw",
+        "bytev2",
+        "bytev2",
+        "raw"
+      ],
+      "all_four_token_sequences_identical": true,
+      "v6_capacity_gain_vs_raw_percent": 27.223154362416114,
+      "v6_tpot_gap_vs_raw_percent": -5.069956014001442,
+      "v6_ttft_gap_vs_raw_percent": 1.1317186440906069
+    },
+    "raw": {
+      "all_performance_valid": true,
+      "capacity_tokens": 152576,
+      "label": "Raw FA2",
+      "median_engine_e2e_seconds": 27.60876328998711,
+      "median_tpot_ms": 40.20050898062314,
+      "median_ttft_ms": 22506.463170051575,
+      "runs": 2,
+      "total_preemptions": 0
+    },
+    "trace_objects_skipped": 4
+  },
+  "event_latency": {
+    "16384": {
+      "backends": {
+        "bytev2": {
+          "all_output_bitwise_equal": true,
+          "label": "ByteV2 V6-256",
+          "max_paired_gap_vs_raw_percent": -11.183459126675565,
+          "max_repetition_median_us": 118.73279809951782,
+          "mean_of_repetition_medians_us": 118.62015724182129,
+          "median_of_repetition_medians_us": 118.6303973197937,
+          "median_paired_gap_vs_raw_percent": -11.294032912731744,
+          "min_paired_gap_vs_raw_percent": -11.447173429852864,
+          "min_repetition_median_us": 118.42559576034546
+        },
+        "raw": {
+          "label": "Raw FA2",
+          "max_paired_gap_vs_raw_percent": 0.0,
+          "max_repetition_median_us": 133.73440504074097,
+          "mean_of_repetition_medians_us": 133.71392488479614,
+          "median_of_repetition_medians_us": 133.73440504074097,
+          "median_paired_gap_vs_raw_percent": 0.0,
+          "min_paired_gap_vs_raw_percent": 0.0,
+          "min_repetition_median_us": 133.6832046508789
+        },
+        "splitzip": {
+          "all_output_bitwise_equal": true,
+          "label": "SplitZip V5 envelope",
+          "max_paired_gap_vs_raw_percent": -10.264273026245386,
+          "max_repetition_median_us": 119.98719573020935,
+          "mean_of_repetition_medians_us": 119.87967729568481,
+          "median_of_repetition_medians_us": 119.88479495048523,
+          "median_paired_gap_vs_raw_percent": -10.356056159248306,
+          "min_paired_gap_vs_raw_percent": -10.455763070974555,
+          "min_repetition_median_us": 119.70560550689697
+        }
+      },
+      "calls_per_sample": 20,
+      "num_splits": 19,
+      "repetitions": 5,
+      "samples_per_repetition": 60,
+      "total_calls_per_repetition": 1200
+    },
+    "4096": {
+      "backends": {
+        "bytev2": {
+          "all_output_bitwise_equal": true,
+          "label": "ByteV2 V6-256",
+          "max_paired_gap_vs_raw_percent": 3.468213096075279,
+          "max_repetition_median_us": 51.123201847076416,
+          "mean_of_repetition_medians_us": 50.698240995407104,
+          "median_of_repetition_medians_us": 50.6879985332489,
+          "median_paired_gap_vs_raw_percent": 3.1512662459451057,
+          "min_paired_gap_vs_raw_percent": 2.574666911006962,
+          "min_repetition_median_us": 50.278401374816895
+        },
+        "raw": {
+          "label": "Raw FA2",
+          "max_paired_gap_vs_raw_percent": 0.0,
+          "max_repetition_median_us": 49.71520006656647,
+          "mean_of_repetition_medians_us": 49.187839925289154,
+          "median_of_repetition_medians_us": 49.10080134868622,
+          "median_paired_gap_vs_raw_percent": 0.0,
+          "min_paired_gap_vs_raw_percent": 0.0,
+          "min_repetition_median_us": 48.71679991483688
+        },
+        "splitzip": {
+          "all_output_bitwise_equal": true,
+          "label": "SplitZip V5 envelope",
+          "max_paired_gap_vs_raw_percent": 3.5714375244378926,
+          "max_repetition_median_us": 51.22560262680054,
+          "mean_of_repetition_medians_us": 50.75456142425537,
+          "median_of_repetition_medians_us": 50.6879985332489,
+          "median_paired_gap_vs_raw_percent": 3.2325280666832823,
+          "min_paired_gap_vs_raw_percent": 2.574666911006962,
+          "min_repetition_median_us": 50.380802154541016
+        }
+      },
+      "calls_per_sample": 20,
+      "num_splits": 16,
+      "repetitions": 5,
+      "samples_per_repetition": 60,
+      "total_calls_per_repetition": 1200
+    },
+    "65536": {
+      "backends": {
+        "bytev2": {
+          "all_output_bitwise_equal": true,
+          "label": "ByteV2 V6-256",
+          "max_paired_gap_vs_raw_percent": -12.605781978811203,
+          "max_repetition_median_us": 407.14240074157715,
+          "mean_of_repetition_medians_us": 406.6431951522827,
+          "median_of_repetition_medians_us": 406.57920837402344,
+          "median_paired_gap_vs_raw_percent": -12.712282609225529,
+          "min_paired_gap_vs_raw_percent": -12.826150903416146,
+          "min_repetition_median_us": 406.27198219299316
+        },
+        "raw": {
+          "label": "Raw FA2",
+          "max_paired_gap_vs_raw_percent": 0.0,
+          "max_repetition_median_us": 466.048002243042,
+          "mean_of_repetition_medians_us": 465.8687973022461,
+          "median_of_repetition_medians_us": 465.8560037612915,
+          "median_paired_gap_vs_raw_percent": 0.0,
+          "min_paired_gap_vs_raw_percent": 0.0,
+          "min_repetition_median_us": 465.74079990386963
+        },
+        "splitzip": {
+          "all_output_bitwise_equal": true,
+          "label": "SplitZip V5 envelope",
+          "max_paired_gap_vs_raw_percent": -11.716559738932963,
+          "max_repetition_median_us": 411.4432096481323,
+          "mean_of_repetition_medians_us": 410.6394386291504,
+          "median_of_repetition_medians_us": 410.8803987503052,
+          "median_paired_gap_vs_raw_percent": -11.822793230553842,
+          "min_paired_gap_vs_raw_percent": -12.053420468355869,
+          "min_repetition_median_us": 409.62560176849365
+        }
+      },
+      "calls_per_sample": 20,
+      "num_splits": 20,
+      "repetitions": 10,
+      "samples_per_repetition": 60,
+      "total_calls_per_repetition": 1200
+    }
+  },
+  "experiment": "ByteV2 V6-256 FA2 reader on NVIDIA A40",
+  "inputs": {
+    "e2e_glob": "reports/e2e_production/*.jsonl",
+    "event_glob": "reports/event_s{4096,16384,65536}_split*_rep*.json",
+    "ncu_metrics": [
+      "analysis/metrics_key_raw.json",
+      "analysis/metrics_key_v6.json"
+    ],
+    "pool_demand": "profile/bytev2-v6-pool-demand-a40-20260727/reports/pool_demand.json"
+  },
+  "ncu": {
+    "caveat": "NCU replay duration is diagnostic and must not replace CUDA-event or E2E latency.",
+    "comparison": {
+      "dram_read_reduction_percent": 19.26860850548815,
+      "long_scoreboard_reduction_percent": 45.67425489837037,
+      "ncu_replay_duration_gap_percent": -3.4669631070659346
+    },
+    "raw": {
+      "achieved_occupancy_percent": 8.437046929628226,
+      "dram_bytes_read": 299618688.0,
+      "dram_read_throughput_percent": 93.56497026093629,
+      "duration_ns": 460576.0,
+      "dynamic_shared_bytes": 82944,
+      "gpu_compute_memory_throughput_percent": 94.39062899718598,
+      "long_scoreboard_per_issue": 4.578127086131203,
+      "registers_per_thread": 252,
+      "short_scoreboard_per_issue": 0.1487984006981913,
+      "sm_throughput_percent": 33.551699549588676,
+      "theoretical_occupancy_percent": 8.333333333333332
+    },
+    "v6_256": {
+      "achieved_occupancy_percent": 15.553711011263186,
+      "dram_bytes_read": 241886336.0,
+      "dram_read_throughput_percent": 78.24660966981132,
+      "duration_ns": 444608.0,
+      "dynamic_shared_bytes": 51072,
+      "gpu_compute_memory_throughput_percent": 79.18511997827011,
+      "long_scoreboard_per_issue": 2.4871016512403012,
+      "registers_per_thread": 250,
+      "short_scoreboard_per_issue": 0.7944946519346754,
+      "sm_throughput_percent": 34.560923509052266,
+      "theoretical_occupancy_percent": 16.666666666666664
+    }
+  },
+  "pool_demand": {
+    "capture_model": "/mnt/sdb/yxz/ByteV2/Meta-Llama-3.1-8B-Instruct",
+    "capture_sha256": "c722d01849256af1a06fbaea07e86be61e4e8ab024f58dafdb18f7d28a7a4fe0",
+    "formats": {
+      "raw": {
+        "page_bytes": 65536,
+        "saving_vs_raw_percent": 0.0
+      },
+      "v5_1024_format_reference": {
+        "comparison_scope": "format-size reference only; not a same-binary latency A/B",
+        "page_bytes": 52096,
+        "saving_vs_raw_percent": 20.5078125
+      },
+      "v6_256": {
+        "page_bytes": 50560,
+        "saving_vs_raw_percent": 22.8515625
+      }
+    },
+    "limitations": [
+      "one Llama-3.1-8B model",
+      "one 512-token calibration and one 1024-token evaluation capture",
+      "batch one natural-text prefill KV only",
+      "no code, multilingual, long-context, multi-batch, or decode-tail sample",
+      "zero observed overflow does not remove the raw fallback requirement"
+    ],
+    "raw_fallback_still_required": true,
+    "splits": {
+      "calibration": {
+        "demand": {
+          "max": 29.0,
+          "mean": 3.98046875,
+          "min": 0.0,
+          "p50": 4.0,
+          "p90": 7.0,
+          "p95": 8.0,
+          "p99": 15.0,
+          "p999": 19.976999999999975
+        },
+        "escape_fraction": 0.00012135505676269531,
+        "max_tile_outliers": 3,
+        "pages": 1024,
+        "pool_256": {
+          "exact_capacity_pages": 0,
+          "headroom_at_max": 227,
+          "overflow_pages": 0,
+          "overflow_rate": 0.0
+        }
+      },
+      "evaluation": {
+        "demand": {
+          "max": 27.0,
+          "mean": 3.513671875,
+          "min": 0.0,
+          "p50": 3.0,
+          "p90": 6.0,
+          "p95": 7.0,
+          "p99": 9.0,
+          "p999": 17.952999999999975
+        },
+        "escape_fraction": 0.0001071542501449585,
+        "max_tile_outliers": 3,
+        "pages": 2048,
+        "pool_256": {
+          "exact_capacity_pages": 0,
+          "headroom_at_max": 229,
+          "overflow_pages": 0,
+          "overflow_rate": 0.0
+        }
+      }
+    }
+  },
+  "schema_version": 1
+}

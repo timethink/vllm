@@ -6312,6 +6312,8 @@ class GPUModelRunner(
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
             _byte_v2_raw_fallback_slots_override,
+            _byte_v2_raw_mutable_tail_q1_runtime_enabled,
+            _validate_byte_v2_raw_fallback_slots,
             get_byte_v2_raw_fallback_sidecar_bytes,
             get_byte_v2_raw_fallback_slots,
             get_byte_v2_raw_staging_workspace_bytes,
@@ -6337,9 +6339,23 @@ class GPUModelRunner(
         self.cache_config.num_gpu_blocks_override = saved_override
         if byte_v2_hybrid_raw_fallback_enabled() and minimal_config.has_byte_v2_layers:
             raw_slots_override = _byte_v2_raw_fallback_slots_override()
+            mutable_tail_enabled = _byte_v2_raw_mutable_tail_q1_runtime_enabled()
+            mutable_tail_slots = (
+                self.scheduler_config.max_num_seqs if mutable_tail_enabled else 0
+            )
+            # The temporary CUDA Graph namespace can be larger than the final
+            # memory-limited cache. Validate an explicit total only against the
+            # absolute minimum here; the final planner validates it again
+            # against the resolved production block count.
+            _validate_byte_v2_raw_fallback_slots(
+                0,
+                raw_slots_override,
+                mutable_tail_slots,
+            )
             raw_slots = get_byte_v2_raw_fallback_slots(
                 minimal_config.num_blocks,
                 raw_slots_override,
+                mutable_tail_slots,
             )
             staging_slots = byte_v2_raw_staging_slots()
             minimal_config.byte_v2_raw_fallback_slots = raw_slots
@@ -6348,6 +6364,7 @@ class GPUModelRunner(
                     minimal_config.num_blocks,
                     minimal_config.num_byte_v2_layers,
                     raw_slots_override,
+                    mutable_tail_slots,
                 )
             )
             minimal_config.byte_v2_raw_staging_slots = staging_slots
@@ -6357,6 +6374,7 @@ class GPUModelRunner(
                     staging_slots,
                 )
             )
+            minimal_config.byte_v2_raw_mutable_tail_q1 = mutable_tail_enabled
         self.initialize_kv_cache(minimal_config, is_profiling=True)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 

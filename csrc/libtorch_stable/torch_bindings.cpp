@@ -1009,7 +1009,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                           Tensor! free_raw_slot_count,"
       "                           Tensor! raw_pool_overflow,"
       "                           int[] tile_policy,"
-      "                           Tensor!? page_unsafe_flags) -> ()");
+      "                           Tensor!? page_unsafe_flags,"
+      "                           bool fuse_commit_finalize=False) -> ()");
 
   ops.def(
       "byte_v2_update_hybrid_cache_raw_staging_multi_token("
@@ -1027,7 +1028,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                           Tensor! free_raw_slot_count,"
       "                           Tensor! raw_pool_overflow,"
       "                           int[] tile_policy,"
-      "                           Tensor!? page_unsafe_flags) -> ()");
+      "                           Tensor!? page_unsafe_flags,"
+      "                           bool demote_safe_raw_pages=False) -> ()");
 
   ops.def(
       "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained("

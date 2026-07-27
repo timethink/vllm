@@ -123,13 +123,31 @@ def byte_v2_hybrid_cache_update_is_available() -> bool:
 
 
 def byte_v2_hybrid_raw_tail_q1_is_available() -> bool:
-    """Return whether the optional persistent raw-tail Q1 op is registered."""
-    return (
-        _find_op(
-            "_C_cache_ops",
-            "byte_v2_update_hybrid_cache_raw_tail_q1",
-        )
-        is not None
+    """Return whether raw-tail Q1 and safe Q>1 demotion are registered."""
+    q1_op = _find_op(
+        "_C_cache_ops",
+        "byte_v2_update_hybrid_cache_raw_tail_q1",
+    )
+    multi_token_op = _find_op(
+        "_C_cache_ops",
+        "byte_v2_update_hybrid_cache_raw_staging_multi_token",
+    )
+    if q1_op is None or multi_token_op is None:
+        return False
+
+    def has_schema_argument(op, argument_name: str) -> bool:
+        try:
+            arguments = op.default._schema.arguments
+        except (AttributeError, RuntimeError):
+            return False
+        return any(argument.name == argument_name for argument in arguments)
+
+    return has_schema_argument(
+        q1_op,
+        "fuse_commit_finalize",
+    ) and has_schema_argument(
+        multi_token_op,
+        "demote_safe_raw_pages",
     )
 
 
@@ -560,13 +578,15 @@ def byte_v2_update_hybrid_cache_raw_tail_q1(
     *,
     tile_policy: Sequence[int],
     page_unsafe_flags: torch.Tensor | None = None,
+    fuse_commit_finalize: bool = False,
 ) -> None:
     """Append Q1 to a raw tail and seal a full page on the current CUDA stream.
 
     Update and attention must stay ordered on that stream; this experimental
     path does not synchronize concurrent cache readers on other streams.
     """
-    _require_op("_C_cache_ops", "byte_v2_update_hybrid_cache_raw_tail_q1")(
+    op = _require_op("_C_cache_ops", "byte_v2_update_hybrid_cache_raw_tail_q1")
+    args = (
         key,
         value,
         raw_staging,
@@ -585,6 +605,13 @@ def byte_v2_update_hybrid_cache_raw_tail_q1(
         list(tile_policy),
         page_unsafe_flags,
     )
+    if fuse_commit_finalize:
+        op(*args, True)
+    else:
+        # Preserve compatibility with the pre-fused-finalize schema. The
+        # capability gate requires the trailing bool before enabling raw-tail
+        # Q1, but direct wrapper callers may still use the legacy operation.
+        op(*args)
 
 
 def byte_v2_update_hybrid_cache_raw_staging_multi_token(
@@ -606,12 +633,14 @@ def byte_v2_update_hybrid_cache_raw_staging_multi_token(
     *,
     tile_policy: Sequence[int],
     page_unsafe_flags: torch.Tensor | None = None,
+    demote_safe_raw_pages: bool = False,
 ) -> None:
-    """Run an exact compact/raw hybrid multi-token update in three kernels."""
-    _require_op(
+    """Run an exact compact/raw hybrid multi-token cache update."""
+    op = _require_op(
         "_C_cache_ops",
         "byte_v2_update_hybrid_cache_raw_staging_multi_token",
-    )(
+    )
+    args = (
         key,
         value,
         raw_staging,
@@ -630,6 +659,12 @@ def byte_v2_update_hybrid_cache_raw_staging_multi_token(
         list(tile_policy),
         page_unsafe_flags,
     )
+    if demote_safe_raw_pages:
+        op(*args, True)
+    else:
+        # Preserve compatibility with the pre-demotion schema. The capability
+        # gate keeps raw-tail Q1 disabled unless the trailing bool is present.
+        op(*args)
 
 
 def byte_v2_update_hybrid_cache_raw_staging_multi_token_retained(
