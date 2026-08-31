@@ -46,9 +46,13 @@ def _zero_kv_blocks_kernel(
     N_SEGS: tl.constexpr,
     PAGE_STRIDE_EL: tl.constexpr,
     ZERO_SIZE_EL: tl.constexpr,
+    INIT_PREFIX_WORDS: tl.constexpr,
+    INIT_PREFIX_WORD_VALUE: tl.constexpr,
+    INIT_WORD_INDEX: tl.constexpr,
+    INIT_WORD_VALUE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Zero a prefix of KV cache blocks across all segments in one launch.
+    """Reset KV cache block metadata across all segments in one launch.
 
     Each segment is a contiguous region of one block's data.  For backends
     where blocks are outermost (block_dim=0) there is one segment per
@@ -59,7 +63,10 @@ def _zero_kv_blocks_kernel(
     allowing segments to live in different CUDA allocations.
 
     PAGE_STRIDE_EL selects consecutive logical blocks, while ZERO_SIZE_EL is
-    the prefix reset for each block. Programs are mapped as
+    the metadata range reset for each block. INIT_PREFIX_WORDS optionally
+    replaces an initial word prefix with a format-specific empty descriptor.
+    INIT_WORD_INDEX can initialize one additional format/version word; the
+    remaining words are zero. Programs are mapped as
     (block_index, seg_index, chunk_index).
     """
     pid = tl.program_id(0)
@@ -78,7 +85,21 @@ def _zero_kv_blocks_kernel(
         block_id.to(tl.int64) * PAGE_STRIDE_EL + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
-    tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
+    values = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    metadata_cols = chunk_index.to(tl.int64) * BLOCK_SIZE + cols
+    if INIT_PREFIX_WORDS > 0:
+        values = tl.where(
+            metadata_cols < INIT_PREFIX_WORDS,
+            INIT_PREFIX_WORD_VALUE,
+            values,
+        )
+    if INIT_WORD_INDEX >= 0:
+        values = tl.where(
+            metadata_cols == INIT_WORD_INDEX,
+            INIT_WORD_VALUE,
+            values,
+        )
+    tl.store(ptr + offset + cols, values)
 
 
 class KVBlockZeroer:
@@ -113,7 +134,9 @@ class KVBlockZeroer:
         """
         self.device = device
         self.pin_memory = pin_memory
-        self._metas: list[tuple[torch.Tensor, int, int, int, int]] = []
+        self._metas: list[
+            tuple[torch.Tensor, int, int, int, int, int, int, int, int]
+        ] = []
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
@@ -121,7 +144,9 @@ class KVBlockZeroer:
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
-        segment_groups: dict[tuple[int, int], list[int]] = defaultdict(list)
+        segment_groups: dict[tuple[int, int, int, int, int, int], list[int]] = (
+            defaultdict(list)
+        )
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -156,11 +181,38 @@ class KVBlockZeroer:
                 page_stride_el = kernel_block_el * ratio
                 if isinstance(spec, ByteV2FullAttentionSpec):
                     zero_size_bytes = spec.page_metadata_size_bytes
+                    zero_offset_bytes = spec.page_metadata_offset_bytes
                     assert zero_size_bytes % 4 == 0
-                    assert zero_size_bytes <= cur_bytes
+                    assert zero_offset_bytes % 4 == 0
+                    assert zero_offset_bytes + zero_size_bytes <= cur_bytes
                     zero_size_el = zero_size_bytes // 4
+                    init_prefix_words = 0
+                    init_prefix_word_value = 0
+                    init_word_index = -1
+                    init_word_value = 0
+                    if zero_offset_bytes:
+                        from vllm.v1.attention.backends.byte_v2_static_w16 import (
+                            STATIC_W16_CANONICAL_METADATA_STATUS,
+                            STATIC_W16_HEADER_BYTES,
+                            STATIC_W16_HEADER_OFFSET_BYTES,
+                            STATIC_W16_STATUS_OFFSET_BYTES,
+                            byte_v2_static_w16_requested,
+                        )
+
+                        assert byte_v2_static_w16_requested()
+                        assert zero_offset_bytes == STATIC_W16_HEADER_OFFSET_BYTES
+                        assert zero_size_bytes == STATIC_W16_HEADER_BYTES
+                        init_word_index = (
+                            STATIC_W16_STATUS_OFFSET_BYTES - zero_offset_bytes
+                        ) // 4
+                        init_word_value = STATIC_W16_CANONICAL_METADATA_STATUS
                 else:
+                    zero_offset_bytes = 0
                     zero_size_el = page_stride_el
+                    init_prefix_words = 0
+                    init_prefix_word_value = 0
+                    init_word_index = -1
+                    init_word_value = 0
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [
@@ -174,21 +226,44 @@ class KVBlockZeroer:
                     if isinstance(spec, ByteV2FullAttentionSpec):
                         # A logical scheduler block can contain multiple
                         # kernel pages under virtual block splitting. Reset
-                        # the metadata prefix of every constituent page while
+                        # the metadata range of every constituent page while
                         # retaining the logical-block stride.
                         for subpage in range(ratio):
-                            segment_groups[(page_stride_el, zero_size_el)].append(
-                                dp + off_bytes + subpage * cur_bytes
+                            segment_groups[
+                                (
+                                    page_stride_el,
+                                    zero_size_el,
+                                    init_prefix_words,
+                                    init_prefix_word_value,
+                                    init_word_index,
+                                    init_word_value,
+                                )
+                            ].append(
+                                dp + off_bytes + subpage * cur_bytes + zero_offset_bytes
                             )
                     else:
-                        segment_groups[(page_stride_el, zero_size_el)].append(
-                            dp + off_bytes
-                        )
+                        segment_groups[
+                            (
+                                page_stride_el,
+                                zero_size_el,
+                                init_prefix_words,
+                                init_prefix_word_value,
+                                init_word_index,
+                                init_word_value,
+                            )
+                        ].append(dp + off_bytes)
 
         if not segment_groups:
             return
 
-        for (page_stride_el, zero_size_el), seg_addrs in segment_groups.items():
+        for (
+            page_stride_el,
+            zero_size_el,
+            init_prefix_words,
+            init_prefix_word_value,
+            init_word_index,
+            init_word_value,
+        ), seg_addrs in segment_groups.items():
             blk_size = min(largest_power_of_2_divisor(zero_size_el), 1024)
             self._metas.append(
                 (
@@ -197,6 +272,10 @@ class KVBlockZeroer:
                     zero_size_el,
                     blk_size,
                     len(seg_addrs),
+                    init_prefix_words,
+                    init_prefix_word_value,
+                    init_word_index,
+                    init_word_value,
                 )
             )
         self._id_cap = 8192
@@ -206,6 +285,13 @@ class KVBlockZeroer:
             pin_memory=self.pin_memory,
         )
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
+
+        # CUDA graph dummy block tables are zero-filled and therefore address
+        # physical block 0 before the scheduler allocates any real block. An
+        # all-zero W16 header is intentionally invalid, so seed only that dummy
+        # page with the canonical empty/versioned state before graph warmup.
+        if any(meta[5] > 0 or meta[7] >= 0 for meta in self._metas):
+            self.zero_block_ids([0])
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
@@ -232,6 +318,10 @@ class KVBlockZeroer:
             zero_size_el,
             blk_size,
             n_segs,
+            init_prefix_words,
+            init_prefix_word_value,
+            init_word_index,
+            init_word_value,
         ) in self._metas:
             grid = (n_blocks * n_segs * (zero_size_el // blk_size),)
             _zero_kv_blocks_kernel[grid](
@@ -241,6 +331,10 @@ class KVBlockZeroer:
                 N_SEGS=n_segs,
                 PAGE_STRIDE_EL=page_stride_el,
                 ZERO_SIZE_EL=zero_size_el,
+                INIT_PREFIX_WORDS=init_prefix_words,
+                INIT_PREFIX_WORD_VALUE=init_prefix_word_value,
+                INIT_WORD_INDEX=init_word_index,
+                INIT_WORD_VALUE=init_word_value,
                 BLOCK_SIZE=blk_size,
             )
 

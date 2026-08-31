@@ -43,13 +43,20 @@ _BYTE_V2_PROFILE_OP_NAMES = (
     "byte_v2_update_hybrid_cache_raw_tail_q1",
     "byte_v2_update_hybrid_cache_raw_staging_multi_token",
     "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained",
+    "byte_v2_static_w16_hydrate_raw_staging_from_hybrid_cache",
+    "byte_v2_static_w16_commit_raw_staging_to_hybrid_cache",
+    "byte_v2_static_w16_update_hybrid_cache_raw_tail_q1",
     "byte_v2_test_force_promote_raw_staging_q1",
     "byte_v2_update_cache_unsafe_flags",
     "byte_v2_paged_decode_attention",
     "byte_v2_paged_decode_attention_split_k",
     "byte_v2_paged_decode_attention_split_k_guarded",
     "byte_v2_fa2_hybrid_paged_decode_attention",
+    "byte_v2_static_w16_fa2_paged_attention",
+    "byte_v2_static_w16_fa2_paged_attention_with_lse",
+    "merge_attn_states",
     "byte_v2_fa2_direct_paged_prefill_attention",
+    "byte_v2_fa2_raw_staging_attention_with_lse",
     "byte_v2_fa2_raw_staging_prefill_attention",
     "byte_v2_reset_raw_fallback_pages",
     "byte_v2_speculative_verify_q4",
@@ -100,7 +107,24 @@ def parse_args() -> argparse.Namespace:
         help="Draft-token counts. Zero is the non-speculative reference.",
     )
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--engine-max-num-seqs",
+        type=int,
+        help=(
+            "Configure engine max_num_seqs independently of the measured batch. "
+            "The default remains --batch-size."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument(
+        "--warmup-max-tokens",
+        type=int,
+        default=1,
+        help=(
+            "Generate this many tokens in the untimed warmup. The default "
+            "preserves the historical one-token protocol."
+        ),
+    )
     parser.add_argument(
         "--engine-max-model-len",
         type=int,
@@ -176,6 +200,16 @@ def parse_args() -> argparse.Namespace:
         help="Disable prefix caching so warmup cannot cache measured prompts.",
     )
     parser.add_argument(
+        "--identical-prompts",
+        action="store_true",
+        help="Use one identical synthetic prompt for every request in the batch.",
+    )
+    parser.add_argument(
+        "--enable-cascade-attn",
+        action="store_true",
+        help="Allow the backend to split a scheduler-proven shared prefix.",
+    )
+    parser.add_argument(
         "--diagnose-outlier-pool",
         action="store_true",
         help=(
@@ -238,6 +272,8 @@ def parse_args() -> argparse.Namespace:
         "engine_max_model_len",
         "max_num_batched_tokens",
         "kv_cache_memory_bytes",
+        "warmup_max_tokens",
+        "engine_max_num_seqs",
     ):
         value = getattr(args, name)
         if value is not None and value <= 0:
@@ -246,6 +282,10 @@ def parse_args() -> argparse.Namespace:
         args.diagnose_outlier_pool or args.diagnose_forced_raw_lifecycle
     ):
         parser.error("--e2e-only cannot be combined with replay-dependent diagnostics")
+    if args.identical_prompts and args.sharegpt_rows_dir:
+        parser.error("--identical-prompts cannot be combined with --sharegpt-rows-dir")
+    if args.enable_cascade_attn and args.disable_prefix_caching:
+        parser.error("--enable-cascade-attn requires prefix caching")
     if not 0 <= args.capture_logprobs <= 20:
         parser.error("--capture-logprobs must be between 0 and 20")
     if args.diagnose_forced_raw_lifecycle:
@@ -393,6 +433,15 @@ class ProfileCollector:
         def cached_prefill_q(args: tuple, kwargs: dict) -> str:
             return metadata_q(args, kwargs).replace("forward", "prefill_from_cache")
 
+        def cascade_q(args: tuple, kwargs: dict) -> str:
+            metadata = next(
+                (arg for arg in args if hasattr(arg, "use_cascade")),
+                kwargs.get("attn_metadata"),
+            )
+            selected = bool(getattr(metadata, "use_cascade", False))
+            q_len = getattr(metadata, "max_query_len", "unknown")
+            return f"byte_v2.cascade.selected{int(selected)}.q{q_len}"
+
         def ragged_candidate_q(args: tuple, kwargs: dict) -> str:
             label = metadata_q(args, kwargs).replace("forward", "ragged_candidate")
             if not self.enabled:
@@ -440,6 +489,11 @@ class ProfileCollector:
             byte_v2_attn.ByteV2AttentionImpl,
             "_forward_prefill_from_cache",
             cached_prefill_q,
+        )
+        self._patch_method(
+            byte_v2_attn.ByteV2AttentionImpl,
+            "_forward_static_w16_cascade",
+            cascade_q,
         )
         self._patch_method(
             byte_v2_attn.ByteV2AttentionImpl,
@@ -965,6 +1019,185 @@ def _collect_hybrid_raw_fallback_state(llm) -> dict[str, Any]:
     return result
 
 
+def _collect_static_w8_writer_state(llm) -> dict[str, Any]:
+    """Attest which production ByteV2 writer table each layer consumed."""
+    engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(engine, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    static_forward_context = getattr(compilation_config, "static_forward_context", {})
+
+    layers = []
+    codebook_records = set()
+    expected_layer_counts = set()
+    configured_layer_indices = set()
+    for layer_name, module in sorted(static_forward_context.items()):
+        impl = getattr(module, "impl", None)
+        if impl is None or not hasattr(impl, "static_w8_codebook"):
+            continue
+        codebook = impl.static_w8_codebook
+        manager = getattr(impl, "raw_staging_manager", None)
+        bases = getattr(manager, "static_w8_bases", (-1, -1))
+        layer_index = getattr(impl, "static_w8_layer_index", None)
+        configured = codebook is not None and layer_index is not None
+        if configured:
+            expected_bases = codebook.bases_for_layer(layer_index)
+            if tuple(bases) != expected_bases:
+                raise RuntimeError(
+                    "ByteV2 Static-W8 runtime bases do not match the frozen "
+                    f"table: layer={layer_name}, runtime={bases}, "
+                    f"expected={expected_bases}"
+                )
+            codebook_records.add(
+                (
+                    codebook.path,
+                    codebook.file_sha256,
+                    codebook.tables_sha256,
+                )
+            )
+            expected_layer_counts.add(len(codebook.bases))
+            configured_layer_indices.add(layer_index)
+        layers.append(
+            {
+                "name": layer_name,
+                "layer_index": layer_index,
+                "bases": list(bases),
+                "configured": configured,
+            }
+        )
+
+    enabled = bool(codebook_records)
+    configured_layer_count = sum(layer["configured"] for layer in layers)
+    if enabled:
+        if len(codebook_records) != 1 or len(expected_layer_counts) != 1:
+            raise RuntimeError(
+                "ByteV2 Static-W8 layers disagree on the production codebook"
+            )
+        expected_layer_count = next(iter(expected_layer_counts))
+        if len(layers) != expected_layer_count or configured_layer_count != len(layers):
+            raise RuntimeError(
+                "ByteV2 Static-W8 did not configure every production layer: "
+                f"observed={len(layers)}, configured={configured_layer_count}, "
+                f"expected={expected_layer_count}"
+            )
+        if configured_layer_indices != set(range(expected_layer_count)):
+            raise RuntimeError(
+                "ByteV2 Static-W8 layer identities are not a complete unique "
+                f"range: {configured_layer_indices}"
+            )
+        codebook_path, file_sha256, tables_sha256 = next(iter(codebook_records))
+    else:
+        codebook_path = None
+        file_sha256 = None
+        tables_sha256 = None
+    return {
+        "enabled": enabled,
+        "requested_path": os.environ.get("BYTE_V2_STATIC_W8_CODEBOOK"),
+        "layer_count": len(layers),
+        "configured_layer_count": configured_layer_count,
+        "codebook_path": codebook_path,
+        "file_sha256": file_sha256,
+        "tables_sha256": tables_sha256,
+        "layers": layers,
+    }
+
+
+def _collect_static_w16_writer_state(llm) -> dict[str, Any]:
+    """Attest the per-layer Static-W16 codebook consumed at runtime."""
+    engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(engine, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    static_forward_context = getattr(compilation_config, "static_forward_context", {})
+
+    layers = []
+    codebook_records = set()
+    expected_layer_counts = set()
+    configured_layer_indices = set()
+    page_size_bytes = set()
+    for layer_name, module in sorted(static_forward_context.items()):
+        impl = getattr(module, "impl", None)
+        if impl is None or not hasattr(impl, "static_w16_codebook"):
+            continue
+        codebook = impl.static_w16_codebook
+        manager = getattr(impl, "raw_staging_manager", None)
+        bases = getattr(manager, "static_w16_bases", (-1, -1))
+        layer_index = getattr(impl, "static_w16_layer_index", None)
+        configured = codebook is not None and layer_index is not None
+        if configured:
+            expected_bases = codebook.bases_for_layer(layer_index)
+            if tuple(bases) != expected_bases:
+                raise RuntimeError(
+                    "ByteV2 Static-W16 runtime bases do not match the frozen "
+                    f"table: layer={layer_name}, runtime={bases}, "
+                    f"expected={expected_bases}"
+                )
+            codebook_records.add(
+                (
+                    codebook.path,
+                    codebook.file_sha256,
+                    codebook.bases_sha256,
+                )
+            )
+            expected_layer_counts.add(len(codebook.bases))
+            configured_layer_indices.add(layer_index)
+            page_size_bytes.add(int(getattr(impl, "fa2_page_size_bytes", -1)))
+        layers.append(
+            {
+                "name": layer_name,
+                "layer_index": layer_index,
+                "bases": list(bases),
+                "page_size_bytes": int(getattr(impl, "fa2_page_size_bytes", -1)),
+                "configured": configured,
+            }
+        )
+
+    enabled = bool(codebook_records)
+    configured_layer_count = sum(layer["configured"] for layer in layers)
+    if enabled:
+        if (
+            len(codebook_records) != 1
+            or len(expected_layer_counts) != 1
+            or len(page_size_bytes) != 1
+        ):
+            raise RuntimeError(
+                "ByteV2 Static-W16 layers disagree on codebook or page geometry"
+            )
+        expected_layer_count = next(iter(expected_layer_counts))
+        if len(layers) != expected_layer_count or configured_layer_count != len(layers):
+            raise RuntimeError(
+                "ByteV2 Static-W16 did not configure every production layer: "
+                f"observed={len(layers)}, configured={configured_layer_count}, "
+                f"expected={expected_layer_count}"
+            )
+        if configured_layer_indices != set(range(expected_layer_count)):
+            raise RuntimeError(
+                "ByteV2 Static-W16 layer identities are not a complete unique "
+                f"range: {configured_layer_indices}"
+            )
+        codebook_path, file_sha256, bases_sha256 = next(iter(codebook_records))
+        resolved_page_size_bytes = next(iter(page_size_bytes))
+        if resolved_page_size_bytes != 49_792:
+            raise RuntimeError(
+                "ByteV2 Static-W16 runtime page geometry drifted: "
+                f"{resolved_page_size_bytes} != 49792"
+            )
+    else:
+        codebook_path = None
+        file_sha256 = None
+        bases_sha256 = None
+        resolved_page_size_bytes = None
+    return {
+        "enabled": enabled,
+        "requested_path": os.environ.get("BYTE_V2_STATIC_W16_CODEBOOK"),
+        "layer_count": len(layers),
+        "configured_layer_count": configured_layer_count,
+        "codebook_path": codebook_path,
+        "file_sha256": file_sha256,
+        "bases_sha256": bases_sha256,
+        "page_size_bytes": resolved_page_size_bytes,
+        "layers": layers,
+    }
+
+
 def _forced_raw_phase_result(
     armed_state: dict[str, Any],
     completed_state: dict[str, Any],
@@ -1045,6 +1278,9 @@ def _collect_kv_cache_plan(llm) -> dict[str, Any]:
     )
     sidecar_bytes = int(getattr(config, "byte_v2_raw_fallback_sidecar_bytes", 0))
     workspace_bytes = int(getattr(config, "byte_v2_raw_staging_workspace_bytes", 0))
+    decoded_prefix_cache_bytes = int(
+        getattr(config, "byte_v2_decoded_prefix_cache_bytes", 0)
+    )
     block_size = int(
         getattr(
             getattr(getattr(model_runner, "vllm_config", None), "cache_config", None),
@@ -1060,14 +1296,30 @@ def _collect_kv_cache_plan(llm) -> dict[str, Any]:
         "compact_tensor_bytes": compact_tensor_bytes,
         "raw_fallback_sidecar_bytes": sidecar_bytes,
         "raw_staging_workspace_bytes": workspace_bytes,
-        "total_planned_bytes": (compact_tensor_bytes + sidecar_bytes + workspace_bytes),
+        "decoded_prefix_cache_bytes": decoded_prefix_cache_bytes,
+        "total_planned_bytes": (
+            compact_tensor_bytes
+            + sidecar_bytes
+            + workspace_bytes
+            + decoded_prefix_cache_bytes
+        ),
         "num_byte_v2_layers": int(getattr(config, "num_byte_v2_layers", 0)),
         "raw_fallback_slots_per_layer": int(
             getattr(config, "byte_v2_raw_fallback_slots", 0)
         ),
         "raw_staging_slots": int(getattr(config, "byte_v2_raw_staging_slots", 0)),
+        "decoded_prefix_cache_slots_per_layer": int(
+            getattr(config, "byte_v2_decoded_prefix_cache_slots", 0)
+        ),
         "raw_mutable_tail_q1": bool(
             getattr(config, "byte_v2_raw_mutable_tail_q1", False)
+        ),
+        "static_w16_retain_cascade_q16": bool(
+            getattr(
+                config,
+                "byte_v2_static_w16_retain_cascade_q16",
+                False,
+            )
         ),
     }
 
@@ -1246,9 +1498,10 @@ def _build_llm(args: argparse.Namespace, backend: str, spec_tokens: int):
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
-        max_num_seqs=args.batch_size,
+        max_num_seqs=args.engine_max_num_seqs or args.batch_size,
         block_size=16,
         enable_prefix_caching=not args.disable_prefix_caching,
+        disable_cascade_attn=not args.enable_cascade_attn,
         disable_log_stats=False,
         speculative_config=speculative_config,
         attention_config={"backend": attention_backend},
@@ -1348,6 +1601,7 @@ def _serialize_request_metrics(outputs) -> list[dict[str, Any]]:
         result.append(
             {
                 "request_id": str(output.request_id),
+                "num_cached_tokens": int(output.num_cached_tokens or 0),
                 "first_token_latency": (
                     float(metrics.first_token_latency) if metrics else None
                 ),
@@ -1606,7 +1860,11 @@ def _run_worker(args: argparse.Namespace) -> None:
         logprobs=args.capture_logprobs or None,
         ignore_eos=args.ignore_eos,
     )
-    cache_fill_params = SamplingParams(max_tokens=1, temperature=0.0)
+    cache_fill_params = SamplingParams(
+        max_tokens=args.warmup_max_tokens,
+        temperature=0.0,
+        ignore_eos=True,
+    )
 
     try:
         for context_index, context_len in enumerate(args.context_lens):
@@ -1620,14 +1878,24 @@ def _run_worker(args: argparse.Namespace) -> None:
                     target_lens=args.sharegpt_target_lens,
                 )
             else:
-                prompt_token_ids = [
-                    _make_prompt_token_ids(
+                if args.identical_prompts:
+                    shared_prompt = _make_prompt_token_ids(
                         args.model,
                         context_len,
-                        offset=context_index * 11 + request_idx * 7,
+                        offset=context_index * 11,
                     )
-                    for request_idx in range(args.batch_size)
-                ]
+                    prompt_token_ids = [
+                        shared_prompt.copy() for _ in range(args.batch_size)
+                    ]
+                else:
+                    prompt_token_ids = [
+                        _make_prompt_token_ids(
+                            args.model,
+                            context_len,
+                            offset=context_index * 11 + request_idx * 7,
+                        )
+                        for request_idx in range(args.batch_size)
+                    ]
             prompts = [
                 TokensPrompt(prompt_token_ids=token_ids)
                 for token_ids in prompt_token_ids
@@ -1784,6 +2052,34 @@ def _run_worker(args: argparse.Namespace) -> None:
                 spec_tokens,
             )
             kv_cache_plan = _collect_kv_cache_plan(llm)
+            static_w8_writer_state = _collect_static_w8_writer_state(llm)
+            static_w16_writer_state = _collect_static_w16_writer_state(llm)
+            static_w8_requested = (
+                os.environ.get("BYTE_V2_STATIC_W8_CODEBOOK") is not None
+            )
+            static_w16_requested = (
+                os.environ.get("BYTE_V2_STATIC_W16_CODEBOOK") is not None
+            )
+            if (
+                args.backend == "byte_v2"
+                and static_w8_writer_state["enabled"] != static_w8_requested
+            ):
+                raise RuntimeError(
+                    "ByteV2 Static-W8 runtime attestation disagrees with the "
+                    f"requested mode: requested={static_w8_requested}, "
+                    f"state={static_w8_writer_state}"
+                )
+            if (
+                args.backend == "byte_v2"
+                and static_w16_writer_state["enabled"] != static_w16_requested
+            ):
+                raise RuntimeError(
+                    "ByteV2 Static-W16 runtime attestation disagrees with the "
+                    f"requested mode: requested={static_w16_requested}, "
+                    f"state={static_w16_writer_state}"
+                )
+            if static_w8_writer_state["enabled"] and static_w16_writer_state["enabled"]:
+                raise RuntimeError("Static-W8 and Static-W16 cannot both be enabled")
 
             result = {
                 "backend": args.backend,
@@ -1801,7 +2097,11 @@ def _run_worker(args: argparse.Namespace) -> None:
                     prompt_token_ids if args.capture_logprobs else None
                 ),
                 "batch_size": args.batch_size,
+                "engine_max_num_seqs": (args.engine_max_num_seqs or args.batch_size),
+                "identical_prompts": args.identical_prompts,
+                "cascade_attention_enabled": args.enable_cascade_attn,
                 "max_tokens": args.max_tokens,
+                "warmup_max_tokens": args.warmup_max_tokens,
                 "ignore_eos": args.ignore_eos,
                 "engine_max_model_len": max_model_len,
                 "max_num_batched_tokens": max_num_batched_tokens,
@@ -1849,6 +2149,8 @@ def _run_worker(args: argparse.Namespace) -> None:
                     token_ids,
                     kv_cache_plan,
                 ),
+                "static_w8_writer_state": static_w8_writer_state,
+                "static_w16_writer_state": static_w16_writer_state,
                 "hybrid_raw_fallback_state": (
                     forced_raw_profile_completed
                     if args.diagnose_forced_raw_lifecycle
@@ -1906,6 +2208,8 @@ def _run_child(
         *[str(value) for value in args.context_lens],
         "--max-tokens",
         str(args.max_tokens),
+        "--warmup-max-tokens",
+        str(args.warmup_max_tokens),
         "--batch-size",
         str(args.batch_size),
         "--gpu-memory-utilization",
@@ -1915,6 +2219,8 @@ def _run_child(
         "--prompt-lookup-max",
         str(args.prompt_lookup_max),
     ]
+    if args.engine_max_num_seqs is not None:
+        cmd.extend(["--engine-max-num-seqs", str(args.engine_max_num_seqs)])
     if args.engine_max_model_len is not None:
         cmd.extend(["--engine-max-model-len", str(args.engine_max_model_len)])
     if args.max_num_batched_tokens is not None:
@@ -1935,6 +2241,10 @@ def _run_child(
             )
     if args.disable_prefix_caching:
         cmd.append("--disable-prefix-caching")
+    if args.identical_prompts:
+        cmd.append("--identical-prompts")
+    if args.enable_cascade_attn:
+        cmd.append("--enable-cascade-attn")
     if args.ignore_eos:
         cmd.append("--ignore-eos")
     if args.e2e_only:

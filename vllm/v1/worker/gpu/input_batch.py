@@ -93,6 +93,11 @@ class InputBatch:
     # Whether any requests in batch use structured output.
     has_structured_output_reqs: bool
 
+    # [kv_cache_group_id][attention_group_id], or None when cascade is unused.
+    cascade_attn_prefix_lens: list[list[int]] | None = None
+    # Host generation key used by bounded decoded-prefix caches.
+    cascade_prefix_cache_key: int = 0
+
     @classmethod
     def make_dummy(
         cls,

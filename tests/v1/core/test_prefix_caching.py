@@ -36,6 +36,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
+    ByteV2FullAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -124,6 +125,26 @@ def make_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
             )
         ],
     )
+
+
+def make_byte_v2_kv_cache_config(block_size: int, num_blocks: int) -> KVCacheConfig:
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                ByteV2FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=8,
+                    head_size=128,
+                    dtype=torch.uint8,
+                ),
+            )
+        ],
+    )
+    config.byte_v2_raw_fallback_slots = 1
+    return config
 
 
 def make_kv_cache_config_hybrid_model(
@@ -1958,6 +1979,69 @@ def test_reset_prefix_cache():
     assert manager.reset_prefix_cache()
     assert not manager.block_pool.cached_block_hash_to_block
     assert all([blk.block_hash is None for blk in manager.block_pool.blocks])
+
+
+def test_byte_v2_prefix_hit_retains_sidecar_until_physical_block_reuse(
+    monkeypatch,
+):
+    """Shared ByteV2 blocks are reset only after prefix-cache eviction."""
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    block_size = 16
+    manager = make_kv_cache_manager(
+        make_byte_v2_kv_cache_config(block_size, 8),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    prompt_token_ids = list(range(2 * block_size + 1))
+
+    first = make_request("first", prompt_token_ids, block_size, sha256)
+    first_blocks = manager.allocate_slots(first, len(prompt_token_ids))
+    assert first_blocks is not None
+    assert first_blocks.get_block_ids() == ([1, 2, 3],)
+    assert manager.take_new_block_ids() == [1, 2, 3]
+
+    second = make_request("second", prompt_token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(second)
+    assert computed_blocks.get_block_ids() == ([1, 2],)
+    assert num_computed_tokens == 2 * block_size
+    second_tail = manager.allocate_slots(
+        second,
+        len(prompt_token_ids) - num_computed_tokens,
+        num_computed_tokens,
+        computed_blocks,
+    )
+    assert second_tail is not None
+    assert second_tail.get_block_ids() == ([4],)
+    assert manager.get_block_ids(second.request_id) == ([1, 2, 4],)
+    assert manager.take_new_block_ids() == [4]
+
+    # Releasing either request must not reset the shared full prefix blocks.
+    manager.free(first)
+    assert manager.take_new_block_ids() == [3]
+    manager.free(second)
+    assert manager.take_new_block_ids() == [4]
+
+    # Filling the pool forces the cached prefix blocks to be evicted and reused.
+    # Only then are their physical IDs sent to the worker-side sidecar reset.
+    replacement = make_request(
+        "replacement",
+        [99] * (7 * block_size),
+        block_size,
+        sha256,
+    )
+    replacement_blocks = manager.allocate_slots(
+        replacement, len(replacement.prompt_token_ids)
+    )
+    assert replacement_blocks is not None
+    reused_ids = manager.take_new_block_ids()
+    assert set(reused_ids) == set(range(1, 8))
+    assert {1, 2}.issubset(reused_ids)
+
+    miss = make_request("miss", prompt_token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(miss)
+    assert not computed_blocks.blocks[0]
+    assert num_computed_tokens == 0
 
 
 @pytest.mark.parametrize("byte_v2_raw_fallback_slots", [0, 1])

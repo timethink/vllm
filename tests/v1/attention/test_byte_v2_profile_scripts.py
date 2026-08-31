@@ -22,6 +22,11 @@ HYBRID_PROFILE_OPS = {
     "byte_v2_update_hybrid_cache_raw_staging_multi_token",
     "byte_v2_update_hybrid_cache_raw_staging_multi_token_retained",
 }
+STATIC_W16_CASCADE_PROFILE_OPS = {
+    "byte_v2_fa2_raw_staging_attention_with_lse",
+    "byte_v2_static_w16_fa2_paged_attention_with_lse",
+    "merge_attn_states",
+}
 
 
 def _fake_llm(static_forward_context, model_runner=None):
@@ -66,6 +71,13 @@ def _fake_store(
 @pytest.mark.parametrize("module", PROFILE_MODULES)
 def test_byte_v2_profile_known_ops_include_hybrid_runtime_ops(module):
     assert set(module._BYTE_V2_PROFILE_OP_NAMES) >= HYBRID_PROFILE_OPS
+
+
+def test_speculative_profile_known_ops_include_static_w16_cascade_runtime_ops():
+    assert (
+        set(byte_v2_speculative_profile._BYTE_V2_PROFILE_OP_NAMES)
+        >= STATIC_W16_CASCADE_PROFILE_OPS
+    )
 
 
 @pytest.mark.parametrize("module", PROFILE_MODULES)
@@ -157,9 +169,11 @@ def test_collect_speculative_profile_kv_cache_plan():
         kv_cache_tensors=[SimpleNamespace(size=100), SimpleNamespace(size=200)],
         byte_v2_raw_fallback_sidecar_bytes=30,
         byte_v2_raw_staging_workspace_bytes=40,
+        byte_v2_decoded_prefix_cache_bytes=50,
         num_byte_v2_layers=2,
         byte_v2_raw_fallback_slots=3,
         byte_v2_raw_staging_slots=128,
+        byte_v2_decoded_prefix_cache_slots=2,
         byte_v2_raw_mutable_tail_q1=True,
     )
     runner = SimpleNamespace(kv_cache_config=config)
@@ -179,11 +193,14 @@ def test_collect_speculative_profile_kv_cache_plan():
         "compact_tensor_bytes": 300,
         "raw_fallback_sidecar_bytes": 30,
         "raw_staging_workspace_bytes": 40,
-        "total_planned_bytes": 370,
+        "decoded_prefix_cache_bytes": 50,
+        "total_planned_bytes": 420,
         "num_byte_v2_layers": 2,
         "raw_fallback_slots_per_layer": 3,
         "raw_staging_slots": 128,
+        "decoded_prefix_cache_slots_per_layer": 2,
         "raw_mutable_tail_q1": True,
+        "static_w16_retain_cascade_q16": False,
     }
 
 
@@ -217,6 +234,26 @@ def test_speculative_profile_engine_limits_and_kv_demand():
     args.engine_max_model_len = 5000
     with pytest.raises(ValueError, match="smaller than the requested"):
         byte_v2_speculative_profile._resolve_engine_limits(args, 0)
+
+
+def test_speculative_profile_records_prefix_cache_hits_per_request():
+    metrics = SimpleNamespace(
+        first_token_latency=0.25,
+        scheduled_ts=1.0,
+        queued_ts=0.5,
+        first_token_ts=1.5,
+        last_token_ts=2.5,
+    )
+    output = SimpleNamespace(
+        request_id="prefix-hit",
+        num_cached_tokens=128,
+        metrics=metrics,
+    )
+
+    result = byte_v2_speculative_profile._serialize_request_metrics([output])
+
+    assert result[0]["request_id"] == "prefix-hit"
+    assert result[0]["num_cached_tokens"] == 128
 
 
 def test_speculative_profile_scheduler_trace():
@@ -459,6 +496,8 @@ def test_speculative_memory_pressure_cli(monkeypatch):
             "byte_v2_speculative_profile.py",
             "--engine-max-model-len",
             "16384",
+            "--engine-max-num-seqs",
+            "32",
             "--max-num-batched-tokens",
             "8192",
             "--kv-cache-memory-bytes",
@@ -470,9 +509,45 @@ def test_speculative_memory_pressure_cli(monkeypatch):
     args = byte_v2_speculative_profile.parse_args()
 
     assert args.engine_max_model_len == 16384
+    assert args.engine_max_num_seqs == 32
     assert args.max_num_batched_tokens == 8192
     assert args.kv_cache_memory_bytes == 20_000_000_000
     assert args.e2e_only is True
+
+
+def test_speculative_shared_prefix_cascade_cli(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "byte_v2_speculative_profile.py",
+            "--identical-prompts",
+            "--enable-cascade-attn",
+            "--warmup-max-tokens",
+            "2",
+        ],
+    )
+
+    args = byte_v2_speculative_profile.parse_args()
+
+    assert args.identical_prompts is True
+    assert args.enable_cascade_attn is True
+    assert args.warmup_max_tokens == 2
+
+
+def test_speculative_cascade_rejects_disabled_prefix_cache(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "byte_v2_speculative_profile.py",
+            "--enable-cascade-attn",
+            "--disable-prefix-caching",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        byte_v2_speculative_profile.parse_args()
 
 
 def test_speculative_prompt_hash_is_stable_and_order_sensitive():

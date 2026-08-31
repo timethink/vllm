@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    byte_v2_decoded_prefix_cache_slots,
     byte_v2_hybrid_raw_fallback_enabled,
     byte_v2_raw_staging_slots,
     byte_v2_test_forced_raw_promotion_enabled,
@@ -95,6 +96,7 @@ _BYTE_V2_INT32_BYTES = 4
 _BYTE_V2_RAW_SIDECAR_FIXED_BYTES = 8
 _BYTE_V2_FORCED_RAW_DIAGNOSTIC_BYTES = 3 * _BYTE_V2_INT32_BYTES
 _BYTE_V2_RAW_STAGING_FIXED_BYTES = 8
+_BYTE_V2_DECODED_PREFIX_DESCRIPTOR_BYTES = 2 * _BYTE_V2_INT32_BYTES
 
 
 def _byte_v2_raw_fallback_slots_override() -> int | None:
@@ -116,6 +118,15 @@ def _byte_v2_raw_fallback_slots_override() -> int | None:
 
 def _byte_v2_raw_mutable_tail_q1_runtime_enabled() -> bool:
     """Resolve the requested raw-tail path against the loaded native ABI."""
+    from vllm.v1.attention.backends.byte_v2_static_w16 import (
+        byte_v2_static_w16_requested,
+    )
+
+    if byte_v2_static_w16_requested():
+        # Every partial W16 page is authoritative raw state, independent of the
+        # legacy V6 raw-tail toggle. Runtime ABI validation remains fail-closed
+        # in ByteV2AttentionImpl after the planner reserves these slots.
+        return True
     from vllm.v1.attention.backends.byte_v2_ops import (
         byte_v2_hybrid_raw_tail_q1_is_available,
     )
@@ -124,6 +135,31 @@ def _byte_v2_raw_mutable_tail_q1_runtime_enabled() -> bool:
         native_available=byte_v2_hybrid_raw_tail_q1_is_available(),
         hybrid_raw_fallback=True,
     )
+
+
+def _byte_v2_static_w16_retain_cascade_q16_runtime_enabled() -> bool:
+    """Resolve bounded cascade-Q16 retention against the loaded native ABI."""
+    from vllm.v1.attention.backends.byte_v2_ops import (
+        byte_v2_static_w16_safe_full_page_retention_is_available,
+    )
+    from vllm.v1.attention.backends.byte_v2_static_w16 import (
+        byte_v2_static_w16_requested,
+        byte_v2_static_w16_retain_cascade_q16_requested,
+    )
+
+    if not byte_v2_static_w16_retain_cascade_q16_requested():
+        return False
+    if not byte_v2_static_w16_requested():
+        raise ValueError(
+            "BYTE_V2_STATIC_W16_RETAIN_CASCADE_Q16=1 requires "
+            "BYTE_V2_STATIC_W16_CODEBOOK"
+        )
+    if not byte_v2_static_w16_safe_full_page_retention_is_available():
+        raise RuntimeError(
+            "BYTE_V2_STATIC_W16_RETAIN_CASCADE_Q16=1 requires a native "
+            "Static-W16 commit op with safe full-page retention"
+        )
+    return True
 
 
 def get_byte_v2_raw_fallback_slots(
@@ -155,9 +191,10 @@ def _validate_byte_v2_raw_fallback_slots(
     if explicit_slots < required_slots:
         raise ValueError(
             f"{_BYTE_V2_RAW_FALLBACK_SLOTS_ENV}={explicit_slots} is too small "
-            "for raw-tail Q1: at least "
+            "for request-resident raw pages: at least "
             f"{required_slots} total slots are required for "
-            f"max_num_seqs={mutable_tail_slots} plus the raw fallback reserve"
+            f"{mutable_tail_slots} request-resident pages plus the raw "
+            "fallback reserve"
         )
 
 
@@ -208,6 +245,22 @@ def get_byte_v2_raw_staging_workspace_bytes(
         + _BYTE_V2_INT32_BYTES * num_blocks
         + 2 * _BYTE_V2_INT32_BYTES * num_staging_slots
         + _BYTE_V2_RAW_STAGING_FIXED_BYTES
+    )
+
+
+def get_byte_v2_decoded_prefix_cache_bytes(
+    num_byte_v2_layers: int,
+    num_cache_slots: int,
+) -> int:
+    """Return bytes for one bounded decoded-prefix cache per ByteV2 layer."""
+    if num_byte_v2_layers < 0:
+        raise ValueError("num_byte_v2_layers must be non-negative")
+    if num_cache_slots < 0:
+        raise ValueError("num_cache_slots must be non-negative")
+    return (
+        num_byte_v2_layers
+        * num_cache_slots
+        * (_BYTE_V2_RAW_PAGE_BYTES + _BYTE_V2_DECODED_PREFIX_DESCRIPTOR_BYTES)
     )
 
 
@@ -264,6 +317,7 @@ def _get_byte_v2_total_cache_bytes(
     explicit_slots: int | None = None,
     raw_staging_slots: int = BYTE_V2_DEFAULT_RAW_STAGING_SLOTS,
     mutable_tail_slots: int = 0,
+    decoded_prefix_cache_slots: int = 0,
 ) -> int:
     """Return compact KV, persistent sidecars, and one shared workspace."""
     return (
@@ -278,6 +332,10 @@ def _get_byte_v2_total_cache_bytes(
             num_blocks,
             raw_staging_slots,
         )
+        + get_byte_v2_decoded_prefix_cache_bytes(
+            num_byte_v2_layers,
+            decoded_prefix_cache_slots,
+        )
     )
 
 
@@ -288,6 +346,7 @@ def _get_max_num_blocks_with_byte_v2_sidecar(
     explicit_slots: int | None = None,
     raw_staging_slots: int = BYTE_V2_DEFAULT_RAW_STAGING_SLOTS,
     mutable_tail_slots: int = 0,
+    decoded_prefix_cache_slots: int = 0,
 ) -> int:
     """Find the largest block count whose full ByteV2 allocation fits."""
     if pool_bytes_per_block <= 0:
@@ -302,6 +361,7 @@ def _get_max_num_blocks_with_byte_v2_sidecar(
         explicit_slots,
         raw_staging_slots,
         mutable_tail_slots,
+        decoded_prefix_cache_slots,
     )
     if minimum_bytes > available_memory:
         raise ValueError(
@@ -321,6 +381,7 @@ def _get_max_num_blocks_with_byte_v2_sidecar(
             explicit_slots,
             raw_staging_slots,
             mutable_tail_slots,
+            decoded_prefix_cache_slots,
         )
         if required <= available_memory:
             low = mid
@@ -1962,6 +2023,10 @@ def generate_scheduler_kv_cache_config(
     cfg.byte_v2_raw_mutable_tail_q1 = any(
         worker_cfg.byte_v2_raw_mutable_tail_q1 for worker_cfg in kv_cache_configs
     )
+    cfg.byte_v2_static_w16_retain_cascade_q16 = any(
+        worker_cfg.byte_v2_static_w16_retain_cascade_q16
+        for worker_cfg in kv_cache_configs
+    )
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2298,12 +2363,33 @@ def get_kv_cache_configs(
         if byte_v2_hybrid_active
         else BYTE_V2_DEFAULT_RAW_STAGING_SLOTS
     )
+    decoded_prefix_cache_slots = (
+        byte_v2_decoded_prefix_cache_slots() if byte_v2_hybrid_active else 0
+    )
+    if decoded_prefix_cache_slots:
+        from vllm.v1.attention.backends.byte_v2_static_w16 import (
+            byte_v2_static_w16_requested,
+        )
+
+        if not byte_v2_static_w16_requested():
+            raise ValueError(
+                "BYTE_V2_STATIC_W16_DECODED_PREFIX_CACHE_SLOTS requires "
+                "BYTE_V2_STATIC_W16_CODEBOOK"
+            )
     mutable_tail_enabled = (
         byte_v2_hybrid_active and _byte_v2_raw_mutable_tail_q1_runtime_enabled()
+    )
+    retain_cascade_q16_enabled = (
+        byte_v2_hybrid_active
+        and _byte_v2_static_w16_retain_cascade_q16_runtime_enabled()
     )
     mutable_tail_slots = (
         vllm_config.scheduler_config.max_num_seqs if mutable_tail_enabled else 0
     )
+    retained_cascade_slots = (
+        vllm_config.scheduler_config.max_num_seqs if retain_cascade_q16_enabled else 0
+    )
+    request_resident_raw_slots = mutable_tail_slots + retained_cascade_slots
     planned_compact_memory = list(available_memory)
 
     # If `num_gpu_blocks_override` is set, the cache size that will actually
@@ -2335,7 +2421,8 @@ def get_kv_cache_configs(
                     num_byte_v2_layers,
                     raw_slots_override,
                     raw_staging_slots,
-                    mutable_tail_slots,
+                    request_resident_raw_slots,
+                    decoded_prefix_cache_slots,
                 )
                 if required_bytes > avail_mem:
                     raise ValueError(
@@ -2364,7 +2451,8 @@ def get_kv_cache_configs(
                 num_byte_v2_layers,
                 raw_slots_override,
                 raw_staging_slots,
-                mutable_tail_slots,
+                request_resident_raw_slots,
+                decoded_prefix_cache_slots,
             )
             adjusted_memory.append(num_blocks * bytes_per_block)
         planned_compact_memory = adjusted_memory
@@ -2419,27 +2507,32 @@ def get_kv_cache_configs(
             _validate_byte_v2_raw_fallback_slots(
                 min_num_blocks,
                 raw_slots_override,
-                mutable_tail_slots,
+                request_resident_raw_slots,
             )
             raw_slots = get_byte_v2_raw_fallback_slots(
                 min_num_blocks,
                 raw_slots_override,
-                mutable_tail_slots,
+                request_resident_raw_slots,
             )
             sidecar_bytes = get_byte_v2_raw_fallback_sidecar_bytes(
                 min_num_blocks,
                 kv_cache_config.num_byte_v2_layers,
                 raw_slots_override,
-                mutable_tail_slots,
+                request_resident_raw_slots,
             )
             staging_workspace_bytes = get_byte_v2_raw_staging_workspace_bytes(
                 min_num_blocks,
                 raw_staging_slots,
             )
+            decoded_prefix_cache_bytes = get_byte_v2_decoded_prefix_cache_bytes(
+                kv_cache_config.num_byte_v2_layers,
+                decoded_prefix_cache_slots,
+            )
             total_bytes = (
                 sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
                 + sidecar_bytes
                 + staging_workspace_bytes
+                + decoded_prefix_cache_bytes
             )
             if total_bytes > profiled_memory:
                 raise RuntimeError(
@@ -2453,7 +2546,16 @@ def get_kv_cache_configs(
             kv_cache_config.byte_v2_raw_staging_workspace_bytes = (
                 staging_workspace_bytes
             )
+            kv_cache_config.byte_v2_decoded_prefix_cache_slots = (
+                decoded_prefix_cache_slots
+            )
+            kv_cache_config.byte_v2_decoded_prefix_cache_bytes = (
+                decoded_prefix_cache_bytes
+            )
             kv_cache_config.byte_v2_raw_mutable_tail_q1 = mutable_tail_enabled
+            kv_cache_config.byte_v2_static_w16_retain_cascade_q16 = (
+                retain_cascade_q16_enabled
+            )
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

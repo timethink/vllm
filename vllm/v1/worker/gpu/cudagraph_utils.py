@@ -289,10 +289,13 @@ class CudaGraphManager:
         num_reqs: int,
         num_tokens: int,
         uniform_token_count: int | None,
+        max_mode: CUDAGraphMode | None = None,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
+                if max_mode is not None and desc.cg_mode.value > max_mode.value:
+                    continue
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
                     return desc
         return BatchExecutionDescriptor(

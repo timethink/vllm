@@ -322,13 +322,15 @@ def test_select_common_block_size_no_valid_option():
 
 
 @pytest.mark.parametrize(
-    ("capture_blocks", "explicit_slots"),
-    ((1, None), (512, 5)),
+    ("capture_blocks", "explicit_slots", "retain_cascade_q16", "expected_slots"),
+    ((1, None, False, 5), (1, None, True, 9), (512, 5, False, 5)),
 )
 def test_byte_v2_minimal_profile_cache_reserves_mutable_tails(
     monkeypatch,
     capture_blocks,
     explicit_slots,
+    retain_cascade_q16,
+    expected_slots,
 ):
     from vllm.v1.core import kv_cache_utils
 
@@ -343,6 +345,11 @@ def test_byte_v2_minimal_profile_cache_reserves_mutable_tails(
         kv_cache_utils,
         "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
         lambda: True,
+    )
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_static_w16_retain_cascade_q16_runtime_enabled",
+        lambda: retain_cascade_q16,
     )
     config = VllmConfig(model_config=ModelConfig(max_model_len=16))
     config.scheduler_config.max_num_seqs = 4
@@ -373,8 +380,9 @@ def test_byte_v2_minimal_profile_cache_reserves_mutable_tails(
     minimal_config = captured["config"]
     assert captured["is_profiling"] is True
     assert minimal_config.num_blocks == capture_blocks
-    assert minimal_config.byte_v2_raw_fallback_slots == 5
+    assert minimal_config.byte_v2_raw_fallback_slots == expected_slots
     assert minimal_config.byte_v2_raw_mutable_tail_q1
+    assert minimal_config.byte_v2_static_w16_retain_cascade_q16 is retain_cascade_q16
     assert config.cache_config.num_gpu_blocks_override is None
 
 

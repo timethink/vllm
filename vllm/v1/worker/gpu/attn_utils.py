@@ -4,11 +4,13 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -16,9 +18,13 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
+    EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -377,6 +383,82 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+def compute_cascade_attn_prefix_lens(
+    attn_groups: list[list[AttentionGroup]],
+    num_scheduled_tokens: np.ndarray,
+    num_computed_tokens: np.ndarray,
+    num_common_prefix_blocks: list[int],
+) -> list[list[int]] | None:
+    """Select page-aligned cascade prefixes for the V2 GPU model runner."""
+    if num_scheduled_tokens.size == 0 or num_computed_tokens.size == 0:
+        return None
+
+    selected = False
+    prefix_lens: list[list[int]] = []
+    for kv_cache_group_id, groups in enumerate(attn_groups):
+        common_blocks = (
+            num_common_prefix_blocks[kv_cache_group_id]
+            if kv_cache_group_id < len(num_common_prefix_blocks)
+            else 0
+        )
+        group_prefix_lens = []
+        for group in groups:
+            kv_cache_spec = group.kv_cache_spec
+            if not isinstance(kv_cache_spec, AttentionSpec) or isinstance(
+                kv_cache_spec, EncoderOnlyAttentionSpec
+            ):
+                group_prefix_lens.append(0)
+                continue
+
+            common_prefix_len = common_blocks * kv_cache_spec.block_size
+            common_prefix_len = min(
+                common_prefix_len,
+                int(num_computed_tokens.min()),
+            )
+            common_prefix_len = (
+                common_prefix_len // kv_cache_spec.block_size * kv_cache_spec.block_size
+            )
+            if common_prefix_len == 0:
+                group_prefix_lens.append(0)
+                continue
+
+            builder = group.get_metadata_builder(0)
+            vllm_config = builder.vllm_config
+            model_config = vllm_config.model_config
+            parallel_config = vllm_config.parallel_config
+            use_sliding_window = isinstance(kv_cache_spec, SlidingWindowSpec) or (
+                isinstance(kv_cache_spec, FullAttentionSpec)
+                and kv_cache_spec.sliding_window is not None
+            )
+            use_local_attention = isinstance(
+                kv_cache_spec, ChunkedLocalAttentionSpec
+            ) or (
+                isinstance(kv_cache_spec, FullAttentionSpec)
+                and kv_cache_spec.attention_chunk_size is not None
+            )
+            use_cascade = (
+                not model_config.disable_cascade_attn
+                and builder.use_cascade_attention(
+                    common_prefix_len=common_prefix_len,
+                    query_lens=num_scheduled_tokens,
+                    num_query_heads=model_config.get_num_attention_heads(
+                        parallel_config
+                    ),
+                    num_kv_heads=kv_cache_spec.num_kv_heads,
+                    use_alibi=model_config.uses_alibi,
+                    use_sliding_window=use_sliding_window,
+                    use_local_attention=use_local_attention,
+                    num_sms=num_compute_units(builder.device.index),
+                    dcp_world_size=(parallel_config.decode_context_parallel_size),
+                )
+            )
+            selected |= use_cascade
+            group_prefix_lens.append(common_prefix_len if use_cascade else 0)
+        prefix_lens.append(group_prefix_lens)
+
+    return prefix_lens if selected else None
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -394,6 +476,8 @@ def build_attn_metadata(
     dcp_local_seq_lens: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+    cascade_attn_prefix_lens: list[list[int]] | None = None,
+    cascade_prefix_cache_key: int = 0,
     for_cudagraph_capture: bool = False,
     causal: bool = True,
 ) -> dict[str, Any]:
@@ -435,10 +519,11 @@ def build_attn_metadata(
             is_prefilling=common_is_prefilling,
             dcp_local_seq_lens=dcp_local_seq_lens,
             positions=positions,
+            cascade_prefix_cache_key=cascade_prefix_cache_key,
             **common_attn_metadata_extra_kwargs,
         )
 
-        for attn_group in attn_groups[i]:
+        for attn_group_id, attn_group in enumerate(attn_groups[i]):
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
@@ -454,7 +539,11 @@ def build_attn_metadata(
                     else {}
                 )
                 metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
+                    common_prefix_len=(
+                        cascade_attn_prefix_lens[i][attn_group_id]
+                        if cascade_attn_prefix_lens is not None
+                        else 0
+                    ),
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )

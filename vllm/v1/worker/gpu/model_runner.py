@@ -40,6 +40,7 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.model_executor.layers.attention.attention import (
     bind_byte_v2_raw_staging_workspace,
+    reset_byte_v2_raw_fallback_pages,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -59,6 +60,7 @@ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
+    compute_cascade_attn_prefix_lens,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
@@ -518,6 +520,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         reset_fns = self._get_raw_fallback_reset_fns()
         if not block_ids or not reset_fns:
             return
+        self._invalidate_decoded_prefix_caches()
         if not hasattr(self, "_raw_fallback_ids_pin_memory"):
             self._init_raw_fallback_reset(is_pin_memory_available())
 
@@ -540,8 +543,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ids_pinned[:n_blocks].numpy()[:] = block_ids
         block_ids_tensor = ids_gpu[:n_blocks]
         block_ids_tensor.copy_(ids_pinned[:n_blocks], non_blocking=True)
-        for reset_fn in reset_fns:
-            reset_fn(block_ids_tensor)
+        reset_byte_v2_raw_fallback_pages(
+            self.compilation_config.static_forward_context,
+            block_ids_tensor,
+        )
+
+    def _invalidate_decoded_prefix_caches(self) -> None:
+        """Invalidate host cache keys before physical block generations change."""
+        self._byte_v2_cascade_prefix_signature: (
+            tuple[tuple[str, ...], tuple[tuple[int, ...], ...]] | None
+        ) = None
+        seen_impls: set[int] = set()
+        for layer in self.compilation_config.static_forward_context.values():
+            impl = getattr(layer, "impl", None)
+            if impl is None or id(impl) in seen_impls:
+                continue
+            seen_impls.add(id(impl))
+            invalidate = getattr(impl, "invalidate_decoded_prefix_cache", None)
+            if callable(invalidate):
+                invalidate()
+
+    def _cascade_prefix_cache_key(
+        self,
+        input_batch: InputBatch,
+        cascade_attn_prefix_lens: list[list[int]],
+    ) -> int:
+        """Return a stable key until request membership or prefix shape changes."""
+        signature = (
+            tuple(input_batch.req_ids),
+            tuple(tuple(group) for group in cascade_attn_prefix_lens),
+        )
+        if signature != getattr(
+            self,
+            "_byte_v2_cascade_prefix_signature",
+            None,
+        ):
+            self._byte_v2_cascade_prefix_epoch = (
+                getattr(self, "_byte_v2_cascade_prefix_epoch", 0) + 1
+            )
+            self._byte_v2_cascade_prefix_signature = signature
+        return self._byte_v2_cascade_prefix_epoch
 
     def _init_raw_fallback_reset(self, pin_memory: bool) -> None:
         """Allocate reusable block-ID staging buffers when reset is supported."""
@@ -826,6 +867,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        if scheduler_output.scheduled_new_reqs:
+            self._byte_v2_cascade_prefix_signature = None
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
@@ -1198,6 +1241,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        cascade_attn_prefix_lens = None
+        if (
+            not dummy_run
+            and not self.model_config.disable_cascade_attn
+            and not self.parallel_config.use_ubatching
+        ):
+            req_ids = sorted(
+                scheduler_output.num_scheduled_tokens,
+                key=scheduler_output.num_scheduled_tokens.get,  # type: ignore[arg-type]
+            )
+            query_lens = np.fromiter(
+                (scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            req_state_indices = np.fromiter(
+                (self.req_states.req_id_to_index[req_id] for req_id in req_ids),
+                dtype=np.int32,
+                count=num_reqs,
+            )
+            cascade_attn_prefix_lens = compute_cascade_attn_prefix_lens(
+                self.attn_groups,
+                query_lens,
+                self.req_states.num_computed_tokens_np[req_state_indices],
+                scheduler_output.num_common_prefix_blocks,
+            )
+
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1206,6 +1276,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
+            disable_full=cascade_attn_prefix_lens is not None,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1217,6 +1288,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            input_batch.cascade_attn_prefix_lens = cascade_attn_prefix_lens
+            if cascade_attn_prefix_lens is not None:
+                input_batch.cascade_prefix_cache_key = self._cascade_prefix_cache_key(
+                    input_batch,
+                    cascade_attn_prefix_lens,
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
 
             if self.lora_config:

@@ -4376,3 +4376,780 @@ Artifacts:
 - `profile/bytev2-v6-256-fa2-a40-20260727/analysis/`
 - `profile/bytev2-v6-256-fa2-a40-20260727/reports/`
 - `profile/bytev2-v6-pool-demand-a40-20260727/REPORT.md`
+
+### A40 ByteV2 Weight Exact-M128 TTFT Optimization (2026-08-01)
+
+The frozen weight-compression formal run exposed a short-prompt TTFT problem:
+for B1/P128 the production direct route issued four M32 custom-op calls for
+each aggregate M128 projection. Nsight Systems attributed about 80.2 ms of
+the old ByteV2 request to 512 native main launches, versus about 30.6 ms for
+129 Raw cuBLAS launches; attention itself was unchanged at about 0.33 ms.
+
+The retained implementation recognizes exact aggregate `M=128` inside the
+existing production custom op and invokes one grouped M128 main kernel plus
+the original split-K reducer. The registered op and checkpoint ABI are
+unchanged. The high-M hydrate decision still has precedence, all other direct
+M values preserve their route, bias is applied once, and the original leading
+dimensions are restored. A capability check prevents the new Python wrapper
+from loading an older ABI-1 extension without grouped-M128 support.
+
+The real layer-0 qkv, o, gate-up, and down projections are bitwise equal to
+the prior four-M32 route. Their CUDA-event times fall from 400.640/228.773/
+1,337.947/677.035 us to 202.325/99.243/532.992/304.725 us. The predicted
+32-layer saving is about 48.2 ms. In the locked one-temporal-block E2E
+diagnostic, cell-equal TTFT relative to Raw improves from 1.3258x to 1.1344x;
+B1/P128 TTFT falls from roughly 91 ms to 42 ms, while TPOT is unchanged. This
+is a candidate diagnostic, not a replacement for the frozen six-block formal
+result.
+
+The larger split workspace reduces usable ByteV2 capacity by 144 tokens, from
+181,904 to 181,760, but still provides 21,024 tokens (+13.08%) over Raw's
+160,736 under the same memory envelope. Three fresh B32/P3568/O2048 capacity
+trials each reached 179,712 resident tokens, completed with zero preemptions
+and zero discarded KV tokens, and therefore exercise 18,976 tokens beyond
+the Raw boundary rather than merely reporting an allocation.
+
+Strict full, PM-sampling, and source NCU reports show that main-plus-reducer
+time falls from 1,396.960 to 657.120 us (-52.96%). DRAM reads fall 72.94%,
+executed instructions 67.31%, global-load instructions 69.83%, and shared
+instructions 72.00%. Long-scoreboard and barrier ratios fall, and main
+tensor-pipe activity rises from 19.95% to 43.54%. The critical path therefore
+moves from repeated weight decoding and memory waits toward useful MMA work.
+
+The remaining resource tradeoff is real: grouped M128 uses 160 registers per
+thread and 50,176 bytes of shared memory per block, versus 89 registers and
+25,600 bytes for M32, reducing theoretical occupancy from 33.33% to 16.67%.
+A direct bitwise follow-up nevertheless rejects splitting the work into two
+grouped M64 launches. Across the same four real projections, 2xM64 takes
+1,672.141 us versus 1,164.440 us for 1xM128, a 43.60% regression with a
+bootstrap ratio interval of [1.4324x, 1.4875x]. Extra main/reducer launches,
+repeated weight reads and decode, and lost tile reuse outweigh the potential
+occupancy gain.
+
+The next justified kernel experiment is therefore internal to the one-M128
+route: reduce its 49,152-byte dynamic activation/weight staging footprint
+toward about 34 KiB without changing arithmetic order, then measure whether
+admitting a third block per SM outweighs reduced copy/compute overlap. A
+compact-reader load-layout experiment is secondary and must preserve the
+fixed resident size and bitwise BF16 reconstruction.
+
+Artifacts:
+
+- `profile/bytev2-weight-ttft-prefill-a40-20260801/REPORT.md`
+- `profile/bytev2-weight-ttft-prefill-a40-20260801/analysis/`
+- `profile/bytev2-weight-ttft-prefill-a40-20260801/reports/`
+- `profile/bytev2-weight-ttft-prefill-a40-20260801/harness/run_m128_tile_ab.py`
+
+### A40 ByteV2 Weight M128 Single-Activation-Buffer Route (2026-08-01)
+
+The exact-M128 follow-up reduces the grouped kernel's dynamic shared-memory
+footprint without changing its weight reader, MMA arithmetic order, split
+workspace, BF16 conversion, or original split-K reducer. The old mainloop
+double buffers both a 32 KiB activation tile and 16 KiB of weight staging.
+The candidate keeps the double-buffered weights but uses one 16 KiB activation
+stage. After every warp has consumed activation slice 3, a block barrier makes
+it safe to overwrite that stage; the next activation copy then overlaps the
+final MMA slice. A wait plus second block barrier protects the following stage.
+The epilogue reuses the mainloop allocation through two 64-token passes over a
+17,408-byte FP32 transpose scratch. Dynamic shared memory is therefore 32,768
+bytes rather than 49,152 bytes.
+
+The compiled A40 candidate uses 163 registers/thread, versus 160 for grouped
+M128, and has zero local loads/stores. Including CUDA's 1,024-byte per-block
+driver allocation, NCU reports 33,792 versus 50,176 shared bytes. The
+shared-memory occupancy limit rises from two to three CTAs/SM; theoretical
+occupancy rises from 16.67% to 25.00%, and achieved occupancy from 15.99% to
+23.11%.
+
+On the real layer-0 gate-up shape `(M,N,K)=(128,28672,4096)`, split-K 2, and
+896-CTA grid, the main kernel falls from 616.736 to 571.808 us (-7.28%). SM
+and tensor throughput rise from 43.37% to 47.05%. The improvement is residency
+and latency hiding, not reduced memory traffic: DRAM reads change only from
+207.579 to 205.735 MB (-0.89%), global-load sectors/request are identical,
+and executed instructions rise 0.26%.
+
+The smaller allocation has a synchronization cost. The long-scoreboard ratio
+rises from 0.5044 to 1.7238, the barrier ratio from 0.6577 to 0.8945, and the
+math-pipe-throttle ratio from 1.0821 to 1.3440. Source PC sampling attributes
+4,331 candidate long-scoreboard samples to the MMA helper and 3,145 barrier
+samples to the two activation phase barriers. The third resident CTA more than
+repays this cost on the measured high-grid shapes, but scoreboard and barrier
+latency are now the routed kernel's primary local ceilings.
+
+A strict four-projection ABBA comparison rejects globally replacing grouped
+M128. Single-A improves qkv by 8.91% and gate-up by 6.52%, but regresses o by
+7.83% and down by 9.84%. The four-projection sum is nominally 1.604% faster,
+with ratio CI `[0.98033,0.99791]`, but violates the predeclared rule that no
+projection may regress by more than 2%.
+
+The retained selective experiment sends qkv (grid 1536) and gate-up (grid 896)
+to single-A and keeps o/down (both grid 256) on grouped M128. Across 20 paired
+ABBA/BAAB blocks, 200 calls/backend/projection, and 20,000 bootstrap resamples,
+its four-projection envelope is 0.95297x with 95% CI
+`[0.94602,0.95727]`, a 4.703% saving. All four outputs are bitwise equal.
+
+The production custom op now applies the selective route only for exact
+`M=128`, compute capability 8.6, 84 SMs, and
+`(output_features / 64) * split_k >= 512`; all other inputs preserve grouped
+M128 or the prior generic route. This predicate checks hardware geometry, not
+the A40 product name. The cutoff is provisional: measurements exist at grids
+256, 896, and 1536, not near 512, and the predicate does not yet include K
+stages per split. It must not be generalized to other models or same-geometry
+GPUs without a grid-by-stage sweep.
+
+The locked 15-cell temporal-block-0 E2E diagnostic completed four paired
+rounds per cell with zero preemptions and an unchanged runtime inventory.
+Against the prior grouped-M128 binary, the cell-equal ratios are 1.000616x for
+TPS, 0.990132x for TTFT P50, 0.999594x for TPOT P50, and 0.999382x for E2E
+P50. B1/P128 TTFT changes from 42.205/42.534/42.500 ms to
+40.570/40.597/40.618 ms for output lengths 128/512/2048. The 1.6--1.9 ms
+reduction matches the layer-level mechanism; decode-dominated metrics move by
+less than 0.1%.
+
+Raw BF16, frozen ByteV2, grouped-M128 ByteV2, and selective single-A ByteV2
+have equal recorded output-token sequence SHA256 values for all 820 requests.
+Prompt hashes, token counts, finish/stop reasons, generation/prompt scheduler
+counters, and the zero-preemption result also match. Because the retained
+results store token-array hashes rather than full token arrays, this bitwise
+statement is scoped to the per-request SHA256 records. The single temporal
+block is a paired diagnostic, not a replacement for the frozen six-block
+formal result.
+
+The focused production gate has 21 passing cases, including compact, raw,
+mixed, patched, and split-K 1/2/4/8/16 inputs; the complete plugin suite has
+175 passing tests. The candidate does not add model-level temporary memory:
+packed weights, output, split workspace, and reducer are unchanged, while CTA
+shared memory decreases.
+
+The next admission experiment is a `grid_ctas x stages_per_split` sweep around
+resident-set boundaries (grids 168, 252, 256, 336, 504, 512, 672, and 896;
+stages 4, 16, 32, and 56), followed by a fail-closed two-dimensional router or
+an explicitly narrower shape guard. Inside the kernel, a scoreboard-reduction
+experiment must remain at or below 170 registers/thread; exceeding that count
+would lose the third resident CTA and the optimization's mechanism.
+
+Artifacts:
+
+- `profile/bytev2-weight-m128-single-a-a40-20260801/REPORT.md`
+- `profile/bytev2-weight-m128-single-a-a40-20260801/analysis/`
+- `profile/bytev2-weight-m128-single-a-a40-20260801/reports/`
+- `profile/bytev2-weight-m128-single-a-a40-20260801/harness/`
+
+### A40 ByteV2 Weight M128 Grid/Stage Router (2026-08-01)
+
+The provisional exact-M128 single-activation-buffer selector has now been
+measured over a fixed `grid_ctas x stages_per_split` matrix instead of only
+the four Llama projection anchors. The controlled experiment fixes M128 and
+split-K 4, derives compact-only logical weights from real layer-0 down-proj
+pages without decoding or repacking, and covers grids
+`{168,252,256,336,504,512,672,896}` and stages per split
+`{4,16,32,56}`. All 32 grouped/single-A output pairs are BF16 bitwise equal.
+
+The performance curve is a resident-wave sawtooth. Grouped M128 admits two
+CTAs/SM on the 84-SM A40, or 168 CTAs per resident set; single-A admits three,
+or 252. Grid 252 therefore changes from two grouped waves to one candidate
+wave and wins 16.1%--21.7%. Grid 256 needs two waves on both kernels and loses
+7.6%--10.0% at stages 16/32/56. Grid 504 changes from three waves to two and
+wins 6.1%--7.4%. All measured grid-512/672/896 cells win 2.1%--7.8%. Grid 168
+and 336, where the wave count is equal, lose 4.3%--11.9%.
+
+The warm discovery exception at stage-4/grid-256 was only 1.23%. In a
+100-block cold-L2 run with one kernel invocation per flush it fell to 0.74%,
+ratio 0.99264, and failed the predeclared point-ratio-at-most-0.99 gate. It is
+therefore not admitted. A fresh 20-cell confirmation of grids
+`{252,504,512,672,896}` at all four stage counts passes the point gate in
+every cell. A 200,000-resample one-sided Bonferroni analysis gives a weakest
+family-wise upper bound of 0.98199. The six positive cold cells at
+252/504/512 and stages 4/56 have a weakest family-wise upper bound of 0.96768.
+
+Production preserves the already validated A40 `grid_ctas >= 512` envelope
+and adds only exact compact-only lower points with split-K 4, grid 252 or 504,
+and stages per split in `{4,16,32,56}`. There is no lower-grid interpolation.
+The production dispatcher and the required `debug_m128_route` symbol use the
+same host helper, so tests directly witness the actual rule. No CUDA mainloop,
+reducer, workspace, checkpoint format, or checkpoint kernel ABI changed.
+
+This route change does not alter the current Llama-3.1-8B choices: qkv and
+gate-up remain single-A, while o and down remain grouped. The complete plugin
+suite reports 193 passing tests. A post-change real four-projection ABBA run
+is bitwise equal and has a selective/grouped ratio of 0.95172 with 95% CI
+`[0.94516,0.95876]`, a 4.83% directional saving.
+
+The locked 15-cell E2E block completes all 60 timed rounds with zero
+preemptions and an unchanged attested runtime. Relative to the old grouped
+binary, cell-equal ratios are 0.999913 for TPS, 0.991218 for TTFT P50,
+1.000354 for TPOT P50, and 1.000084 for E2E P50. Relative to the preceding
+selective binary, which takes the same routes, TPS is 0.070% lower and E2E P50
+is 0.070% higher. That tiny independent-process shift also appears in decode
+cells that do not execute exact M128 and is treated as single-block run drift,
+not a demonstrated selector cost.
+
+Raw, frozen ByteV2, grouped-M128 ByteV2, and the router binary have identical
+recorded prompt/output token sequence hashes and completion metadata for all
+820 requests. The direct router/prior-selective comparison is also exact for
+all 820 requests. These retained results store token-array SHA256 values, not
+the full arrays, so the bitwise claim is scoped to those records.
+
+The next generalization gate is not another threshold fit. It should use a
+different real layer/source, new seeds, one invocation per L2 flush, and exact
+just-after-boundary grids around the 169/252 and 337/504 occupancy regions.
+Only then can the diagnostic predicate
+`ceil(grid/252) < ceil(grid/168)` replace exact lower-grid allowlisting.
+
+Artifacts:
+
+- `profile/bytev2-weight-m128-router-sweep-a40-20260801/REPORT.md`
+- `profile/bytev2-weight-m128-router-sweep-a40-20260801/analysis/`
+- `profile/bytev2-weight-m128-router-sweep-a40-20260801/figures/`
+- `profile/bytev2-weight-m128-router-sweep-a40-20260801/reports/`
+
+### A40 Formal Raw/ZipServ/Current-ByteV2 Weight E2E Comparison (2026-08-02)
+
+The current M-router runtime has now completed the preregistered independent
+three-candidate formal protocol. This is a **weight-only** comparison: Raw,
+ZipServ-offline, and ByteV2 all retain the same BF16 FlashAttention KV cache,
+eager engine envelope, disabled logprobs and prefix caching, and one A40. The
+design contains six balanced temporal mode-order blocks, four timed full-batch
+iterations per block and cell, and 15 cells spanning B1/B8/B32 and prompt /
+output pairs 128/128, 128/512, 128/2048, 1024/128, and 4096/128. All three
+capacity probes, 18 performance workers, and 45 fresh-process capacity trials
+completed: 66/66 jobs, 1,080 timed batch units, zero failed jobs, and zero
+performance-region preemptions. Request latency and throughput are measured
+after engine and shape warmup; checkpoint/model load is outside the timed E2E
+region.
+
+The primary cell-equal paired effects use candidate / Raw ratios and a
+10,000-resample hierarchical bootstrap with temporal block as the outer
+cluster and round as the inner cluster. ZipServ reaches 1.06474x TPS
+`[1.06412,1.06541]`, 1.15812x TTFT P50 `[1.15684,1.15952]`, 0.92649x TPOT
+P50 `[0.92590,0.92701]`, and 0.93930x E2E P50
+`[0.93869,0.93985]`. Current ByteV2 reaches 1.18373x TPS
+`[1.18293,1.18426]`, 1.12808x TTFT P50 `[1.12715,1.12903]`, 0.82568x TPOT
+P50 `[0.82530,0.82625]`, and 0.84492x E2E P50
+`[0.84455,0.84549]`. Thus ByteV2's formal cell-equal result relative to Raw is
++18.37% TPS, +12.81% TTFT, -17.43% TPOT, and -15.51% E2E. The result supports
+a decode-throughput and end-to-end benefit, but it does not support a TTFT
+win over Raw.
+
+A separate direct analysis pairs the original ByteV2 and ZipServ iterations;
+it does not divide their Raw-derived ratios. ByteV2 / ZipServ is 1.1118x TPS
+`[1.1112,1.1123]`, 0.9741x TTFT P50 `[0.9731,0.9752]`, 0.8912x TPOT P50
+`[0.8907,0.8916]`, and 0.8995x E2E P50 `[0.8991,0.8999]`. The current
+ByteV2 path is therefore about 11.18% higher-throughput and 10.05% lower-E2E
+than the integrated ZipServ baseline, with 2.59% lower TTFT and 10.88% lower
+TPOT. The secondary token-pooled TPS ratio is 1.1100x.
+
+The benefit is workload-dependent. At B32/P4096/O128, ByteV2 / Raw is only
+0.9996x TPS and 1.0021x E2E P50; ZipServ / Raw is 0.9900x TPS and 1.0113x
+E2E P50. At the same boundary ByteV2 still beats ZipServ directly by 1.0097x
+TPS and 0.9910x E2E, but neither compressed path demonstrates a useful win
+over Raw for that prefill-heavy cell. Decode-dominant cells show the much
+larger gains summarized above.
+
+The capacity sweep measures actual scheduler block-pool high-water rather
+than theoretical demand. Under the same engine memory envelope, Raw exposes
+160,736 BF16 KV tokens, ByteV2 181,760 (+13.08%), and ZipServ 190,496
+(+18.51%). At the preregistered `byte_added_slots` demand of 179,712 tokens,
+ByteV2 reaches a 179,712-token high-water and completes all three fresh trials
+with zero preemptions, while Raw records 12 preemptions in aggregate. At the
+185,856-token `byte_over_zip_fit` point, ZipServ completes with zero
+preemptions while ByteV2 crosses its measured boundary. This proves that
+weight compression frees memory that can be consumed by additional **raw
+BF16 KV slots**; it is not evidence that KV data itself was compressed in
+this experiment.
+
+The independent token-hash audit finds 360/360 complete three-mode pairing
+groups and no unpaired requests. Capacity requests are 480/480 exactly equal.
+Performance requests are 4,912/4,920 three-way hash exact (99.8374%), with
+eight hash-mismatch records, zero token-count mismatches, and zero finish/stop
+mismatches. Pairwise exact counts are 4,914/4,920 for Raw/ZipServ and
+4,915/4,920 for both Raw/ByteV2 and ZipServ/ByteV2. The eight records reduce
+to four unique block/round/request-prompt contexts. Six records come from two
+P128 contexts, each repeated at O128/O512/O2048. In a post-hoc input-level
+view, the deduplicated rate is therefore 4/2,952 contexts (0.1355%), rather
+than eight independent prompts; this does not replace the preregistered
+8/4,920 cell-record statistic.
+
+There are no three-way splits: ByteV2 is isolated in two records/two contexts,
+ZipServ in three records/one context, and Raw in three records/one context.
+All four contexts are B32 and have equal synthetic global-sample and request
+indices (12, 15, 20, and 22); this is clustering evidence, not a demonstrated
+cause. Retained performance results store token-array hashes rather than full
+token arrays, so the first divergent token and Hamming distance cannot be
+reconstructed. The formal performance exactness gate is therefore **false**:
+the mismatch rate is small and completion metadata is equal, but this run does
+not justify a bitwise-lossless claim or by itself establish task-level accuracy
+equivalence.
+
+Artifacts:
+
+- `profile/clean-weight-performance-router-formal-20260801/REPORT.md`
+- `profile/clean-weight-performance-router-formal-20260801/formal-v1-token-audit/`
+- `profile/clean-weight-performance-router-formal-20260801/formal-v1-token-audit/MISMATCH_ANALYSIS.md`
+- `profile/clean-weight-performance-router-formal-20260801/comparisons/clean-weight-performance-router-formal-v1-gpu5-20260801/`
+- `/mnt/sdb/yxz/ByteV2/ZipServ_ASPLOS26/.results/clean-weight-performance-router-formal-v1-gpu5-20260801/analysis/`
+
+### A40 ByteV2 Weight Persistent-Hydrate Rejection (2026-08-02)
+
+The high-M weight-hydrate follow-up tested two launch-scheduling alternatives
+without changing the checkpoint format, BF16 reconstruction, dense GEMM, or KV
+ByteV2. A full logical-page grid throttled with unused dynamic shared memory
+regresses gate/up hydrate by 1.53%--16.16% for caps of 3--6 resident blocks per
+SM; a cap of 2 regresses 8.47%. This route is rejected.
+
+A fixed-grid persistent kernel instead walks pages through a noinline device
+helper. Unlike the historical naive grid-stride attempt, it keeps scalar and
+vector register use at 46/53 rather than 111/122, with zero spills or local
+memory. At grid 168 it reconstructs gate/up and down 11.43% and 11.27% faster
+than chunked-168. O improves 3.95%, while QKV regresses 2.80%. All complete
+weights and hydrate-plus-dense outputs are bitwise equal to raw BF16.
+
+NCU establishes that this is a boundary-elimination result, not less decode
+work. For gate/up, persistent executes 52.996 million instructions versus an
+extrapolated 51.971 million for the 21 full chunks plus tail, and its total
+DRAM traffic is 3.46% higher. It removes 21 launches and raises sustained DRAM
+throughput, but long-scoreboard PC samples rise from 58.03% to 71.71%. The
+remaining dependency is on low/code/base loads; the high-byte arithmetic line
+where samples land is their consumer.
+
+The real side-stream layer pipeline rejects promotion. A strict paired run
+keeps QKV full-grid and O chunked, then switches only gate/up and down to
+persistent-168. M256 hot/cold P50 improves 3.00%/3.19%, but M1024 is
+0.00%/+0.35%, M4096 is +0.05%/+0.19%, and M8192 is +0.25%/-0.53%. The M8192
+hot mean ratio is 1.00053 with 95% block-bootstrap CI
+`[0.99818,1.00301]`. Adding O does not recover M8192. Persistent grids 84 and
+126 regress the M1024 pipeline by 8.77% and 5.00%, respectively.
+
+The standalone win disappears because persistent CTAs continuously consume
+memory while the dense GEMM is active. Chunked launches intentionally create
+CTA scheduling boundaries; lowering persistent concurrency delays the next
+ready weight more than it reduces contention. The production chunked-168
+route is therefore retained, and no formal E2E promotion run is claimed. The
+next bounded kernel experiment is a two-tile low/code/base software-prefetch
+pipeline with a 64-register and zero-spill gate. The larger E2E direction is
+to reduce repeated per-wave hydration across long-prefill scheduler waves,
+not to fuse more hydrate launches.
+
+Artifacts:
+
+- `profile/bytev2-weight-residency-capped-hydrate-a40-20260802/REPORT.md`
+- `profile/bytev2-weight-residency-capped-hydrate-a40-20260802/reports/`
+- `profile/bytev2-weight-residency-capped-hydrate-a40-20260802/analysis/`
+- `profile/bytev2-weight-residency-capped-hydrate-a40-20260802/figures/`
+
+### A40 Static-W16 Direct FA2 Reader Gate (2026-08-19)
+
+The arithmetic Static-W16 candidate has been transplanted into the existing
+FA2 external KV loader without changing QK, online softmax, PV, split-K, or the
+original combine kernel. Its sealed page stores one sign/mantissa byte and one
+4-bit contiguous exponent-window code per BF16 value, a 128-byte header, and
+eight exact 32-bit exponent patches for each of 16 `(K/V, kv_head)` chunks.
+The resulting page is 49,792 bytes, a fixed 24.0234% saving versus raw BF16,
+compared with 50,560 bytes / 22.8516% for V6. Partial or cap-overflow pages are
+authoritatively raw through a fail-closed status and page-to-sidecar map.
+
+The reader has a separate experimental `static_w16_varlen_fwd` entry point.
+It stages the raw sign/mantissa plane and row-major code plane directly into
+FA2 shared memory, reconstructs BF16 there, applies chunk-local patches, and
+returns to the unchanged mainloop. Eight 32-byte shared page descriptors add
+256 bytes after the 48 KiB aliased K/V tile. A private extension was built and
+loaded explicitly; the installed V6/SplitZip baseline extension was not
+overwritten. The private SHA256 is
+`459e8d8da990daed8710c8c1c7af4cbe53e06be10d2da44778905aa69b65d8af`.
+
+The formal comparison uses one A40, identical captured Llama layer-0 K/V,
+explicit splits 16/19/20 at sequence 4K/16K/65K, all 24 backend permutations,
+and five fresh processes per point. The primary protocol has 12 warmups and
+60 CUDA-event samples of 20 calls each. Raw/V6/fixed-SplitZip/Static-W16 P50
+latencies are respectively 48.768/50.227/50.125/50.637 us at 4K,
+121.600/112.077/112.435/111.027 us at 16K, and
+422.093/375.091/379.136/368.154 us at 65K. Static-W16 / V6 paired P50 changes
+are +0.971%, -0.891%, and -1.815%; paired P95 changes are +0.603%, -0.728%,
+and -1.963%. It therefore passes the predeclared direct-reader gate: the 4K
+regression is below 2%, while 16K and 65K improve.
+
+All 30 formal wire checks, 90 compressed-reader output/LSE comparisons, and 30
+forced-overflow gates are bitwise exact. Directed validation additionally
+covers partial tails, permuted pages, ragged batches, shared prefixes, Q4,
+split combine, sparse compact patches, and a remapped raw sidecar with poisoned
+compact payload. Memcheck reports zero errors at sequence 73 and 4099. The
+actual format-2 split kernel uses 255 registers/thread and 49,408 bytes dynamic
+shared memory plus 1,024 driver bytes, retains a two-CTA/SM resource ceiling,
+and has no local load/store or spill.
+
+NCU at 65K/split20 reports Static-W16/V6 replay durations of
+427.264/439.328 us and DRAM reads of 237.267/241.752 MB. Static-W16 executes
+15.67% more dynamic instructions, but global-load sectors fall 48.79%, while
+long- and short-scoreboard ratios fall 27.08% and 49.37%. The gain is therefore
+an access-organization/dependency-stall result rather than instruction
+reduction. Formal CUDA-event data, not NCU replay duration, remains the
+performance authority.
+
+This advances Static-W16 to a bounded E2E prototype, not production. The
+current packer is offline, calibration is not yet cross-model, and the test
+sidecar is densely allocated. The next gate is an online sealed-page writer
+with a sparse fallback allocator, followed by B1 4K/16K/65K TTFT/TPOT/TPS,
+token equality, and a scheduler capacity-boundary test that counts all
+sidecar/allocator bytes and actually consumes the added slots.
+
+Artifacts:
+
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/REPORT.md`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/analysis/`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/reports/`
+
+### A40 Static-W16 Shared-Pool Writer and vLLM E2E Gate (2026-08-19)
+
+The preceding eight-entry-per-chunk Static-W16 result was not sufficient for
+an online runtime.  In a compiled 4K-prompt capture spanning 8,192 logical
+layer-pages, frozen layer/K/V bases produced 2,788 complete pages whose local
+chunk escape count exceeded eight.  The largest page contained only 71 total
+escapes, so the failure was caused by statically partitioning the existing
+128-record capacity rather than by insufficient page-wide capacity.  With the
+default 49 raw sidecar slots per layer, those unnecessary whole-page fallbacks
+exhausted the allocator and correctly tripped the fail-closed path.
+
+Static-W16 v2 retains the 49,792-byte fixed page and replaces the 16 local
+eight-record pools with a page-shared 128-record pool.  The first 64 header
+bytes are a 16-entry tagged directory; each entry contains the start and count
+of one `(K/V, kv_head)` range.  The FA2 loader therefore scans only the current
+chunk's records rather than all 128 entries.  The generic sealed-page writer
+uses one CTA per chunk and atomically reserves a contiguous page range, while
+the Q1 seal path uses the same format.  Page totals through 128 remain compact;
+129 and partial pages use the authoritative raw sidecar.  The fixed saving is
+unchanged at 24.0234% relative to a 65,536-byte raw page.
+
+The native writer gate covers compact totals 0/1/9/128, a 129-entry fallback,
+compact/raw hydration, Q1 sealing and demotion, repeated reset, and allocator
+conservation.  The direct FA2 matrix also covers partial and ragged inputs,
+permuted block tables, shared prefixes, Q4, split combine, exact-128 compact
+pages, and a remapped raw fallback.  All directed BF16 round trips and all
+FA2 output/LSE comparisons are bitwise exact.  The online pack and Q1 kernels
+use 28 and 34 registers respectively with no spill; the W16 FA2 kernel uses
+252--255 registers and retains the two-CTA/SM resource ceiling.
+
+Compiled graph bring-up exposed a separate vLLM lifecycle bug.  W16 empty
+headers require tagged zero-range descriptors, but synthetic warmup allocated
+blocks outside the scheduler and did not report them through
+`new_block_ids_to_zero`.  The block zeroer now writes a tagged W16 header and
+synthetic warmup reports its prefill/decode allocations only when a zeroer is
+configured.  Raw configurations continue to leave that field unset.  Targeted
+unit tests cover both cases, and compiled Raw and W16 smoke runs pass.  A
+compiled W16 P4096/O8 reproduction completes with `fatal=0`, zero preemptions,
+and 32 raw pages total, consistent with one mutable partial tail per layer.
+
+The shared-pool direct-reader rerun uses ten fresh processes at each of
+4K/16K/65K, 12 warmups, 60 samples, and 20 calls per sample.  All 90 compressed
+output/LSE comparisons and all forced fallback checks are bitwise exact.  W16
+relative to V6 has paired P50 changes of +1.079%, -3.375%, and +0.252%; relative
+to Raw it changes by +3.700%, -10.810%, and -11.950%.  The 65K shared-pool W16
+P50 is 371.174 us, 0.821% slower than the earlier local-cap8 W16 binary.  Since
+the old and new formats were separate builds, this is an observed regression,
+not yet a source-isolated directory cost.  It invalidates a no-regression claim
+against cap8 even though the shared pool fixes the allocator failure.
+
+The first vLLM E2E gate uses one A40, Llama-3.1-8B-Instruct, B1, prompts
+4K/16K/65K, O256, compiled graphs, a fixed 20,000,000,000-byte KV budget, and
+six balanced fresh-process order blocks.  Raw, V6, and W16 produce identical
+256-token sequences for all 18 block/length groups; W16 attests all 32 layers,
+`fatal=0`, and zero preemptions.  The paired median W16 results are:
+
+| Prompt | versus | TTFT | TPOT | request E2E |
+| ---: | :--- | ---: | ---: | ---: |
+| 4K | Raw | +3.946% | +0.818% | +1.093% |
+| 16K | Raw | +4.193% | -0.632% | +0.785% |
+| 65K | Raw | +1.521% | -2.234% | +0.341% |
+| 4K | V6 | +3.039% | -0.011% | +0.210% |
+| 16K | V6 | +3.453% | +0.461% | +1.393% |
+| 65K | V6 | +1.382% | +2.644% | +1.777% |
+
+Thus compressed reads now reduce TPOT relative to Raw at 16K and 65K, but the
+TTFT cost still cancels that gain.  V6 remains the best 65K E2E path.  The
+isolated 65K W16 reader is only 0.252% behind V6, so the 2.644% E2E TPOT gap
+cannot be assigned to the reader alone; writer, page-lifecycle, and per-layer
+integration costs are the next attribution target.
+
+Under the same 20-GB planner budget, Raw exposes 9,536 blocks / 152,576 tokens,
+V6 exposes 12,132 / 194,112, and W16 exposes 12,318 / 197,088.  W16 therefore
+adds 29.174% token capacity over Raw and 1.533% over V6 after sidecar and staging
+accounting.  The 65K B1 run consumes only 33.38% of the W16 plan, however.  This
+gate proves that the production planner exposes the extra slots, but it does
+not itself consume the Raw-infeasible/W16-feasible interval.
+
+A separate B16/P8192 gate hits a Raw-only scheduler capacity cliff.  With a
+fixed 17.3-GB KV budget and O64, Raw exposes 8,249 blocks against a
+block-aligned logical final demand of 8,256 and records one preemption.  W16
+exposes 10,613 blocks (+28.658%), has zero preemptions, keeps `fatal=0`, and
+conserves its sidecar allocator.  All 16 prompts and complete 64-token outputs
+match.  A separate step-instrumented replay observes W16
+`peak_kv_cache_usage=0.7779871843`; because vLLM excludes its permanent null
+block from the usage denominator, this is exactly 8,256 used non-null blocks.
+It exceeds Raw's 8,249-block total plan by seven and its 8,248 non-null capacity
+by eight.  Raw peaks at 8,247 observed blocks and records one preemption plus
+8,236 discarded KV tokens, while W16 records zero for both.  Replay tokens are
+equal across methods and match their clean runs.  This therefore proves W16
+actually consumes physical KV capacity unavailable to Raw in the same budget.
+The single W16-to-Raw pair reaches 39.831 versus 38.804 completed output token/s
+(+2.646%), but this throughput number has no reversed-order repeat or confidence
+interval.  It proves that W16 delays the scheduler capacity cliff, not a stable
+unconditional speedup.  A 16-GB/O32 diagnostic also shows why demand alone is
+insufficient: when Raw cannot admit the prompt working set, the scheduler
+throttles concurrency instead of necessarily preempting, and W16 is 0.799%
+slower in that cell.
+
+The next bounded work is to profile writer/commit and page lifecycle separately,
+then repeat the capacity crossing in Raw-to-W16 order and at additional B8/B32
+shapes.  The current statistics are six independent processes per B1 E2E cell,
+so their P95 values are descriptive rather than production-tail estimates.
+Results are limited to one A40, one model, and synthetic prompts.  Production
+hardening must also decide where to validate all 16 shared-pool ranges for
+global non-overlap: the hot FA2 reader currently validates only the current
+chunk's tag/start/count and trusts pages published by the in-process writer.
+
+Artifacts:
+
+- `profile/bytev2-static-w16-vllm-e2e-a40-20260819/REPORT.md`
+- `profile/bytev2-static-w16-vllm-e2e-a40-20260819/analysis/`
+- `profile/bytev2-static-w16-vllm-e2e-a40-20260819/results/`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/reports/formal_shared128_gpu4/`
+- `profile/bytev2-static-w16-native-writer-gate-a40-20260819/`
+- `profile/bytev2-static-w16-capacity-boundary-a40-20260819/`
+
+### A40 Static-W16 Attribution, Reversed Capacity Crossing, and Source-Isolated cap8 Gate (2026-08-26)
+
+The current production-path attribution identifies
+`byte_v2_prepare_raw_staging_kernel`, rather than the FA2 reader or Q1 decode,
+as the dominant Static-W16 prefill penalty.  At B1/P16384, the pure W16 writer
+uses 167.442 ms of GPU active time versus 8.969 ms for the Raw reshape writer;
+prepare alone uses 138.095 ms, or 82.47% of the W16 writer.  At B1/P65536, the
+corresponding values are 706.335, 36.033, and 580.078 ms, with prepare again
+accounting for 82.13%.  The implementation launches 64 CTAs for each 16K
+scheduler chunk, but only block 0/thread 0 processes the 16,384-token mapping
+serially.  The four commit kernels account for only 7.460 and 33.049 ms
+(4.45% and 4.68%), while page-lifecycle kernels account for 0.181 and
+0.583 ms.  The compiled Q1 graph kernel totals approximately 1.056 ms across
+224 launches, or 4.7 us per layer-step.  The next prefill optimization target
+is therefore a page-parallel prepare path; the page format, append, hydrate,
+commit, FA2 reader, split, and combine paths should remain unchanged for that
+ablation.
+
+These Nsight results are stage attribution, not a new formal E2E result.  The
+available Raw/V6/W16 diagnostic matrix contains one measured generation per
+method and shape.  Its W16-versus-Raw wall-time deltas range from +0.13% to
++6.80%, but the rows are neither independent repetitions nor P50/P95
+distributions.  They locate the prepare bottleneck and must not be cited as a
+stable E2E regression estimate.
+
+The Raw-to-W16 reversed capacity crossing repeated the earlier B16/P8192/O64
+test under the same exact 17.3-GB KV budget.  Raw completed in 26.106299 s at
+39.224250 completed output token/s with one preemption; W16 completed in
+25.725105 s at 39.805474 token/s with zero preemptions, corresponding to
+-1.4602% wall time and +1.4818% goodput.  The instrumented replay measured
+8,247 resident non-null blocks and 8,236 discarded KV tokens for Raw, versus
+8,256 blocks and zero discarded tokens for W16.  W16 therefore consumed seven
+more blocks than Raw's 8,249-block total plan and eight more than its
+8,248-block usable capacity.  All 16 complete 64-token outputs were exact.  The
+earlier W16-to-Raw pair measured +2.6461% goodput; across the two execution
+orders, the descriptive median is +2.0640% with a range of +1.4818% to
++2.6461%.  Two process-level pairs do not provide a confidence interval or an
+unconditional speed claim; they establish that W16 delays the scheduler
+capacity cliff.
+
+The phase-1 cap8/shared128 comparison used a single cohabitation binary, ten
+fresh processes per sequence length, balanced 5/5 allocation order, 12
+warmups, and 60 CUDA-event samples of 20 calls each.  Every one of the 30 rows
+passed wire, Raw-FA2 output/LSE, and directed poisoned-sidecar correctness
+gates.  The median absolute P50 latencies and median within-process paired
+ratios were:
+
+| Sequence / splits | cap8 P50 | shared128 P50 | paired shared128/cap8 P50 | paired shared128/cap8 P95 |
+| ---: | ---: | ---: | ---: | ---: |
+| 4K / 16 | 52.518 us | 52.736 us | 1.000917 | 1.035171 |
+| 16K / 19 | 120.858 us | 118.720 us | 0.981493 | 1.000001 |
+| 65K / 20 | 405.402 us | 406.413 us | 1.003012 | 1.016054 |
+
+A ratio above one favors cap8.  The nominal 65K P50 advantage is not robust:
+its 0.301% pooled signal is smaller than the 0.373-percentage-point
+allocation-order interaction.  More importantly, adding cap8 to the same
+translation unit changed the production noncausal shared128 split kernel from
+255 registers and 4,280 SASS instructions in the stable build to 248 registers
+and 4,304 instructions.  Phase 1 is therefore a codegen-confounded
+cohabitation experiment, not a format-only result.  Its append-only v3
+provenance correction revalidates all preserved rows and reproduces the
+complete numerical summary, while explicitly recording that the exact
+original analyzer source was not frozen.
+
+To remove that confound, the cap8 causal and noncausal implementations were
+moved into separate translation units, and the production loader and launch
+headers no longer reference cap8.  The clean isolated FA2 shared object has
+SHA-256
+`6992cf77a264129b79762858f4f54cd9acf77d8ff3ce3f511841c79f44d910a0`;
+the stable control remains
+`800b19c25ff0448104fd239d9a3a67c255efcdb3214a6fd9fd0b94b27d69c23e`.
+The self-bound v4 fail-closed codegen audit passes.  Production causal and
+noncausal device SASS and resource dumps are exact between stable and isolated
+objects, and all 18 linked production E0/E1/E2 main variants occur once and
+match the stable objects.  All six linked cap8 main variants occur once and
+match their originating objects.  The formal noncausal cap8 split kernel uses
+255 registers, 4,248 SASS instructions, 49,408 bytes of dynamic shared memory,
+and no local or stack storage.  The relevant Log4/Log5 combine code and
+resources are also exact per linked copy.  This audit establishes production
+codegen isolation; it is not itself a performance result.
+
+The source-isolated formal timing gate used one idle A40, sequence lengths
+4K/16K/65K with splits 16/19/20, ten fresh processes per point, balanced 5/5
+allocation order, 12 warmups, and 60 samples of 20 calls each.  Each process
+first produces a P50/P95 from its 60 samples; the values below are the medians
+of the ten process-level statistics.  All 30 rows completed.  The gate reports
+60/60 bitwise wire checks, 90/90 main output/LSE comparisons, and 360/360
+directed output/LSE comparisons with zero mismatch.  Both formats have zero
+natural fallback on the formal capture.  The separate pre-run seq64/split0
+compute-sanitizer device gate reports zero errors.
+
+| Sequence / splits | cap8 P50 / P95 | unchanged shared128 P50 / P95 | paired shared128/cap8 P50 / P95 | cap8->shared / shared->cap8 paired P50 | P50 order gap |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4K / 16 | 51.904 / 52.710 us | 52.172 / 52.890 us | 1.005247 / 1.034068 | 1.006021 / 0.998120 | 0.790 pp |
+| 16K / 19 | 119.629 / 120.934 us | 118.016 / 119.245 us | 0.986763 / 1.005164 | 0.985911 / 0.987616 | 0.170 pp |
+| 65K / 20 | 397.312 / 408.448 us | 401.818 / 414.694 us | 1.010186 / 1.023572 | 1.010264 / 1.010107 | 0.016 pp |
+
+The 4K paired-P50 cap8 advantage is 0.525%, smaller than the 0.790-point
+allocation-order gap, and changes sign across the P50 allocation-order strata,
+so it is not robust.  At 16K, all ten process-level paired P50 ratios favor
+shared128 and cap8 is 1.367% slower by the absolute process-median P50.  At
+65K, all ten process-level paired P50 ratios favor cap8; its absolute P50 is
+1.121% lower and the paired central advantage is 1.019%, with only a
+0.016-point order interaction.  The result is therefore length-dependent
+rather than a universal cap8 win.
+
+The production format remains shared128.  Both formats occupy the same
+49,792-byte fixed page, so cap8 has no capacity advantage.  Its per-chunk
+eight-record compact domain is a strict subset of the page-shared 128-record
+domain: the directed nine-entry case already forces cap8 to Raw while
+shared128 remains compact.  On the earlier compiled vLLM P4096 capture
+spanning all 32 layers with frozen per-layer bases, cap8 overflows 2,788 of
+8,192 complete layer-pages (34.03%), whereas the maximum page-total escape
+demand is 71 and fits shared128.  This allocator risk, the stable 16K
+regression, and the single-model and bounded-capture scope outweigh the
+isolated 65K reader gain.  Cap8 remains a profile-only candidate; its formal
+noncausal split main kernel has 32 fewer static SASS instructions than
+unchanged shared128.  That difference is useful evidence for simplifying the
+shared128 reader, not a reason to replace the page format.
+
+The next bounded production optimization is page-parallel prepare, keeping
+shared128 wire, append, hydrate, commit, page lifecycle, FA2, split-K, and
+combine unchanged.  Reader micro-optimization can follow as an independent
+ablation, using the cap8 65K loader as an instruction-scheduling reference.
+
+Artifacts:
+
+- `profile/bytev2-static-w16-current-attribution-a40-20260819/REPORT.md`
+- `profile/bytev2-static-w16-capacity-boundary-a40-20260819/reverse_raw_w16_r1/REPORT.md`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/reports/cap8_shared128_ab/formal_gpu1_b8eb_20260820/REPORT_v3.md`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/reports/cap8_shared128_ab/formal_gpu1_b8eb_20260820/PROVENANCE_v3.json`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/reports/cap8_shared128_isolated/codegen_6992_20260826_v4/codegen_audit.json`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/reports/cap8_shared128_isolated/device_gate_gpu0_6992_20260826_v2/DEVICE_GATE_SUMMARY.json`
+- `profile/bytev2-static-w16-fa2-reader-a40-20260819/reports/cap8_shared128_isolated/formal_gpu1_6992_20260826_v1/`
+
+### A40 Static-W16 Page-Parallel Prepare (2026-08-26)
+
+The Static-W16 prefill bottleneck was the raw-staging prepare operation, which
+previously launched a grid but let only block 0/thread 0 walk the complete
+`slot_mapping` serially.  Prepare does not move K/V payload: it constructs the
+transient physical-page-to-staging-slot bijection, the reverse map, and the
+maximum valid row for each page.  The new path preserves the 49,792-byte
+shared128 wire and leaves hydrate, append, commit, release, FA2, split-K, and
+combine unchanged.
+
+For eligible inputs, one warp validates each 16-token group.  Every active lane
+must name the same valid physical page, different groups must name different
+pages, allocator state must be clean, and the number of groups must fit the
+staging capacity.  A deterministic temporary claim records the group owner.
+A second same-stream kernel either publishes group index as the staging slot,
+thereby retaining encounter order, or removes every temporary claim.  A third
+kernel invokes the exact original serial loop only when validation requested a
+fallback.  Negative slots, cross-page groups, duplicate pages, nonempty state,
+malformed mappings, and insufficient capacity therefore retain the old
+semantics.  Unexpected publication failure traps instead of exposing a
+partially published map.  The fast path is selected for at least 256 tokens and
+can be disabled with
+`BYTE_V2_RAW_STAGING_PAGE_PARALLEL_PREPARE=0` for rollback.
+
+The isolated same-binary A40 microbenchmark uses reversed unique page order,
+30 warmups, and 100 CUDA-event samples per process.  Release occurs after the
+stop event.  Three fresh-process repetitions agree; the table shows the median
+P50 values across those processes:
+
+| Tokens | serial prepare | page-parallel prepare | P50 speedup |
+| ---: | ---: | ---: | ---: |
+| 16 | 22.528 us | 22.528 us | 1.00x |
+| 144 | 38.912 us | 37.888 us | 1.03x |
+| 256 | 52.224 us | 27.648 us | 1.89x |
+| 512 | 99.328 us | 27.648 us | 3.59x |
+| 2,048 | 381.952 us | 27.648 us | 13.81x |
+| 4,096 | 758.784 us | 27.648 us | 27.44x |
+| 16,384 | 3,018.752 us | 27.648 us | 109.19x |
+
+The geometric-mean P50/P95 speedups over dispatch-eligible lengths are
+12.29x/11.53x.  An auxiliary same-GPU check found 3,025.920 us for the old
+private binary at 16K, close to the candidate's disabled-path 3,018.752 us;
+this quick control was not frozen as a formal artifact and is not an acceptance
+gate.  It nevertheless indicates that the main result is not explained by
+merely reducing the old idle launch grid.  The near-constant parallel time is
+expected for this range because all groups execute concurrently and the path
+is launch/atomic-publication dominated.
+
+The P16K event attribution uses one B1/O8 matched pair across 32 W16 layers.
+Prepare falls from 137.339 ms total, or 4,291.840 us per layer, to 0.472 ms
+total, or 14.752 us per layer (-99.656%).  The complete writer falls from
+166.382 to 29.598 ms (-82.211%), while hydrate, append, commit, and release stay
+within approximately 0.4% in this diagnostic pair.  Prepare's share of writer
+time falls from 82.54% to 1.59%, so it is no longer the first-order writer
+bottleneck.
+
+Clean compiled-vLLM results use Llama-3.1-8B-Instruct, Static-W16, B1/O8, no
+logprobs/prefix/speculation, and three fresh serial/parallel pairs per prompt
+length.  Each cell reports the median paired change:
+
+| Prompt | TTFT | process wall time | TPS | TPOT |
+| ---: | ---: | ---: | ---: | ---: |
+| 4K | -3.903% | -3.036% | +3.131% | -0.035% |
+| 16K | -3.095% | -2.922% | +3.010% | -0.067% |
+| 65K | -2.033% | -2.012% | +2.053% | -0.134% |
+
+All nine clean pairs and the event pair have identical prompt hashes and
+generated tokens, attest all 32 W16 layers, conserve the fallback allocator,
+and report zero fatal state and zero preemptions.  TPOT is intentionally
+unchanged: single-token decode uses the fused Static-W16 raw-tail update and
+does not enter the generic prepare path.  The absolute TTFT saving increases
+with context length even though its percentage decreases, because cached
+prefill attention and hydration account for more of the 65K critical path.
+
+Correctness coverage includes 15 direct metadata/graph tests and 16 existing
+writer-pipeline tests.  It covers 255/256/257/4096 tokens, ragged and permuted
+mappings, duplicate and negative slots, late cross-page failure after earlier
+groups have claimed pages, capacity overflow, nonempty allocator reuse,
+release/reuse, and CUDA Graph replay with changing mappings.  Compute Sanitizer
+passes five targeted fast, cleanup/fallback, graph, positive-out-of-range, and
+capacity-bypass cases with zero errors.  The serial, validate, and finalize
+kernels use 22, 22, and 25 registers per thread, respectively, with zero stack,
+local, or static shared memory.
+
+The candidate is kept default-on behind the rollback environment selector in
+the private build.  This result is bounded to one A40, one model, B1, aligned
+long-prefill mappings, and three clean process pairs per shape; arbitrary
+mappings deliberately use the serial fallback, and B8/B32 still require a
+production gate.  The next prefill target is now append/hydrate/commit and, at
+long context, cached-prefill attention rather than prepare.  The candidate SO
+was built in an independent prefix with SHA-256
+`1c5a7ba40ba78ab3327d53a738d5c6bf3056b98f783d6febdc3d295f0be6c2a6`;
+neither the installed binary nor the prior stable private binary was replaced.
+
+Artifacts:
+
+- `profile/bytev2-page-parallel-prepare-a40-20260826/REPORT.md`
+- `profile/bytev2-page-parallel-prepare-a40-20260826/results/formal_gpu5_1c5a_20260826_v1/`
+- `profile/bytev2-page-parallel-prepare-a40-20260826/results/formal_gpu5_1c5a_20260826_v2/`
+- `profile/bytev2-page-parallel-prepare-a40-20260826/results/formal_gpu5_1c5a_20260826_v3/`
+- `profile/bytev2-page-parallel-prepare-a40-20260826/results/e2e_analysis_gpu4_1c5a_20260826_v1.json`
+- `profile/bytev2-page-parallel-prepare-a40-20260826/results/e2e_clean_p4k_p65k_gpu4_1c5a_20260826_v1/`
+- `profile/bytev2-page-parallel-prepare-a40-20260826/results/e2e_events_gpu4_1c5a_20260826_v1/`

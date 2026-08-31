@@ -27,6 +27,7 @@ def _metadata(
     num_actual_tokens=None,
     *,
     seq_lens_cpu_upper_bound=None,
+    is_prefilling=None,
 ):
     if num_actual_tokens is None:
         num_actual_tokens = query_start_locs[-1]
@@ -37,6 +38,11 @@ def _metadata(
             None
             if seq_lens_cpu_upper_bound is None
             else torch.tensor(seq_lens_cpu_upper_bound, dtype=torch.int32)
+        ),
+        is_prefilling=(
+            None
+            if is_prefilling is None
+            else torch.tensor(is_prefilling, dtype=torch.bool)
         ),
     )
 
@@ -193,6 +199,86 @@ def test_byte_v2_cached_row_keeps_conservative_page_bound():
     ]
 
 
+def test_byte_v2_marks_only_page_aligned_prefill_waves_as_overwriting():
+    waves = plan_byte_v2_raw_staging_waves(
+        34,
+        2,
+        _metadata(
+            [0, 34],
+            seq_lens_cpu_upper_bound=[50],
+            is_prefilling=[True],
+        ),
+    )
+
+    assert [
+        (
+            wave.start,
+            wave.end,
+            wave.max_unique_pages,
+            wave.overwrites_all_valid_rows,
+        )
+        for wave in waves
+    ] == [
+        (0, 17, 2, True),
+        (17, 34, 2, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("is_prefilling", "seq_len", "expected"),
+    [
+        ([True], 32, True),
+        ([True], 17, False),
+        ([True], 15, False),
+        ([False], 32, False),
+        (None, 32, False),
+    ],
+)
+def test_byte_v2_page_aligned_overwrite_proof_fails_closed(
+    is_prefilling,
+    seq_len,
+    expected,
+):
+    waves = plan_byte_v2_raw_staging_waves(
+        16,
+        2,
+        _metadata(
+            [0, 16],
+            seq_lens_cpu_upper_bound=[seq_len],
+            is_prefilling=is_prefilling,
+        ),
+    )
+
+    assert len(waves) == 1
+    assert waves[0].overwrites_all_valid_rows is expected
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "expected"),
+    [
+        ([20, 20], True),
+        ([20, 5], False),
+    ],
+)
+def test_byte_v2_merged_wave_requires_every_request_segment_to_be_aligned(
+    seq_lens,
+    expected,
+):
+    waves = plan_byte_v2_raw_staging_waves(
+        8,
+        4,
+        _metadata(
+            [0, 4, 8],
+            seq_lens_cpu_upper_bound=seq_lens,
+            is_prefilling=[True, True],
+        ),
+    )
+
+    assert len(waves) == 1
+    assert (waves[0].start, waves[0].end) == (0, 8)
+    assert waves[0].overwrites_all_valid_rows is expected
+
+
 def test_byte_v2_page_aware_wave_bounds_many_one_token_requests():
     query_start_locs = list(range(130))
 
@@ -228,6 +314,8 @@ class _WorkspaceImpl:
         self.workspace = None
         self.raw_plan = None
         self.raw_state_cache = None
+        self.decoded_prefix_cache_plan = None
+        self.decoded_prefix_cache_bytes = 0
         self.hybrid_raw_mutable_tail_q1 = False
         self.fa2_hybrid_raw_fallback = True
 
@@ -244,6 +332,15 @@ class _WorkspaceImpl:
 
     def initialize_raw_fallback_state(self, kv_cache):
         self.raw_state_cache = kv_cache
+
+    def bind_decoded_prefix_cache_plan(self, kv_cache, num_cache_slots):
+        self.decoded_prefix_cache_plan = (kv_cache, num_cache_slots)
+        self.decoded_prefix_cache_bytes = num_cache_slots * (
+            self.spec.slot_size_bytes + 8
+        )
+
+    def decoded_prefix_cache_nbytes(self):
+        return self.decoded_prefix_cache_bytes
 
 
 def test_bind_byte_v2_raw_staging_workspace_shares_one_allocation():
@@ -281,6 +378,45 @@ def test_bind_byte_v2_raw_staging_workspace_shares_one_allocation():
     assert impls[1].raw_plan == (4, 1)
     assert impls[0].raw_state_cache is context["0"].kv_cache
     assert impls[1].raw_state_cache is context["1"].kv_cache
+
+
+def test_bind_byte_v2_raw_staging_workspace_accounts_decoded_prefix_cache():
+    spec = ByteV2RawStagingWorkspaceSpec(
+        num_blocks=4,
+        num_staging_slots=2,
+        slot_size_bytes=64,
+        device=torch.device("cpu"),
+    )
+    impls = [_WorkspaceImpl(spec), _WorkspaceImpl(spec)]
+    context = {
+        str(index): SimpleNamespace(
+            impl=impl,
+            kv_cache=torch.empty((4, 1), dtype=torch.uint8),
+        )
+        for index, impl in enumerate(impls)
+    }
+    cache_slots = 3
+    cache_bytes = len(impls) * cache_slots * (spec.slot_size_bytes + 8)
+    config = SimpleNamespace(
+        num_blocks=4,
+        byte_v2_raw_fallback_slots=1,
+        byte_v2_raw_staging_slots=2,
+        byte_v2_raw_staging_workspace_bytes=spec.nbytes,
+        byte_v2_decoded_prefix_cache_slots=cache_slots,
+        byte_v2_decoded_prefix_cache_bytes=cache_bytes,
+    )
+
+    workspace = bind_byte_v2_raw_staging_workspace(
+        context,
+        config,
+        use_ubatching=False,
+    )
+
+    assert workspace is not None
+    plans = [impl.decoded_prefix_cache_plan for impl in impls]
+    assert all(plan is not None for plan in plans)
+    assert [plan[1] for plan in plans if plan is not None] == [3, 3]
+    assert sum(impl.decoded_prefix_cache_bytes for impl in impls) == cache_bytes
 
 
 def test_bind_byte_v2_raw_staging_workspace_rejects_capability_mismatch():

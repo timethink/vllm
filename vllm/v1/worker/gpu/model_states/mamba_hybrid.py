@@ -139,6 +139,8 @@ class MambaHybridModelState(DefaultModelState):
             kv_cache_config=kv_cache_config,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             model_specific_attn_metadata=mamba_attn_metadata,
+            cascade_attn_prefix_lens=input_batch.cascade_attn_prefix_lens,
+            cascade_prefix_cache_key=input_batch.cascade_prefix_cache_key,
             for_cudagraph_capture=for_capture,
         )
 

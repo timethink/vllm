@@ -1,0 +1,370 @@
+{
+  "all_bitwise": true,
+  "default_unset_smoke": {
+    "eager_output_lse_bitwise": true,
+    "file": "results/smoke-default-unset-s1024.json",
+    "graph_output_lse_bitwise": true,
+    "num_splits": 8,
+    "sequence_length": 1024,
+    "wire_bitwise": true
+  },
+  "graph_results": {
+    "65536": {
+      "default": {
+        "bitwise": true,
+        "files": [
+          "results/default/s65536-r1.json",
+          "results/default/s65536-r2.json",
+          "results/default/s65536-r3.json"
+        ],
+        "raw_graph": {
+          "max_us": 419.02079582214355,
+          "median_us": 418.99518966674805,
+          "min_us": 418.91841888427734,
+          "range_us": 0.10237693786621094,
+          "values_us": [
+            418.99518966674805,
+            419.02079582214355,
+            418.91841888427734
+          ]
+        },
+        "w16_graph": {
+          "max_us": 357.4015974998474,
+          "median_us": 357.19679594039917,
+          "min_us": 355.5327892303467,
+          "range_us": 1.8688082695007324,
+          "values_us": [
+            357.4015974998474,
+            355.5327892303467,
+            357.19679594039917
+          ]
+        },
+        "w16_vs_raw_percent": -14.749189310622125
+      },
+      "derived": {
+        "default_gap_closed_by_raw_alias_fraction": 0.10483384089685657,
+        "default_gap_closed_by_raw_alias_percentage_points": 1.5462141655473776,
+        "default_w16_win_percent": 14.749189310622125,
+        "equal_2cta_w16_win_percent": 13.202975145074747,
+        "raw_alias2_vs_default_raw_percent": -1.5702348228045948,
+        "same_sass_clamp_w16_penalty_percent": 34.79538452999964
+      },
+      "raw_alias2": {
+        "bitwise": true,
+        "files": [
+          "results/raw_alias2/s65536-r1.json",
+          "results/raw_alias2/s65536-r2.json",
+          "results/raw_alias2/s65536-r3.json"
+        ],
+        "raw_graph": {
+          "max_us": 412.51840591430664,
+          "median_us": 412.4159812927246,
+          "min_us": 412.3136043548584,
+          "range_us": 0.2048015594482422,
+          "values_us": [
+            412.51840591430664,
+            412.3136043548584,
+            412.4159812927246
+          ]
+        },
+        "w16_graph": {
+          "max_us": 358.7583899497986,
+          "median_us": 357.9648017883301,
+          "min_us": 357.83679485321045,
+          "range_us": 0.9215950965881348,
+          "values_us": [
+            358.7583899497986,
+            357.83679485321045,
+            357.9648017883301
+          ]
+        },
+        "w16_vs_raw_percent": -13.202975145074747
+      },
+      "w16_clamp1": {
+        "bitwise": true,
+        "files": [
+          "results/w16_clamp1/s65536-r1.json",
+          "results/w16_clamp1/s65536-r2.json",
+          "results/w16_clamp1/s65536-r3.json"
+        ],
+        "raw_graph": {
+          "max_us": 418.6624050140381,
+          "median_us": 418.6367988586426,
+          "min_us": 418.58558654785156,
+          "range_us": 0.07681846618652344,
+          "values_us": [
+            418.58558654785156,
+            418.6367988586426,
+            418.6624050140381
+          ]
+        },
+        "w16_graph": {
+          "max_us": 481.9200038909912,
+          "median_us": 481.4847946166992,
+          "min_us": 481.382417678833,
+          "range_us": 0.5375862121582031,
+          "values_us": [
+            481.9200038909912,
+            481.382417678833,
+            481.4847946166992
+          ]
+        },
+        "w16_vs_raw_percent": 15.012534953784119
+      }
+    },
+    "8192": {
+      "default": {
+        "bitwise": true,
+        "files": [
+          "results/default/s8192-r1.json",
+          "results/default/s8192-r2.json",
+          "results/default/s8192-r3.json"
+        ],
+        "raw_graph": {
+          "max_us": 69.88800168037415,
+          "median_us": 69.83680129051208,
+          "min_us": 69.83680129051208,
+          "range_us": 0.05120038986206055,
+          "values_us": [
+            69.88800168037415,
+            69.83680129051208,
+            69.83680129051208
+          ]
+        },
+        "w16_graph": {
+          "max_us": 65.89440107345581,
+          "median_us": 65.84320068359375,
+          "min_us": 65.84320068359375,
+          "range_us": 0.05120038986206055,
+          "values_us": [
+            65.84320068359375,
+            65.84320068359375,
+            65.89440107345581
+          ]
+        },
+        "w16_vs_raw_percent": -5.718475836694569
+      },
+      "derived": {
+        "default_gap_closed_by_raw_alias_fraction": 0.6537197248394883,
+        "default_gap_closed_by_raw_alias_percentage_points": 3.7382804504652363,
+        "default_w16_win_percent": 5.718475836694569,
+        "equal_2cta_w16_win_percent": 1.980195386229333,
+        "raw_alias2_vs_default_raw_percent": -3.739005729528466,
+        "same_sass_clamp_w16_penalty_percent": 40.20217521030798
+      },
+      "raw_alias2": {
+        "bitwise": true,
+        "files": [
+          "results/raw_alias2/s8192-r1.json",
+          "results/raw_alias2/s8192-r2.json",
+          "results/raw_alias2/s8192-r3.json"
+        ],
+        "raw_graph": {
+          "max_us": 67.22559928894043,
+          "median_us": 67.22559928894043,
+          "min_us": 67.1999990940094,
+          "range_us": 0.025600194931030273,
+          "values_us": [
+            67.1999990940094,
+            67.22559928894043,
+            67.22559928894043
+          ]
+        },
+        "w16_graph": {
+          "max_us": 65.89440107345581,
+          "median_us": 65.89440107345581,
+          "min_us": 65.84320068359375,
+          "range_us": 0.05120038986206055,
+          "values_us": [
+            65.89440107345581,
+            65.89440107345581,
+            65.84320068359375
+          ]
+        },
+        "w16_vs_raw_percent": -1.980195386229333
+      },
+      "w16_clamp1": {
+        "bitwise": true,
+        "files": [
+          "results/w16_clamp1/s8192-r1.json",
+          "results/w16_clamp1/s8192-r2.json",
+          "results/w16_clamp1/s8192-r3.json"
+        ],
+        "raw_graph": {
+          "max_us": 69.86240148544312,
+          "median_us": 69.83680129051208,
+          "min_us": 69.83680129051208,
+          "range_us": 0.025600194931030273,
+          "values_us": [
+            69.83680129051208,
+            69.83680129051208,
+            69.86240148544312
+          ]
+        },
+        "w16_graph": {
+          "max_us": 92.36479997634888,
+          "median_us": 92.31359958648682,
+          "min_us": 92.31359958648682,
+          "range_us": 0.05120038986206055,
+          "values_us": [
+            92.31359958648682,
+            92.31359958648682,
+            92.36479997634888
+          ]
+        },
+        "w16_vs_raw_percent": 32.18474769838635
+      }
+    }
+  },
+  "ncu": {
+    "launches": {
+      "raw_alias2": {
+        "bitwise": true,
+        "driver": "ncu/raw_alias2_driver.json",
+        "kernel": "void flash_fwd_splitkv_raw_alias_profile_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, 0, 0, bfloat16_t, Flash_kernel_traits<128, 64, 128, 4, bfloat16_t>>, 0>(Flash_fwd_params)",
+        "metrics": {
+          "Achieved Occupancy": 13.39,
+          "Block Limit Registers": 2,
+          "Block Limit Shared Mem": 2,
+          "Driver Shared Memory Per Block": 1.02,
+          "Dynamic Shared Memory Per Block": 49.15,
+          "Registers Per Thread": 255,
+          "Shared Memory Configuration Size": 102.4,
+          "Theoretical Occupancy": 16.67,
+          "Waves Per SM": 0.95
+        },
+        "report": "ncu/raw_alias2.ncu-rep",
+        "units": {
+          "Achieved Occupancy": "%",
+          "Block Limit Registers": "block",
+          "Block Limit Shared Mem": "block",
+          "Driver Shared Memory Per Block": "Kbyte/block",
+          "Dynamic Shared Memory Per Block": "Kbyte/block",
+          "Registers Per Thread": "register/thread",
+          "Shared Memory Configuration Size": "Kbyte",
+          "Theoretical Occupancy": "%",
+          "Waves Per SM": ""
+        }
+      },
+      "raw_default": {
+        "bitwise": true,
+        "driver": "ncu/raw_default_driver.json",
+        "kernel": "void flash_fwd_splitkv_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, 0, 0, bfloat16_t, Flash_kernel_traits<128, 64, 128, 4, bfloat16_t>>, 0, 0, 0, 0, 1, 0, 1, 0>(Flash_fwd_params)",
+        "metrics": {
+          "Achieved Occupancy": 8.33,
+          "Block Limit Registers": 2,
+          "Block Limit Shared Mem": 1,
+          "Driver Shared Memory Per Block": 1.02,
+          "Dynamic Shared Memory Per Block": 81.92,
+          "Registers Per Thread": 250,
+          "Shared Memory Configuration Size": 102.4,
+          "Theoretical Occupancy": 8.33,
+          "Waves Per SM": 1.9
+        },
+        "report": "ncu/raw_default.ncu-rep",
+        "units": {
+          "Achieved Occupancy": "%",
+          "Block Limit Registers": "block",
+          "Block Limit Shared Mem": "block",
+          "Driver Shared Memory Per Block": "Kbyte/block",
+          "Dynamic Shared Memory Per Block": "Kbyte/block",
+          "Registers Per Thread": "register/thread",
+          "Shared Memory Configuration Size": "Kbyte",
+          "Theoretical Occupancy": "%",
+          "Waves Per SM": ""
+        }
+      },
+      "w16_clamp1": {
+        "bitwise": true,
+        "driver": "ncu/w16_clamp1_driver.json",
+        "kernel": "void flash_fwd_splitkv_byte_v2_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, 0, 0, bfloat16_t, Flash_kernel_traits<128, 64, 128, 4, bfloat16_t>>, 0, 1, 0, 3>(Flash_fwd_params)",
+        "metrics": {
+          "Achieved Occupancy": 8.33,
+          "Block Limit Registers": 2,
+          "Block Limit Shared Mem": 1,
+          "Driver Shared Memory Per Block": 1.02,
+          "Dynamic Shared Memory Per Block": 51.2,
+          "Registers Per Thread": 254,
+          "Shared Memory Configuration Size": 102.4,
+          "Theoretical Occupancy": 8.33,
+          "Waves Per SM": 1.9
+        },
+        "report": "ncu/w16_clamp1.ncu-rep",
+        "units": {
+          "Achieved Occupancy": "%",
+          "Block Limit Registers": "block",
+          "Block Limit Shared Mem": "block",
+          "Driver Shared Memory Per Block": "Kbyte/block",
+          "Dynamic Shared Memory Per Block": "Kbyte/block",
+          "Registers Per Thread": "register/thread",
+          "Shared Memory Configuration Size": "Kbyte",
+          "Theoretical Occupancy": "%",
+          "Waves Per SM": ""
+        }
+      },
+      "w16_default": {
+        "bitwise": true,
+        "driver": "ncu/w16_default_driver.json",
+        "kernel": "void flash_fwd_splitkv_byte_v2_kernel<Flash_fwd_kernel_traits<128, 64, 128, 4, 0, 0, bfloat16_t, Flash_kernel_traits<128, 64, 128, 4, bfloat16_t>>, 0, 1, 0, 3>(Flash_fwd_params)",
+        "metrics": {
+          "Achieved Occupancy": 13.49,
+          "Block Limit Registers": 2,
+          "Block Limit Shared Mem": 2,
+          "Driver Shared Memory Per Block": 1.02,
+          "Dynamic Shared Memory Per Block": 49.41,
+          "Registers Per Thread": 254,
+          "Shared Memory Configuration Size": 102.4,
+          "Theoretical Occupancy": 16.67,
+          "Waves Per SM": 0.95
+        },
+        "report": "ncu/w16_default.ncu-rep",
+        "units": {
+          "Achieved Occupancy": "%",
+          "Block Limit Registers": "block",
+          "Block Limit Shared Mem": "block",
+          "Driver Shared Memory Per Block": "Kbyte/block",
+          "Dynamic Shared Memory Per Block": "Kbyte/block",
+          "Registers Per Thread": "register/thread",
+          "Shared Memory Configuration Size": "Kbyte",
+          "Theoretical Occupancy": "%",
+          "Waves Per SM": ""
+        }
+      }
+    },
+    "ncu_binary": "/opt/nvidia/nsight-compute/2025.4.1/ncu"
+  },
+  "protocol": {
+    "calls_per_sample": 20,
+    "gpu": "physical GPU 4, NVIDIA A40, ECC disabled",
+    "iterations": 60,
+    "num_splits": 20,
+    "process_repetitions": 3,
+    "query_length": 1,
+    "sequence_lengths": [
+      8192,
+      65536
+    ],
+    "statistic": "median of three per-process graph medians",
+    "warmup": 12
+  },
+  "provenance": {
+    "capture_sha256": "ddc6b95feca30eda985dbdcb329d2ddc55d9320dc638c775bb8f4afce5b2d1d3",
+    "extension_sha256": "d6024ebfd7b13ce2e93c53116f28f0f110c21e8f6fcbfda5bb876d12a6d7ba84",
+    "files_checked": 18,
+    "gpu": "NVIDIA A40"
+  },
+  "sass_audit": {
+    "current_sass_sha256": {
+      "raw_default": "68e2ead97be842f4e5162102826150ac0fe6d5816454cccb5d1322090ba031bf",
+      "w16_default": "4a384e3b25f8eadf6e3fb0e011566ec4a27044fac768315ec16f4d20644ea6c4"
+    },
+    "extension": "build-bytev2-static-w16-validation-hoist/vllm-flash-attn/_vllm_fa2_C.abi3.so",
+    "extension_sha256": "d6024ebfd7b13ce2e93c53116f28f0f110c21e8f6fcbfda5bb876d12a6d7ba84",
+    "pre_control_sass_sha256": {
+      "raw_default": "68e2ead97be842f4e5162102826150ac0fe6d5816454cccb5d1322090ba031bf",
+      "w16_default": "4a384e3b25f8eadf6e3fb0e011566ec4a27044fac768315ec16f4d20644ea6c4"
+    },
+    "unchanged": true
+  },
+  "schema_version": 1
+}

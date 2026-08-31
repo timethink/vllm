@@ -70,7 +70,10 @@ def sync_cudagraph_and_dp_padding(
     # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
     # so we don't perform request padding for PIECEWISE graphs
     synced_desc = cudagraph_manager.dispatch(
-        num_reqs, synced_num_tokens, synced_uniform_token_count
+        num_reqs,
+        synced_num_tokens,
+        synced_uniform_token_count,
+        max_mode=synced_cg_mode,
     )
 
     # Update num_tokens_across_dp to reflect padded size.
@@ -87,6 +90,7 @@ def dispatch_cg_and_sync_dp(
     dp_size: int,
     dp_rank: int,
     need_eager: bool = False,
+    disable_full: bool = False,
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
@@ -100,7 +104,10 @@ def dispatch_cg_and_sync_dp(
             "where need_eager must be True"
         )
         batch_desc = cudagraph_manager.dispatch(
-            num_reqs, num_tokens, uniform_token_count
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            max_mode=CUDAGraphMode.PIECEWISE if disable_full else None,
         )
 
     if dp_size == 1:

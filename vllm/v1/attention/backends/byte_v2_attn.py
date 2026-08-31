@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import ClassVar, TypedDict
 
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
@@ -46,6 +47,7 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_fa2_hybrid_decode_is_available,
     byte_v2_fa2_hybrid_paged_decode_attention,
     byte_v2_fa2_paged_decode_attention,
+    byte_v2_fa2_raw_staging_attention_with_lse,
     byte_v2_fa2_raw_staging_prefill_attention,
     byte_v2_hybrid_cache_update_is_available,
     byte_v2_hybrid_raw_tail_q1_is_available,
@@ -62,6 +64,14 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_reshape_and_cache,
     byte_v2_speculative_verify_gqa,
     byte_v2_speculative_verify_ragged_q4,
+    byte_v2_static_w8_writer_is_available,
+    byte_v2_static_w16_commit_raw_staging_to_hybrid_cache,
+    byte_v2_static_w16_fa2_paged_attention,
+    byte_v2_static_w16_fa2_paged_attention_with_lse,
+    byte_v2_static_w16_hydrate_raw_staging_from_hybrid_cache,
+    byte_v2_static_w16_runtime_is_available,
+    byte_v2_static_w16_safe_full_page_retention_is_available,
+    byte_v2_static_w16_update_hybrid_cache_raw_tail_q1,
     byte_v2_test_force_promote_raw_staging_q1,
     byte_v2_test_forced_raw_promotion_is_available,
     byte_v2_update_cache_raw_staging,
@@ -72,6 +82,18 @@ from vllm.v1.attention.backends.byte_v2_ops import (
     byte_v2_update_hybrid_cache_raw_staging_q1,
     byte_v2_update_hybrid_cache_raw_tail_q1,
 )
+from vllm.v1.attention.backends.byte_v2_static_w8 import (
+    ByteV2StaticW8Codebook,
+    byte_v2_static_w8_codebook_from_env,
+)
+from vllm.v1.attention.backends.byte_v2_static_w16 import (
+    STATIC_W16_PAGE_BYTES,
+    ByteV2StaticW16Codebook,
+    byte_v2_static_w16_codebook_from_env,
+    byte_v2_static_w16_requested,
+    byte_v2_static_w16_retain_cascade_q16_requested,
+)
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
     byte_v2_hybrid_raw_fallback_enabled,
     byte_v2_hybrid_raw_mutable_tail_q1_enabled,
@@ -84,6 +106,8 @@ _BYTE_V2_MAX_RAW_STAGING_TOKENS = 1024
 _BYTE_V2_UNNORMALIZED_PARTITION_OUTPUT_MODE = 27
 _BYTE_V2_FA2_PAGE_SIZE_BYTES = ByteV2PageLayoutV6().page_size_bytes
 _BYTE_V2_CACHED_PREFILL_AUTO_MIN_QUERY_LEN = 16_384
+_BYTE_V2_STATIC_W16_CASCADE_HYDRATE_AUTO_MIN_PREFIX_LEN = 1_008
+_BYTE_V2_STATIC_W16_CASCADE_HYDRATE_AUTO_MIN_QUERY_TOKENS = 16
 logger = init_logger(__name__)
 
 
@@ -284,6 +308,91 @@ def _cached_prefill_hydrate_to_raw_enabled() -> bool:
     return _cached_prefill_hydrate_to_raw_mode() != "disabled"
 
 
+def _static_w16_initial_prefill_skip_hydrate_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_STATIC_W16_INITIAL_PREFILL_SKIP_HYDRATE")
+    if value is None:
+        return True
+    if value not in ("0", "1"):
+        raise ValueError(
+            "BYTE_V2_STATIC_W16_INITIAL_PREFILL_SKIP_HYDRATE must be unset, "
+            f"0, or 1; got {value!r}"
+        )
+    return value == "1"
+
+
+def _static_w16_page_aligned_prefill_skip_hydrate_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_STATIC_W16_PAGE_ALIGNED_PREFILL_SKIP_HYDRATE")
+    if value is None:
+        return True
+    if value not in ("0", "1"):
+        raise ValueError(
+            "BYTE_V2_STATIC_W16_PAGE_ALIGNED_PREFILL_SKIP_HYDRATE must be "
+            f"unset, 0, or 1; got {value!r}"
+        )
+    return value == "1"
+
+
+def _static_w16_batched_raw_tail_q1_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_STATIC_W16_BATCHED_RAW_TAIL_Q1")
+    if value is None:
+        return True
+    if value not in ("0", "1"):
+        raise ValueError(
+            "BYTE_V2_STATIC_W16_BATCHED_RAW_TAIL_Q1 must be unset, 0, or 1; "
+            f"got {value!r}"
+        )
+    return value == "1"
+
+
+def _static_w16_cascade_attention_enabled() -> bool:
+    value = os.environ.get("BYTE_V2_STATIC_W16_CASCADE_ATTENTION")
+    if value is None:
+        return True
+    if value not in ("0", "1"):
+        raise ValueError(
+            "BYTE_V2_STATIC_W16_CASCADE_ATTENTION must be unset, 0, or 1; "
+            f"got {value!r}"
+        )
+    return value == "1"
+
+
+def _static_w16_cascade_prefix_hydrate_mode() -> str:
+    value = os.environ.get("BYTE_V2_STATIC_W16_CASCADE_PREFIX_HYDRATE")
+    if value is None:
+        return "auto"
+    if value not in ("0", "1", "auto"):
+        raise ValueError(
+            "BYTE_V2_STATIC_W16_CASCADE_PREFIX_HYDRATE must be unset, 0, 1, "
+            f"or auto; got {value!r}"
+        )
+    return {"0": "disabled", "1": "enabled", "auto": "auto"}[value]
+
+
+def _static_w16_cascade_prefix_hydrate_enabled() -> bool:
+    return _static_w16_cascade_prefix_hydrate_mode() != "disabled"
+
+
+def _static_w16_cascade_prefix_hydrate_for_call(
+    mode: str,
+    *,
+    num_actual_tokens: int,
+    max_query_len: int,
+    common_prefix_len: int,
+) -> bool:
+    if mode == "enabled":
+        return True
+    if mode == "disabled":
+        return False
+    if mode != "auto":
+        raise ValueError(f"unknown Static-W16 cascade hydrate mode: {mode!r}")
+    return (
+        max_query_len == 1
+        and num_actual_tokens
+        >= _BYTE_V2_STATIC_W16_CASCADE_HYDRATE_AUTO_MIN_QUERY_TOKENS
+        and common_prefix_len >= _BYTE_V2_STATIC_W16_CASCADE_HYDRATE_AUTO_MIN_PREFIX_LEN
+    )
+
+
 def _hybrid_raw_mutable_tail_q1_enabled(
     *,
     hybrid_raw_fallback: bool,
@@ -375,6 +484,11 @@ class ByteV2AttentionMetadata(AttentionMetadata):
     is_prefilling: torch.Tensor | None = None
     seq_len_sum: int | None = None
     common_prefix_len: int = 0
+    use_cascade: bool = False
+    cu_prefix_query_lens: torch.Tensor | None = None
+    prefix_kv_lens: torch.Tensor | None = None
+    suffix_kv_lens: torch.Tensor | None = None
+    cascade_prefix_cache_key: int = 0
     tile_policy: ByteV2TilePolicy = DEFAULT_BYTE_V2_TILE_POLICY
     direct_prefill_plan: ByteV2DirectPrefillPlan | None = None
 
@@ -576,6 +690,27 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
                 device=common_attn_metadata.query_start_loc.device,
                 block_size=self.tile_policy.alloc_block_tokens,
             )
+        use_cascade = common_prefix_len > 0
+        cu_prefix_query_lens = None
+        prefix_kv_lens = None
+        suffix_kv_lens = None
+        if use_cascade:
+            block_size = self.tile_policy.alloc_block_tokens
+            if common_prefix_len % block_size:
+                raise RuntimeError("ByteV2 cascade prefix length must be page-aligned")
+            cu_prefix_query_lens = torch.tensor(
+                [0, common_attn_metadata.num_actual_tokens],
+                dtype=torch.int32,
+                device=common_attn_metadata.query_start_loc.device,
+            )
+            prefix_kv_lens = torch.tensor(
+                [common_prefix_len],
+                dtype=torch.int32,
+                device=common_attn_metadata.seq_lens.device,
+            )
+            suffix_kv_lens = (
+                common_attn_metadata.seq_lens[:num_reqs] - common_prefix_len
+            )
         return ByteV2AttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -591,8 +726,47 @@ class ByteV2AttentionMetadataBuilder(AttentionMetadataBuilder[ByteV2AttentionMet
             is_prefilling=getattr(common_attn_metadata, "is_prefilling", None),
             seq_len_sum=seq_len_sum,
             common_prefix_len=int(common_prefix_len),
+            use_cascade=use_cascade,
+            cu_prefix_query_lens=cu_prefix_query_lens,
+            prefix_kv_lens=prefix_kv_lens,
+            suffix_kv_lens=suffix_kv_lens,
+            cascade_prefix_cache_key=int(
+                getattr(common_attn_metadata, "cascade_prefix_cache_key", 0)
+            ),
             tile_policy=self.tile_policy,
             direct_prefill_plan=direct_prefill_plan,
+        )
+
+    def use_cascade_attention(
+        self,
+        common_prefix_len: int,
+        query_lens,
+        num_query_heads: int,
+        num_kv_heads: int,
+        use_alibi: bool,
+        use_sliding_window: bool,
+        use_local_attention: bool,
+        num_sms: int,
+        dcp_world_size: int,
+    ) -> bool:
+        if (
+            not byte_v2_static_w16_requested()
+            or not byte_v2_hybrid_raw_fallback_enabled()
+            or not _static_w16_cascade_attention_enabled()
+        ):
+            return False
+        from vllm.v1.attention.backends.flash_attn import use_cascade_attention
+
+        return use_cascade_attention(
+            common_prefix_len=common_prefix_len,
+            query_lens=query_lens,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            use_alibi=use_alibi,
+            use_sliding_window=use_sliding_window,
+            use_local_attention=use_local_attention,
+            num_sms=num_sms,
+            dcp_world_size=dcp_world_size,
         )
 
     def update_block_table(
@@ -649,6 +823,8 @@ class ByteV2AttentionBackend(AttentionBackend):
             head_dim=head_size,
             head_dim_v=head_size,
         )
+        if byte_v2_static_w16_requested():
+            return (num_blocks, STATIC_W16_PAGE_BYTES)
         layout = ByteV2PageLayoutV6(
             tile_policy=tile_policy,
             num_kv_heads=num_kv_heads,
@@ -957,6 +1133,27 @@ class ByteV2RawStagingWorkspace:
 
 
 @dataclass(frozen=True)
+class ByteV2DecodedPrefixCache:
+    """One layer's bounded raw copy of its current immutable prefix."""
+
+    raw_pages: torch.Tensor
+    local_block_table: torch.Tensor
+    valid_rows: torch.Tensor
+
+    @property
+    def nbytes(self) -> int:
+        """Return the exact device storage owned by this cache."""
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                self.raw_pages,
+                self.local_block_table,
+                self.valid_rows,
+            )
+        )
+
+
+@dataclass(frozen=True)
 class ByteV2InitialPrefillStagingLease:
     """Transient exact pages retained between cache update and attention."""
 
@@ -976,6 +1173,7 @@ class ByteV2RawStagingWave:
     start: int
     end: int
     max_unique_pages: int
+    overwrites_all_valid_rows: bool = False
 
 
 def _trusted_byte_v2_query_start_locs(
@@ -1004,6 +1202,33 @@ def _trusted_byte_v2_query_start_locs(
     if any(end < start for start, end in zip(query_start_locs, query_start_locs[1:])):
         return None
     return query_start_locs
+
+
+def _trusted_byte_v2_batched_q1(
+    attn_metadata: object | None,
+    num_tokens: int,
+) -> bool:
+    """Prove that a packed update contains one token per request."""
+    if attn_metadata is None or num_tokens <= 1:
+        return False
+    num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+    max_query_len = getattr(attn_metadata, "max_query_len", None)
+    query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    if (
+        not isinstance(num_actual_tokens, int)
+        or isinstance(num_actual_tokens, bool)
+        or num_actual_tokens != num_tokens
+        or not isinstance(max_query_len, int)
+        or isinstance(max_query_len, bool)
+        or max_query_len != 1
+        or not isinstance(query_start_loc_cpu, torch.Tensor)
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
+        or query_start_loc_cpu.ndim != 1
+        or query_start_loc_cpu.numel() != num_tokens + 1
+    ):
+        return False
+    return query_start_loc_cpu.tolist() == list(range(num_tokens + 1))
 
 
 def _trusted_byte_v2_initial_prefill_rows(
@@ -1037,6 +1262,87 @@ def _trusted_byte_v2_initial_prefill_rows(
             zip(query_start_locs, query_start_locs[1:])
         )
     ]
+
+
+def _trusted_byte_v2_prefill_context_lens(
+    attn_metadata: object | None,
+    query_start_locs: list[int],
+) -> list[int | None]:
+    """Return exact prefill context lengths, failing closed per request."""
+    num_requests = len(query_start_locs) - 1
+    unknown: list[int | None] = [None] * num_requests
+    if attn_metadata is None:
+        return unknown
+
+    seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu_upper_bound", None)
+    is_prefilling = getattr(attn_metadata, "is_prefilling", None)
+    if (
+        not isinstance(seq_lens_cpu, torch.Tensor)
+        or seq_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.dtype not in (torch.int32, torch.int64)
+        or seq_lens_cpu.ndim != 1
+        or seq_lens_cpu.shape[0] < num_requests
+        or not isinstance(is_prefilling, torch.Tensor)
+        or is_prefilling.device.type != "cpu"
+        or is_prefilling.dtype != torch.bool
+        or is_prefilling.ndim != 1
+        or is_prefilling.shape[0] < num_requests
+    ):
+        return unknown
+
+    # The runner guarantees seq_lens_cpu_upper_bound is exact for prefill rows,
+    # including async speculative-decode mode. Decode/unknown rows deliberately
+    # retain the conservative path.
+    context_lens = unknown.copy()
+    for index, (request_start, request_end) in enumerate(
+        zip(query_start_locs, query_start_locs[1:])
+    ):
+        if not bool(is_prefilling[index]):
+            continue
+        query_len = request_end - request_start
+        context_len = int(seq_lens_cpu[index]) - query_len
+        if context_len >= 0:
+            context_lens[index] = context_len
+    return context_lens
+
+
+def _trusted_static_w16_cascade_q16_pages(
+    attn_metadata: object | None,
+    num_tokens: int,
+    *,
+    alloc_block_tokens: int,
+) -> bool:
+    """Prove that each row writes the first full page after a shared prefix."""
+    if attn_metadata is None or alloc_block_tokens <= 0:
+        return False
+    if getattr(attn_metadata, "use_cascade", False) is not True:
+        return False
+    common_prefix_len = getattr(attn_metadata, "common_prefix_len", None)
+    max_query_len = getattr(attn_metadata, "max_query_len", None)
+    if (
+        not isinstance(common_prefix_len, int)
+        or isinstance(common_prefix_len, bool)
+        or common_prefix_len <= 0
+        or common_prefix_len % alloc_block_tokens
+        or max_query_len != alloc_block_tokens
+    ):
+        return False
+    query_start_locs = _trusted_byte_v2_query_start_locs(
+        attn_metadata,
+        num_tokens,
+    )
+    if query_start_locs is None or query_start_locs[-1] != num_tokens:
+        return False
+    query_lens = [
+        end - start for start, end in zip(query_start_locs, query_start_locs[1:])
+    ]
+    if not query_lens or any(length != alloc_block_tokens for length in query_lens):
+        return False
+    context_lens = _trusted_byte_v2_prefill_context_lens(
+        attn_metadata,
+        query_start_locs,
+    )
+    return all(context_len == common_prefix_len for context_len in context_lens)
 
 
 def plan_byte_v2_raw_staging_waves(
@@ -1077,6 +1383,10 @@ def plan_byte_v2_raw_staging_waves(
         attn_metadata,
         query_start_locs,
     )
+    prefill_context_lens = _trusted_byte_v2_prefill_context_lens(
+        attn_metadata,
+        query_start_locs,
+    )
     pieces: list[ByteV2RawStagingWave] = []
     conservative_token_limit = alloc_block_tokens * num_staging_slots
     conservative_token_limit -= alloc_block_tokens - 1
@@ -1101,7 +1411,19 @@ def plan_byte_v2_raw_staging_waves(
                 max_unique_pages = (
                     num_request_tokens + 2 * alloc_block_tokens - 2
                 ) // alloc_block_tokens
-            pieces.append(ByteV2RawStagingWave(start, end, max_unique_pages))
+            context_len = prefill_context_lens[request_index]
+            overwrites_all_valid_rows = (
+                context_len is not None
+                and (context_len + start - request_start) % alloc_block_tokens == 0
+            )
+            pieces.append(
+                ByteV2RawStagingWave(
+                    start,
+                    end,
+                    max_unique_pages,
+                    overwrites_all_valid_rows,
+                )
+            )
             start = end
 
     waves: list[ByteV2RawStagingWave] = []
@@ -1114,10 +1436,16 @@ def plan_byte_v2_raw_staging_waves(
                 previous.start,
                 piece.end,
                 previous.max_unique_pages + piece.max_unique_pages,
+                previous.overwrites_all_valid_rows and piece.overwrites_all_valid_rows,
             )
         else:
             waves.append(piece)
     return waves
+
+
+class _StaticW8WriterKwargs(TypedDict, total=False):
+    static_k_high7_base: int
+    static_v_high7_base: int
 
 
 class ByteV2RawStagingManager:
@@ -1132,6 +1460,7 @@ class ByteV2RawStagingManager:
         raw_fallback_store: ByteV2RawFallbackStore | None = None,
         hybrid_raw_mutable_tail_q1: bool = False,
         hybrid_raw_tail_fused_finalize: bool = True,
+        static_w16_retain_cascade_q16: bool = False,
     ) -> None:
         self.tile_policy = tile_policy
         self.raw_layout = ByteV2RawStagingLayout(
@@ -1142,6 +1471,11 @@ class ByteV2RawStagingManager:
         self.raw_fallback_store = raw_fallback_store
         self.hybrid_raw_mutable_tail_q1 = hybrid_raw_mutable_tail_q1
         self.hybrid_raw_tail_fused_finalize = hybrid_raw_tail_fused_finalize
+        self.static_w16_retain_cascade_q16 = static_w16_retain_cascade_q16
+        self.static_w16_batched_raw_tail_q1 = _static_w16_batched_raw_tail_q1_enabled()
+        self.static_w8_bases = (-1, -1)
+        self.static_w16_bases = (-1, -1)
+        self._static_w8_writer_kwargs: _StaticW8WriterKwargs = {}
         self.shared_workspace: ByteV2RawStagingWorkspace | None = None
 
         self.raw_staging: torch.Tensor | None = None
@@ -1151,6 +1485,63 @@ class ByteV2RawStagingManager:
         self.next_staging_slot: torch.Tensor | None = None
         self.overflow: torch.Tensor | None = None
         self._initial_prefill_lease: ByteV2InitialPrefillStagingLease | None = None
+        self.decoded_prefix_cache: ByteV2DecodedPrefixCache | None = None
+        self._decoded_prefix_cache_binding: (
+            tuple[
+                int,
+                torch.device,
+                tuple[int, ...],
+                int,
+            ]
+            | None
+        ) = None
+        self._decoded_prefix_cache_key: tuple[int, int] | None = None
+
+    @property
+    def static_w8_enabled(self) -> bool:
+        """Whether this layer uses its frozen K/V writer bases."""
+        return self.static_w8_bases != (-1, -1)
+
+    @property
+    def static_w16_enabled(self) -> bool:
+        """Whether this layer uses the experimental Static-W16 wire."""
+        return self.static_w16_bases != (-1, -1)
+
+    def configure_static_w8_bases(self, bases: tuple[int, int]) -> None:
+        """Freeze the codebook scalars before any cache update is captured."""
+        k_base, v_base = bases
+        if not (0 <= k_base <= 120 and 0 <= v_base <= 120):
+            raise RuntimeError(
+                "ByteV2 Static-W8 bases must both be in [0, 120], got "
+                f"K={k_base}, V={v_base}"
+            )
+        if self.static_w8_enabled and self.static_w8_bases != bases:
+            raise RuntimeError(
+                "ByteV2 Static-W8 staging manager cannot change codebooks "
+                f"after configuration: {self.static_w8_bases} -> {bases}"
+            )
+        self.static_w8_bases = bases
+        self._static_w8_writer_kwargs = {
+            "static_k_high7_base": k_base,
+            "static_v_high7_base": v_base,
+        }
+
+    def configure_static_w16_bases(self, bases: tuple[int, int]) -> None:
+        """Freeze the W16 exponent-window bases before cache capture."""
+        k_base, v_base = bases
+        if not (0 <= k_base <= 240 and 0 <= v_base <= 240):
+            raise RuntimeError(
+                "ByteV2 Static-W16 bases must both be in [0, 240], got "
+                f"K={k_base}, V={v_base}"
+            )
+        if self.static_w8_enabled:
+            raise RuntimeError("Static-W8 and Static-W16 are mutually exclusive")
+        if self.static_w16_enabled and self.static_w16_bases != bases:
+            raise RuntimeError(
+                "ByteV2 Static-W16 staging manager cannot change codebooks "
+                f"after configuration: {self.static_w16_bases} -> {bases}"
+            )
+        self.static_w16_bases = bases
 
     def bind_shared_workspace(
         self,
@@ -1188,6 +1579,151 @@ class ByteV2RawStagingManager:
         self.valid_rows = None
         self.next_staging_slot = None
         self.overflow = None
+
+    def bind_decoded_prefix_cache(
+        self,
+        kv_cache: torch.Tensor,
+        num_cache_slots: int,
+    ) -> None:
+        """Allocate one fixed-address decoded-prefix cache for this layer."""
+        if num_cache_slots < 0:
+            raise ValueError("num_cache_slots must be non-negative")
+        if num_cache_slots == 0:
+            self.clear_decoded_prefix_cache()
+            return
+        if self.raw_fallback_store is None:
+            raise RuntimeError(
+                "Decoded-prefix caching requires ByteV2 hybrid raw fallback"
+            )
+        binding = (
+            kv_cache.data_ptr(),
+            kv_cache.device,
+            tuple(int(dim) for dim in kv_cache.shape),
+            num_cache_slots,
+        )
+        if self.decoded_prefix_cache is not None:
+            if binding != self._decoded_prefix_cache_binding:
+                raise RuntimeError(
+                    "ByteV2 decoded-prefix cache binding changed after allocation"
+                )
+            return
+        raw_pages = torch.empty(
+            (num_cache_slots, self.raw_layout.slot_size_bytes),
+            dtype=torch.uint8,
+            device=kv_cache.device,
+        )
+        local_block_table = torch.arange(
+            num_cache_slots,
+            dtype=torch.int32,
+            device=kv_cache.device,
+        ).view(1, num_cache_slots)
+        valid_rows = torch.full(
+            (num_cache_slots,),
+            self.tile_policy.alloc_block_tokens,
+            dtype=torch.int32,
+            device=kv_cache.device,
+        )
+        self.decoded_prefix_cache = ByteV2DecodedPrefixCache(
+            raw_pages=raw_pages,
+            local_block_table=local_block_table,
+            valid_rows=valid_rows,
+        )
+        self._decoded_prefix_cache_binding = binding
+        self._decoded_prefix_cache_key = None
+
+    def clear_decoded_prefix_cache(self) -> None:
+        """Drop the persistent cache and its host-side generation key."""
+        self.decoded_prefix_cache = None
+        self._decoded_prefix_cache_binding = None
+        self._decoded_prefix_cache_key = None
+
+    def invalidate_decoded_prefix_cache(self) -> None:
+        """Invalidate cached contents after scheduler block generation changes."""
+        self._decoded_prefix_cache_key = None
+
+    def decoded_prefix_cache_nbytes(self) -> int:
+        """Return the allocated per-layer decoded-prefix cache size."""
+        cache = self.decoded_prefix_cache
+        return 0 if cache is None else cache.nbytes
+
+    def stage_cached_prefix(
+        self,
+        *,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_len: int,
+        prefix_cache_key: int,
+    ) -> (
+        tuple[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            bool,
+        ]
+        | None
+    ):
+        """Return persistent decoded pages on a hit, hydrating only on miss.
+
+        The boolean result says whether the returned pages use the transient
+        shared workspace and therefore require ``release_cached_prefill``.
+        """
+        cache = self.decoded_prefix_cache
+        block_size = self.tile_policy.alloc_block_tokens
+        num_pages = (seq_len + block_size - 1) // block_size
+        if (
+            cache is None
+            or prefix_cache_key <= 0
+            or seq_len <= 0
+            or seq_len % block_size
+            or num_pages <= 0
+            or num_pages > cache.raw_pages.shape[0]
+            or block_table.ndim != 2
+            or block_table.shape[0] != 1
+            or num_pages > block_table.shape[1]
+        ):
+            staged = self.stage_cached_prefill(
+                kv_cache=kv_cache,
+                block_table=block_table,
+                seq_len=seq_len,
+            )
+            return None if staged is None else (staged, True)
+
+        binding = self._decoded_prefix_cache_binding
+        if binding is None or binding[:3] != (
+            kv_cache.data_ptr(),
+            kv_cache.device,
+            tuple(int(dim) for dim in kv_cache.shape),
+        ):
+            raise RuntimeError("ByteV2 decoded-prefix cache KV binding is invalid")
+        key = (prefix_cache_key, seq_len)
+        raw_pages = cache.raw_pages[:num_pages]
+        local_block_table = cache.local_block_table[:, :num_pages]
+        valid_rows = cache.valid_rows[:num_pages]
+        if self._decoded_prefix_cache_key != key:
+            if self.raw_fallback_store is None:
+                raise RuntimeError("ByteV2 decoded-prefix cache has no raw sidecar")
+            hybrid_state = self.raw_fallback_store.state(kv_cache)
+            try:
+                byte_v2_static_w16_hydrate_raw_staging_from_hybrid_cache(
+                    raw_pages,
+                    kv_cache,
+                    hybrid_state.raw_pages,
+                    hybrid_state.page_to_raw_slot,
+                    block_table[0, :num_pages],
+                    valid_rows,
+                    hybrid_state.fatal,
+                )
+            except Exception:
+                self._decoded_prefix_cache_key = None
+                raise
+            self._decoded_prefix_cache_key = key
+        return (
+            (
+                raw_pages,
+                local_block_table.view(-1),
+                local_block_table,
+                valid_rows,
+            ),
+            False,
+        )
 
     def stage_initial_prefill(
         self,
@@ -1329,17 +1865,28 @@ class ByteV2RawStagingManager:
         local_page_ids = workspace.staging_to_physical_block[:num_pages]
         try:
             torch.arange(num_pages, out=local_page_ids)
-            byte_v2_hydrate_raw_staging_from_hybrid_cache(
-                raw_staging,
-                kv_cache,
-                hybrid_state.raw_pages,
-                hybrid_state.page_to_raw_slot,
-                physical_pages,
-                valid_rows,
-                codec_token_block=self.tile_policy.codec_token_block,
-                codec_dim_block=self.tile_policy.codec_dim_block,
-                alloc_block_tokens=block_size,
-            )
+            if self.static_w16_enabled:
+                byte_v2_static_w16_hydrate_raw_staging_from_hybrid_cache(
+                    raw_staging,
+                    kv_cache,
+                    hybrid_state.raw_pages,
+                    hybrid_state.page_to_raw_slot,
+                    physical_pages,
+                    valid_rows,
+                    hybrid_state.fatal,
+                )
+            else:
+                byte_v2_hydrate_raw_staging_from_hybrid_cache(
+                    raw_staging,
+                    kv_cache,
+                    hybrid_state.raw_pages,
+                    hybrid_state.page_to_raw_slot,
+                    physical_pages,
+                    valid_rows,
+                    codec_token_block=self.tile_policy.codec_token_block,
+                    codec_dim_block=self.tile_policy.codec_dim_block,
+                    alloc_block_tokens=block_size,
+                )
         except Exception:
             self.release_cached_prefill(
                 local_page_ids.view(1, num_pages),
@@ -1556,18 +2103,43 @@ class ByteV2RawStagingManager:
         if num_tokens == 0:
             return True, False
         if self.raw_fallback_store is not None:
+            hybrid_state = self.raw_fallback_store.state(kv_cache)
+            if (
+                self.static_w16_enabled
+                and self.hybrid_raw_mutable_tail_q1
+                and self.static_w16_batched_raw_tail_q1
+                and _trusted_byte_v2_batched_q1(attn_metadata, num_tokens)
+            ):
+                return self._update_one_wave(
+                    key=key,
+                    value=value,
+                    kv_cache=kv_cache,
+                    slot_mapping=slot_mapping,
+                    page_unsafe_flags=page_unsafe_flags,
+                    hybrid_state=hybrid_state,
+                    active_slot_capacity=num_tokens,
+                    static_w16_raw_tail_q1=True,
+                )
             workspace = self.shared_workspace
             if workspace is None:
                 raise RuntimeError(
                     "ByteV2 hybrid raw fallback requires a runner-owned raw "
                     "staging workspace"
                 )
-            hybrid_state = self.raw_fallback_store.state(kv_cache)
             waves = plan_byte_v2_raw_staging_waves(
                 num_tokens,
                 workspace.spec.num_staging_slots,
                 attn_metadata,
                 alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+            )
+            retain_cascade_q16 = (
+                self.static_w16_enabled
+                and self.static_w16_retain_cascade_q16
+                and _trusted_static_w16_cascade_q16_pages(
+                    attn_metadata,
+                    num_tokens,
+                    alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+                )
             )
             retain_single_wave = (
                 retain_initial_prefill
@@ -1587,6 +2159,8 @@ class ByteV2RawStagingManager:
                     hybrid_state=hybrid_state,
                     active_slot_capacity=wave.max_unique_pages,
                     retain_initial_prefill=retain_single_wave,
+                    overwrites_all_valid_rows=(wave.overwrites_all_valid_rows),
+                    retain_safe_full_pages=retain_cascade_q16,
                 )
                 if not handled:
                     raise RuntimeError(
@@ -1617,6 +2191,9 @@ class ByteV2RawStagingManager:
         hybrid_state: ByteV2RawFallbackState | None,
         active_slot_capacity: int,
         retain_initial_prefill: bool = False,
+        overwrites_all_valid_rows: bool = False,
+        static_w16_raw_tail_q1: bool = False,
+        retain_safe_full_pages: bool = False,
     ) -> tuple[bool, bool]:
         if (
             hybrid_state is None
@@ -1638,6 +2215,39 @@ class ByteV2RawStagingManager:
                 return True, page_unsafe_flags is not None
             except NotImplementedError:
                 pass
+        if (
+            self.static_w16_enabled
+            and hybrid_state is not None
+            and (
+                (slot_mapping.shape[0] == 1 and active_slot_capacity == 1)
+                or static_w16_raw_tail_q1
+            )
+            and slot_mapping.is_cuda
+        ):
+            if page_unsafe_flags is not None:
+                raise RuntimeError(
+                    "ByteV2 Static-W16 does not use V6 page-unsafe flags"
+                )
+            if not self.hybrid_raw_mutable_tail_q1:
+                raise RuntimeError(
+                    "ByteV2 Static-W16 requires the persistent raw-tail Q1 path"
+                )
+            k_base, v_base = self.static_w16_bases
+            byte_v2_static_w16_update_hybrid_cache_raw_tail_q1(
+                key,
+                value,
+                kv_cache,
+                hybrid_state.raw_pages,
+                slot_mapping,
+                hybrid_state.page_to_raw_slot,
+                hybrid_state.free_slots,
+                hybrid_state.free_count,
+                hybrid_state.fatal,
+                k_base=k_base,
+                v_base=v_base,
+            )
+            return True, False
+
         if hybrid_state is None and not self._should_stage(slot_mapping):
             return False, False
         if not self._ensure_capacity(kv_cache, active_slot_capacity):
@@ -1690,8 +2300,13 @@ class ByteV2RawStagingManager:
                         ),
                         page_unsafe_flags=page_unsafe_flags,
                         fuse_commit_finalize=self.hybrid_raw_tail_fused_finalize,
+                        **self._static_w8_writer_kwargs,
                     )
                 except NotImplementedError:
+                    if self.static_w8_enabled:
+                        raise RuntimeError(
+                            "ByteV2 Static-W8 raw-tail writer op is unavailable"
+                        ) from None
                     pass
                 else:
                     # Raw-tail sealing owns the row-15 demotion decision; the
@@ -1723,8 +2338,13 @@ class ByteV2RawStagingManager:
                         self.tile_policy.head_dim_v,
                     ),
                     page_unsafe_flags=page_unsafe_flags,
+                    **self._static_w8_writer_kwargs,
                 )
             except NotImplementedError:
+                if self.static_w8_enabled:
+                    raise RuntimeError(
+                        "ByteV2 Static-W8 hybrid Q1 writer op is unavailable"
+                    ) from None
                 pass
             else:
                 forced_raw_diagnostic = getattr(
@@ -1752,6 +2372,7 @@ class ByteV2RawStagingManager:
             hybrid_state is not None
             and slot_mapping.shape[0] > 1
             and slot_mapping.is_cuda
+            and not self.static_w16_enabled
         ):
             if retain_initial_prefill:
                 try:
@@ -1780,8 +2401,13 @@ class ByteV2RawStagingManager:
                             self.tile_policy.head_dim_v,
                         ),
                         page_unsafe_flags=None,
+                        **self._static_w8_writer_kwargs,
                     )
                 except NotImplementedError:
+                    if self.static_w8_enabled:
+                        raise RuntimeError(
+                            "ByteV2 Static-W8 retained prefill writer op is unavailable"
+                        ) from None
                     pass
                 else:
                     self._initial_prefill_lease = ByteV2InitialPrefillStagingLease(
@@ -1821,9 +2447,14 @@ class ByteV2RawStagingManager:
                     ),
                     page_unsafe_flags=page_unsafe_flags,
                     demote_safe_raw_pages=self.hybrid_raw_mutable_tail_q1,
+                    **self._static_w8_writer_kwargs,
                 )
                 return True, page_unsafe_flags is not None
             except NotImplementedError:
+                if self.static_w8_enabled:
+                    raise RuntimeError(
+                        "ByteV2 Static-W8 multi-token writer op is unavailable"
+                    ) from None
                 pass
 
         if (
@@ -1863,9 +2494,14 @@ class ByteV2RawStagingManager:
                     fuse_single_token_stage_metadata_clear=(
                         _fused_single_token_stage_metadata_clear_enabled()
                     ),
+                    **self._static_w8_writer_kwargs,
                 )
                 return True, True
             except NotImplementedError:
+                if self.static_w8_enabled:
+                    raise RuntimeError(
+                        "ByteV2 Static-W8 fused staging writer op is unavailable"
+                    ) from None
                 pass
 
         try:
@@ -1891,31 +2527,67 @@ class ByteV2RawStagingManager:
                 )
             _debug_sync("raw staging prepare")
             _debug_warmup("raw staging prepare done")
-            _debug_warmup("raw staging hydrate start")
-            if hybrid_state is None:
-                byte_v2_hydrate_raw_staging_from_cache(
-                    raw_staging,
-                    kv_cache,
-                    staging_to_physical_block,
-                    valid_rows,
-                    codec_token_block=self.tile_policy.codec_token_block,
-                    codec_dim_block=self.tile_policy.codec_dim_block,
-                    alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+            skip_initial_prefill_hydrate = (
+                self.static_w16_enabled
+                and hybrid_state is not None
+                and retain_initial_prefill
+                and _static_w16_initial_prefill_skip_hydrate_enabled()
+            )
+            skip_page_aligned_prefill_hydrate = (
+                self.static_w16_enabled
+                and hybrid_state is not None
+                and overwrites_all_valid_rows
+                and _static_w16_page_aligned_prefill_skip_hydrate_enabled()
+            )
+            skip_hydrate = (
+                skip_initial_prefill_hydrate or skip_page_aligned_prefill_hydrate
+            )
+            if skip_hydrate:
+                # Trusted CPU metadata proved that every request segment in
+                # this wave begins at row zero. Append overwrites every valid
+                # row; unread partial-page tail rows remain length-masked.
+                reason = (
+                    "initial prefill"
+                    if skip_initial_prefill_hydrate
+                    else "page-aligned prefill wave"
                 )
+                _debug_warmup("raw staging hydrate skipped for %s", reason)
             else:
-                byte_v2_hydrate_raw_staging_from_hybrid_cache(
-                    raw_staging,
-                    kv_cache,
-                    hybrid_state.raw_pages,
-                    hybrid_state.page_to_raw_slot,
-                    staging_to_physical_block,
-                    valid_rows,
-                    codec_token_block=self.tile_policy.codec_token_block,
-                    codec_dim_block=self.tile_policy.codec_dim_block,
-                    alloc_block_tokens=self.tile_policy.alloc_block_tokens,
-                )
-            _debug_sync("raw staging hydrate")
-            _debug_warmup("raw staging hydrate done")
+                _debug_warmup("raw staging hydrate start")
+                if hybrid_state is None:
+                    byte_v2_hydrate_raw_staging_from_cache(
+                        raw_staging,
+                        kv_cache,
+                        staging_to_physical_block,
+                        valid_rows,
+                        codec_token_block=self.tile_policy.codec_token_block,
+                        codec_dim_block=self.tile_policy.codec_dim_block,
+                        alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+                    )
+                elif self.static_w16_enabled:
+                    byte_v2_static_w16_hydrate_raw_staging_from_hybrid_cache(
+                        raw_staging,
+                        kv_cache,
+                        hybrid_state.raw_pages,
+                        hybrid_state.page_to_raw_slot,
+                        staging_to_physical_block,
+                        valid_rows,
+                        hybrid_state.fatal,
+                    )
+                else:
+                    byte_v2_hydrate_raw_staging_from_hybrid_cache(
+                        raw_staging,
+                        kv_cache,
+                        hybrid_state.raw_pages,
+                        hybrid_state.page_to_raw_slot,
+                        staging_to_physical_block,
+                        valid_rows,
+                        codec_token_block=self.tile_policy.codec_token_block,
+                        codec_dim_block=self.tile_policy.codec_dim_block,
+                        alloc_block_tokens=self.tile_policy.alloc_block_tokens,
+                    )
+                _debug_sync("raw staging hydrate")
+                _debug_warmup("raw staging hydrate done")
             _debug_warmup("raw staging append start")
             byte_v2_append_raw_staging(
                 key,
@@ -1940,6 +2612,22 @@ class ByteV2RawStagingManager:
                     codec_dim_block=self.tile_policy.codec_dim_block,
                     alloc_block_tokens=self.tile_policy.alloc_block_tokens,
                 )
+            elif self.static_w16_enabled:
+                k_base, v_base = self.static_w16_bases
+                byte_v2_static_w16_commit_raw_staging_to_hybrid_cache(
+                    raw_staging,
+                    kv_cache,
+                    hybrid_state.raw_pages,
+                    hybrid_state.page_to_raw_slot,
+                    hybrid_state.free_slots,
+                    hybrid_state.free_count,
+                    hybrid_state.fatal,
+                    staging_to_physical_block,
+                    valid_rows,
+                    k_base=k_base,
+                    v_base=v_base,
+                    retain_safe_full_pages=retain_safe_full_pages,
+                )
             else:
                 byte_v2_commit_raw_staging_to_hybrid_cache(
                     raw_staging,
@@ -1957,6 +2645,17 @@ class ByteV2RawStagingManager:
                 )
             _debug_sync("raw staging commit")
             _debug_warmup("raw staging commit done")
+            if self.static_w16_enabled and retain_initial_prefill:
+                self._initial_prefill_lease = ByteV2InitialPrefillStagingLease(
+                    kv_cache_ptr=kv_cache.data_ptr(),
+                    num_tokens=slot_mapping.shape[0],
+                    active_slot_capacity=active_slot_capacity,
+                    raw_staging=raw_staging,
+                    block_to_staging_slot=self.block_to_staging_slot,
+                    staging_to_physical_block=staging_to_physical_block,
+                    valid_rows=valid_rows,
+                )
+                return True, False
             _debug_warmup("raw staging release start")
             flags_updated = self._release_allocator_state(
                 kv_cache,
@@ -2007,7 +2706,121 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             head_dim_v=head_size,
         )
         self.fa2_hybrid_raw_fallback = byte_v2_hybrid_raw_fallback_enabled()
+        static_w16_requested = byte_v2_static_w16_requested()
+        if (
+            static_w16_requested
+            and os.environ.get("BYTE_V2_STATIC_W8_CODEBOOK") is not None
+        ):
+            raise RuntimeError("Static-W8 and Static-W16 are mutually exclusive")
+        self.static_w8_codebook: ByteV2StaticW8Codebook | None = None
+        self.static_w8_layer_index: int | None = None
+        if os.environ.get("BYTE_V2_STATIC_W8_CODEBOOK") is not None:
+            if not self.fa2_hybrid_raw_fallback:
+                raise RuntimeError(
+                    "BYTE_V2_STATIC_W8_CODEBOOK requires the exact hybrid "
+                    "raw-sidecar fallback"
+                )
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is None or vllm_config.model_config is None:
+                raise RuntimeError(
+                    "ByteV2 Static-W8 requires an initialized model config"
+                )
+            model_config = vllm_config.model_config
+            hf_config = getattr(model_config, "hf_text_config", None)
+            if hf_config is None:
+                hf_config = getattr(model_config, "hf_config", None)
+            num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+            if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+                raise RuntimeError(
+                    "ByteV2 Static-W8 requires num_hidden_layers in the model config"
+                )
+            self.static_w8_codebook = byte_v2_static_w8_codebook_from_env(
+                expected_model=model_config.model,
+                expected_num_layers=num_hidden_layers,
+            )
+            assert self.static_w8_codebook is not None
+            logger.warning_once(
+                "[ByteV2] production Static-W8 writer-only ablation is enabled; "
+                "model=%s layers=%d table_sha256=%s file_sha256=%s",
+                self.static_w8_codebook.model,
+                len(self.static_w8_codebook.bases),
+                self.static_w8_codebook.tables_sha256,
+                self.static_w8_codebook.file_sha256,
+            )
+        self.static_w16_codebook: ByteV2StaticW16Codebook | None = None
+        self.static_w16_layer_index: int | None = None
+        if static_w16_requested:
+            if not self.fa2_hybrid_raw_fallback:
+                raise RuntimeError(
+                    "BYTE_V2_STATIC_W16_CODEBOOK requires the exact hybrid "
+                    "raw-sidecar fallback"
+                )
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is None or vllm_config.model_config is None:
+                raise RuntimeError(
+                    "ByteV2 Static-W16 requires an initialized model config"
+                )
+            model_config = vllm_config.model_config
+            hf_config = getattr(model_config, "hf_text_config", None)
+            if hf_config is None:
+                hf_config = getattr(model_config, "hf_config", None)
+            num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+            if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+                raise RuntimeError(
+                    "ByteV2 Static-W16 requires num_hidden_layers in the model config"
+                )
+            if vllm_config.speculative_config is not None:
+                raise RuntimeError(
+                    "ByteV2 Static-W16 E2E prototype does not support speculative "
+                    "decoding or rollback"
+                )
+            self.static_w16_codebook = byte_v2_static_w16_codebook_from_env(
+                expected_model=model_config.model,
+                expected_num_layers=num_hidden_layers,
+            )
+            assert self.static_w16_codebook is not None
+            logger.warning_once(
+                "[ByteV2] experimental Static-W16 E2E prototype is enabled; "
+                "model=%s layers=%d prefix_caching=%s bases_sha256=%s "
+                "file_sha256=%s",
+                self.static_w16_codebook.model,
+                len(self.static_w16_codebook.bases),
+                vllm_config.cache_config.enable_prefix_caching,
+                self.static_w16_codebook.bases_sha256,
+                self.static_w16_codebook.file_sha256,
+            )
+        self.fa2_page_size_bytes = (
+            STATIC_W16_PAGE_BYTES
+            if self.static_w16_codebook is not None
+            else _BYTE_V2_FA2_PAGE_SIZE_BYTES
+        )
         self.test_forced_raw_promotion = byte_v2_test_forced_raw_promotion_enabled()
+        if self.static_w16_codebook is not None and self.test_forced_raw_promotion:
+            raise RuntimeError(
+                "ByteV2 Static-W16 is incompatible with the V6 forced-promotion "
+                "diagnostic"
+            )
+        retain_cascade_q16_requested = byte_v2_static_w16_retain_cascade_q16_requested()
+        if retain_cascade_q16_requested and self.static_w16_codebook is None:
+            raise RuntimeError(
+                "BYTE_V2_STATIC_W16_RETAIN_CASCADE_Q16=1 requires "
+                "BYTE_V2_STATIC_W16_CODEBOOK"
+            )
+        if (
+            retain_cascade_q16_requested
+            and not byte_v2_static_w16_safe_full_page_retention_is_available()
+        ):
+            raise RuntimeError(
+                "BYTE_V2_STATIC_W16_RETAIN_CASCADE_Q16=1 requires a native "
+                "Static-W16 commit op with safe full-page retention"
+            )
+        self.static_w16_retain_cascade_q16 = retain_cascade_q16_requested
+        if self.static_w16_retain_cascade_q16:
+            logger.warning_once(
+                "[ByteV2] bounded Static-W16 cascade Q16 raw retention is "
+                "enabled; only the first full private page after the shared "
+                "prefix remains raw"
+            )
         raw_tail_requested = _hybrid_raw_mutable_tail_q1_enabled(
             hybrid_raw_fallback=(
                 self.fa2_hybrid_raw_fallback and not self.test_forced_raw_promotion
@@ -2018,8 +2831,17 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 "BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1=1 requires "
                 "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1"
             )
+        if self.static_w16_codebook is not None and not raw_tail_requested:
+            raise RuntimeError(
+                "ByteV2 Static-W16 requires BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1=1"
+            )
+        raw_tail_native_available = (
+            byte_v2_static_w16_runtime_is_available()
+            if self.static_w16_codebook is not None
+            else byte_v2_hybrid_raw_tail_q1_is_available()
+        )
         self.hybrid_raw_mutable_tail_q1 = resolve_byte_v2_hybrid_raw_mutable_tail_q1(
-            native_available=byte_v2_hybrid_raw_tail_q1_is_available(),
+            native_available=raw_tail_native_available,
             hybrid_raw_fallback=(
                 self.fa2_hybrid_raw_fallback and not self.test_forced_raw_promotion
             ),
@@ -2063,6 +2885,23 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         self.cached_prefill_hydrate_to_raw = (
             self.cached_prefill_hydrate_to_raw_mode != "disabled"
         )
+        self.static_w16_cascade_prefix_hydrate_mode = (
+            _static_w16_cascade_prefix_hydrate_mode()
+            if self.fa2_hybrid_raw_fallback
+            else "disabled"
+        )
+        self.static_w16_cascade_prefix_hydrate = (
+            self.static_w16_cascade_prefix_hydrate_mode != "disabled"
+        )
+        if self.static_w16_cascade_prefix_hydrate:
+            logger.warning_once(
+                "[ByteV2] experimental Static-W16 cascade prefix hydrate-to-raw "
+                "path is %s; auto selects Q1 with at least %d shared query "
+                "tokens and a %d-token common prefix",
+                self.static_w16_cascade_prefix_hydrate_mode,
+                _BYTE_V2_STATIC_W16_CASCADE_HYDRATE_AUTO_MIN_QUERY_TOKENS,
+                _BYTE_V2_STATIC_W16_CASCADE_HYDRATE_AUTO_MIN_PREFIX_LEN,
+            )
         if self.cached_prefill_hydrate_to_raw:
             logger.warning_once(
                 "[ByteV2] experimental B1 cached-prefill hydrate-to-raw mode "
@@ -2117,13 +2956,22 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             raw_fallback_store=self.raw_fallback_store,
             hybrid_raw_mutable_tail_q1=self.hybrid_raw_mutable_tail_q1,
             hybrid_raw_tail_fused_finalize=(_hybrid_raw_tail_fused_finalize_enabled()),
+            static_w16_retain_cascade_q16=(self.static_w16_retain_cascade_q16),
         )
         self.prefill_backend = _prefill_backend()
         self.decode_kernel_mode = _decode_kernel_mode()
         self.decode_fa2_available = False
         if self.fa2_hybrid_raw_fallback:
-            hybrid_reader_available = byte_v2_fa2_hybrid_decode_is_available()
-            hybrid_writer_available = byte_v2_hybrid_cache_update_is_available()
+            if self.static_w16_codebook is not None:
+                static_w16_runtime_available = byte_v2_static_w16_runtime_is_available()
+                hybrid_reader_available = static_w16_runtime_available
+                hybrid_writer_available = (
+                    static_w16_runtime_available
+                    and byte_v2_hybrid_cache_update_is_available()
+                )
+            else:
+                hybrid_reader_available = byte_v2_fa2_hybrid_decode_is_available()
+                hybrid_writer_available = byte_v2_hybrid_cache_update_is_available()
             if not hybrid_reader_available or not hybrid_writer_available:
                 missing = []
                 if not hybrid_reader_available:
@@ -2134,6 +2982,14 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                     "BYTE_V2_FA2_HYBRID_RAW_FALLBACK=1 requested the "
                     "experimental compact/raw checkpoint, but the following "
                     f"ops are unavailable: {', '.join(missing)}"
+                )
+            if (
+                self.static_w8_codebook is not None
+                and not byte_v2_static_w8_writer_is_available()
+            ):
+                raise RuntimeError(
+                    "BYTE_V2_STATIC_W8_CODEBOOK requires custom ops with the "
+                    "Static-W8 writer scalar schema"
                 )
             if (
                 self.test_forced_raw_promotion
@@ -2273,6 +3129,27 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             )
         self.raw_staging_manager.bind_shared_workspace(workspace)
 
+    def bind_decoded_prefix_cache_plan(
+        self,
+        kv_cache: torch.Tensor,
+        num_cache_slots: int,
+    ) -> None:
+        """Allocate the planner-accounted per-layer decoded-prefix cache."""
+        if num_cache_slots > 0 and self.static_w16_codebook is None:
+            raise RuntimeError("Decoded-prefix caching requires a Static-W16 codebook")
+        self.raw_staging_manager.bind_decoded_prefix_cache(
+            kv_cache,
+            num_cache_slots,
+        )
+
+    def decoded_prefix_cache_nbytes(self) -> int:
+        """Return this layer's allocated decoded-prefix cache bytes."""
+        return self.raw_staging_manager.decoded_prefix_cache_nbytes()
+
+    def invalidate_decoded_prefix_cache(self) -> None:
+        """Invalidate decoded pages after scheduler block generation changes."""
+        self.raw_staging_manager.invalidate_decoded_prefix_cache()
+
     def bind_raw_fallback_plan(
         self,
         *,
@@ -2300,6 +3177,7 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
     def clear_raw_fallback_runtime_state(self) -> None:
         """Release profiling-only workspace and sidecar tensor references."""
         self.raw_staging_manager.clear_shared_workspace()
+        self.raw_staging_manager.clear_decoded_prefix_cache()
         if self.raw_fallback_store is not None:
             self.raw_fallback_store.clear_binding()
 
@@ -2307,6 +3185,22 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         """Release raw sidecar slots for scheduler-reset physical blocks."""
         if self.raw_fallback_store is not None:
             self.raw_fallback_store.reset(physical_block_ids)
+
+    def raw_fallback_reset_tensors(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Expose initialized reset metadata for cross-layer batching."""
+        if self.raw_fallback_store is None:
+            return None
+        state = self.raw_fallback_store.current_state
+        if state is None:
+            return None
+        return (
+            state.page_to_raw_slot,
+            state.free_slots,
+            state.free_count,
+            state.fatal,
+        )
 
     def _use_gqa_packed_decode(self, max_seq_len: int) -> bool:
         if not self.decode_gqa_packed:
@@ -3580,6 +4474,57 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             )
         return True
 
+    def _run_hybrid_fa2_attention(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        query_start_locs: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        max_query_len: int,
+        max_seq_len: int,
+        causal: bool,
+        preserve_mixed_dispatch: bool = False,
+    ) -> None:
+        """Dispatch the unchanged FA2 body to the selected KV wire loader."""
+        if self.raw_fallback_store is None:
+            raise RuntimeError("ByteV2 hybrid FA2 attention requires a raw sidecar")
+        hybrid_state = self.raw_fallback_store.state(kv_cache)
+        if getattr(self, "static_w16_codebook", None) is not None:
+            byte_v2_static_w16_fa2_paged_attention(
+                output,
+                query,
+                kv_cache,
+                hybrid_state.raw_pages,
+                hybrid_state.page_to_raw_slot,
+                query_start_locs,
+                block_tables,
+                seq_lens,
+                scale=self.scale,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                causal=causal,
+                preserve_mixed_dispatch=preserve_mixed_dispatch,
+            )
+        else:
+            byte_v2_fa2_hybrid_paged_decode_attention(
+                output,
+                query,
+                kv_cache,
+                hybrid_state.raw_pages,
+                hybrid_state.page_to_raw_slot,
+                query_start_locs,
+                block_tables,
+                seq_lens,
+                scale=self.scale,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                causal=causal,
+                preserve_mixed_dispatch=preserve_mixed_dispatch,
+            )
+
     def _forward_direct_paged_prefill(
         self,
         query: torch.Tensor,
@@ -3709,17 +4654,13 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
 
         if plan.cached_request_count:
             assert raw_fallback_store is not None
-            hybrid_state = raw_fallback_store.state(kv_cache)
-            byte_v2_fa2_hybrid_paged_decode_attention(
+            self._run_hybrid_fa2_attention(
                 output[: plan.cached_token_count],
                 query[: plan.cached_token_count],
                 kv_cache,
-                hybrid_state.raw_pages,
-                hybrid_state.page_to_raw_slot,
                 attn_metadata.query_start_loc[: plan.cached_request_count + 1],
                 attn_metadata.block_table[: plan.cached_request_count],
                 attn_metadata.seq_lens[: plan.cached_request_count],
-                scale=self.scale,
                 max_query_len=plan.cached_max_query_len,
                 max_seq_len=plan.cached_max_seq_len,
                 causal=True,
@@ -3896,6 +4837,140 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             )
         return True
 
+    def _forward_static_w16_cascade(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: ByteV2AttentionMetadata,
+    ) -> bool:
+        """Read one shared prefix for a packed batch, then merge suffixes."""
+        if not getattr(attn_metadata, "use_cascade", False):
+            return False
+        if getattr(self, "static_w16_codebook", None) is None:
+            raise RuntimeError("ByteV2 cascade metadata requires Static-W16")
+        if self.raw_fallback_store is None:
+            raise RuntimeError("ByteV2 cascade attention requires a raw sidecar")
+        if not attn_metadata.causal:
+            raise RuntimeError("ByteV2 cascade attention requires causal attention")
+
+        num_actual_tokens = min(attn_metadata.num_actual_tokens, query.shape[0])
+        batch_size = min(
+            attn_metadata.query_start_loc.numel() - 1,
+            attn_metadata.block_table.shape[0],
+            attn_metadata.seq_lens.shape[0],
+        )
+        common_prefix_len = int(attn_metadata.common_prefix_len)
+        block_size = self.tile_policy.alloc_block_tokens
+        num_common_blocks = common_prefix_len // block_size
+        cu_prefix_query_lens = attn_metadata.cu_prefix_query_lens
+        prefix_kv_lens = attn_metadata.prefix_kv_lens
+        suffix_kv_lens = attn_metadata.suffix_kv_lens
+        if (
+            num_actual_tokens <= 0
+            or batch_size <= 0
+            or common_prefix_len <= 0
+            or common_prefix_len % block_size
+            or num_common_blocks > attn_metadata.block_table.shape[1]
+            or attn_metadata.max_seq_len <= common_prefix_len
+            or cu_prefix_query_lens is None
+            or prefix_kv_lens is None
+            or suffix_kv_lens is None
+            or suffix_kv_lens.shape[0] < batch_size
+        ):
+            raise RuntimeError("ByteV2 cascade metadata is incomplete or invalid")
+
+        hybrid_state = self.raw_fallback_store.state(kv_cache)
+        prefix_block_table = attn_metadata.block_table[:1, :num_common_blocks]
+        staged_prefix = None
+        hydrate_mode = getattr(
+            self,
+            "static_w16_cascade_prefix_hydrate_mode",
+            (
+                "enabled"
+                if getattr(self, "static_w16_cascade_prefix_hydrate", False)
+                else "disabled"
+            ),
+        )
+        staged_prefix_requires_release = False
+        if _static_w16_cascade_prefix_hydrate_for_call(
+            hydrate_mode,
+            num_actual_tokens=num_actual_tokens,
+            max_query_len=attn_metadata.max_query_len,
+            common_prefix_len=common_prefix_len,
+        ):
+            staged = self.raw_staging_manager.stage_cached_prefix(
+                kv_cache=kv_cache,
+                block_table=prefix_block_table,
+                seq_len=common_prefix_len,
+                prefix_cache_key=attn_metadata.cascade_prefix_cache_key,
+            )
+            if staged is not None:
+                staged_prefix, staged_prefix_requires_release = staged
+        if staged_prefix is None:
+            prefix_output, prefix_lse = byte_v2_static_w16_fa2_paged_attention_with_lse(
+                query[:num_actual_tokens],
+                kv_cache,
+                hybrid_state.raw_pages,
+                hybrid_state.page_to_raw_slot,
+                cu_prefix_query_lens,
+                prefix_block_table,
+                prefix_kv_lens,
+                scale=self.scale,
+                max_query_len=num_actual_tokens,
+                max_seq_len=common_prefix_len,
+                causal=False,
+            )
+        else:
+            raw_staging, page_map, local_block_table, valid_rows = staged_prefix
+            try:
+                prefix_output, prefix_lse = byte_v2_fa2_raw_staging_attention_with_lse(
+                    query[:num_actual_tokens],
+                    raw_staging,
+                    page_map,
+                    cu_prefix_query_lens,
+                    local_block_table,
+                    prefix_kv_lens,
+                    scale=self.scale,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=block_size,
+                    head_dim=self.head_size,
+                    max_query_len=num_actual_tokens,
+                    max_seq_len=common_prefix_len,
+                    causal=False,
+                    block_tables_are_staging_slots=True,
+                )
+            finally:
+                if staged_prefix_requires_release:
+                    self.raw_staging_manager.release_cached_prefill(
+                        local_block_table,
+                        valid_rows,
+                    )
+        suffix_output, suffix_lse = byte_v2_static_w16_fa2_paged_attention_with_lse(
+            query[:num_actual_tokens],
+            kv_cache,
+            hybrid_state.raw_pages,
+            hybrid_state.page_to_raw_slot,
+            attn_metadata.query_start_loc[: batch_size + 1],
+            attn_metadata.block_table[
+                :batch_size,
+                num_common_blocks:,
+            ],
+            suffix_kv_lens[:batch_size],
+            scale=self.scale,
+            max_query_len=attn_metadata.max_query_len,
+            max_seq_len=attn_metadata.max_seq_len - common_prefix_len,
+            causal=True,
+        )
+        merge_attn_states(
+            output[:num_actual_tokens],
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+        )
+        return True
+
     def _forward_prefill_from_cache(
         self,
         query: torch.Tensor,
@@ -3920,6 +4995,13 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             )
             if batch_size <= 0:
                 return output
+            if self._forward_static_w16_cascade(
+                query,
+                kv_cache,
+                output,
+                attn_metadata,
+            ):
+                return output
             if self._forward_cached_prefill_from_hydrated_cache(
                 query,
                 kv_cache,
@@ -3927,17 +5009,13 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 attn_metadata,
             ):
                 return output
-            hybrid_state = self.raw_fallback_store.state(kv_cache)
-            byte_v2_fa2_hybrid_paged_decode_attention(
+            self._run_hybrid_fa2_attention(
                 output[:num_actual_tokens],
                 query[:num_actual_tokens],
                 kv_cache,
-                hybrid_state.raw_pages,
-                hybrid_state.page_to_raw_slot,
                 attn_metadata.query_start_loc[: batch_size + 1],
                 attn_metadata.block_table[:batch_size],
                 attn_metadata.seq_lens[:batch_size],
-                scale=self.scale,
                 max_query_len=attn_metadata.max_query_len,
                 max_seq_len=attn_metadata.max_seq_len,
                 causal=attn_metadata.causal,
@@ -4046,10 +5124,13 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             kv_cache.dtype != torch.uint8
             or kv_cache.ndim != 2
             or kv_cache.shape[0] <= 0
-            or kv_cache.shape[1] != _BYTE_V2_FA2_PAGE_SIZE_BYTES
+            or kv_cache.shape[1] != self.fa2_page_size_bytes
             or not kv_cache.is_contiguous()
         ):
-            return "KV cache must be contiguous V6 uint8 pages of 50560 bytes"
+            return (
+                "KV cache must be contiguous uint8 pages of "
+                f"{self.fa2_page_size_bytes} bytes"
+            )
 
         batch_size = output.shape[0]
         query_start_locs = attn_metadata.query_start_loc
@@ -4113,6 +5194,14 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 )
             return False
 
+        if self._forward_static_w16_cascade(
+            query,
+            kv_cache,
+            output,
+            attn_metadata,
+        ):
+            return True
+
         batch_size = output.shape[0]
         if self.raw_fallback_store is None:
             byte_v2_fa2_paged_decode_attention(
@@ -4127,17 +5216,13 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
                 causal=attn_metadata.causal,
             )
         else:
-            hybrid_state = self.raw_fallback_store.state(kv_cache)
-            byte_v2_fa2_hybrid_paged_decode_attention(
+            self._run_hybrid_fa2_attention(
                 output,
                 query,
                 kv_cache,
-                hybrid_state.raw_pages,
-                hybrid_state.page_to_raw_slot,
                 attn_metadata.query_start_loc,
                 attn_metadata.block_table[:batch_size],
                 attn_metadata.seq_lens[:batch_size],
-                scale=self.scale,
                 max_query_len=1,
                 max_seq_len=attn_metadata.max_seq_len,
                 causal=attn_metadata.causal,
@@ -4210,6 +5295,68 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
             None,
         )
 
+    def _configure_static_w8_writer(self, layer: object) -> None:
+        codebook = self.static_w8_codebook
+        if codebook is None:
+            return
+        layer_name = getattr(layer, "layer_name", None)
+        if not isinstance(layer_name, str) or not layer_name:
+            raise RuntimeError(
+                "ByteV2 Static-W8 requires Attention.layer_name for every layer"
+            )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        try:
+            layer_index = extract_layer_index(layer_name)
+        except (AssertionError, ValueError) as error:
+            raise RuntimeError(
+                "ByteV2 Static-W8 could not resolve a unique layer index from "
+                f"{layer_name!r}"
+            ) from error
+        if (
+            self.static_w8_layer_index is not None
+            and self.static_w8_layer_index != layer_index
+        ):
+            raise RuntimeError(
+                "ByteV2 Static-W8 attention instance changed layer identity: "
+                f"{self.static_w8_layer_index} -> {layer_index}"
+            )
+        self.static_w8_layer_index = layer_index
+        self.raw_staging_manager.configure_static_w8_bases(
+            codebook.bases_for_layer(layer_index)
+        )
+
+    def _configure_static_w16_writer(self, layer: object) -> None:
+        codebook = self.static_w16_codebook
+        if codebook is None:
+            return
+        layer_name = getattr(layer, "layer_name", None)
+        if not isinstance(layer_name, str) or not layer_name:
+            raise RuntimeError(
+                "ByteV2 Static-W16 requires Attention.layer_name for every layer"
+            )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        try:
+            layer_index = extract_layer_index(layer_name)
+        except (AssertionError, ValueError) as error:
+            raise RuntimeError(
+                "ByteV2 Static-W16 could not resolve a unique layer index from "
+                f"{layer_name!r}"
+            ) from error
+        if (
+            self.static_w16_layer_index is not None
+            and self.static_w16_layer_index != layer_index
+        ):
+            raise RuntimeError(
+                "ByteV2 Static-W16 attention instance changed layer identity: "
+                f"{self.static_w16_layer_index} -> {layer_index}"
+            )
+        self.static_w16_layer_index = layer_index
+        self.raw_staging_manager.configure_static_w16_bases(
+            codebook.bases_for_layer(layer_index)
+        )
+
     def do_kv_cache_update_with_metadata(
         self,
         layer,
@@ -4237,7 +5384,8 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         slot_mapping: torch.Tensor,
         attn_metadata: object | None,
     ) -> None:
-        del layer
+        self._configure_static_w8_writer(layer)
+        self._configure_static_w16_writer(layer)
         query_start_locs = _trusted_byte_v2_query_start_locs(
             attn_metadata,
             slot_mapping.shape[0],
@@ -4305,6 +5453,15 @@ class ByteV2AttentionImpl(AttentionImpl[ByteV2AttentionMetadata]):
         if self.fa2_hybrid_raw_fallback:
             raise RuntimeError(
                 "ByteV2 hybrid raw fallback cannot use the direct cache writer"
+            )
+        if self.static_w8_codebook is not None:
+            raise RuntimeError(
+                "ByteV2 Static-W8 cannot fall through to the Dynamic-W8 direct "
+                "cache writer"
+            )
+        if self.static_w16_codebook is not None:
+            raise RuntimeError(
+                "ByteV2 Static-W16 cannot fall through to the V6 direct cache writer"
             )
         byte_v2_reshape_and_cache(
             key,

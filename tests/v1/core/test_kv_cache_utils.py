@@ -1892,6 +1892,80 @@ def test_byte_v2_raw_tail_runtime_resolution_tracks_native_abi(monkeypatch):
         kv_cache_utils._byte_v2_raw_mutable_tail_q1_runtime_enabled()
 
 
+def test_byte_v2_cascade_q16_retention_runtime_resolution(monkeypatch):
+    from vllm.v1.attention.backends import byte_v2_ops
+
+    env_name = "BYTE_V2_STATIC_W16_RETAIN_CASCADE_Q16"
+    monkeypatch.delenv(env_name, raising=False)
+    assert not (kv_cache_utils._byte_v2_static_w16_retain_cascade_q16_runtime_enabled())
+
+    monkeypatch.setenv(env_name, "1")
+    with pytest.raises(ValueError, match="STATIC_W16_CODEBOOK"):
+        kv_cache_utils._byte_v2_static_w16_retain_cascade_q16_runtime_enabled()
+
+    monkeypatch.setenv("BYTE_V2_STATIC_W16_CODEBOOK", "codebook.json")
+    monkeypatch.setattr(
+        byte_v2_ops,
+        "byte_v2_static_w16_safe_full_page_retention_is_available",
+        lambda: False,
+    )
+    with pytest.raises(RuntimeError, match="safe full-page retention"):
+        kv_cache_utils._byte_v2_static_w16_retain_cascade_q16_runtime_enabled()
+
+    monkeypatch.setattr(
+        byte_v2_ops,
+        "byte_v2_static_w16_safe_full_page_retention_is_available",
+        lambda: True,
+    )
+    assert kv_cache_utils._byte_v2_static_w16_retain_cascade_q16_runtime_enabled()
+
+
+def test_byte_v2_cascade_q16_retention_reserves_one_page_per_request(
+    monkeypatch,
+):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_static_w16_retain_cascade_q16_runtime_enabled",
+        lambda: True,
+    )
+    spec = new_byte_v2_kv_cache_spec()
+    num_blocks = 17
+    max_num_seqs = 4
+    request_resident_raw_slots = 2 * max_num_seqs
+    sidecar_bytes = kv_cache_utils.get_byte_v2_raw_fallback_sidecar_bytes(
+        num_blocks,
+        1,
+        mutable_tail_slots=request_resident_raw_slots,
+    )
+    workspace_bytes = kv_cache_utils.get_byte_v2_raw_staging_workspace_bytes(
+        num_blocks,
+        128,
+    )
+    available_memory = (
+        spec.page_size_bytes * num_blocks + sidecar_bytes + workspace_bytes
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+    vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+
+    config = get_kv_cache_configs(
+        vllm_config,
+        [{"byte_v2": spec}],
+        [available_memory],
+    )[0]
+
+    assert config.num_blocks == num_blocks
+    assert config.byte_v2_raw_fallback_slots == 1 + request_resident_raw_slots
+    assert config.byte_v2_raw_fallback_sidecar_bytes == sidecar_bytes
+    assert config.byte_v2_raw_mutable_tail_q1
+    assert config.byte_v2_static_w16_retain_cascade_q16
+
+
 def test_byte_v2_raw_staging_workspace_formula():
     num_blocks = 512
     num_staging_slots = 128
@@ -1903,6 +1977,91 @@ def test_byte_v2_raw_staging_workspace_formula():
         )
         == 65_536 * num_staging_slots + 4 * num_blocks + 8 * num_staging_slots + 8
     )
+
+
+def test_byte_v2_decoded_prefix_cache_formula():
+    assert kv_cache_utils.get_byte_v2_decoded_prefix_cache_bytes(32, 256) == (
+        536_936_448
+    )
+
+
+def test_byte_v2_decoded_prefix_cache_is_budgeted(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_HYBRID_RAW_MUTABLE_TAIL_Q1", "0")
+    monkeypatch.setenv("BYTE_V2_FA2_RAW_FALLBACK_SLOTS", "1")
+    monkeypatch.setenv("BYTE_V2_FA2_RAW_STAGING_SLOTS", "4")
+    monkeypatch.setenv("BYTE_V2_STATIC_W16_CODEBOOK", "test-codebook.json")
+    monkeypatch.setenv("BYTE_V2_STATIC_W16_DECODED_PREFIX_CACHE_SLOTS", "2")
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
+        lambda: False,
+    )
+    spec = new_byte_v2_kv_cache_spec()
+    num_blocks = 17
+    cache_bytes = kv_cache_utils.get_byte_v2_decoded_prefix_cache_bytes(1, 2)
+    available_memory = kv_cache_utils._get_byte_v2_total_cache_bytes(
+        num_blocks,
+        spec.page_size_bytes,
+        1,
+        1,
+        4,
+        decoded_prefix_cache_slots=2,
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+
+    config = get_kv_cache_configs(
+        vllm_config,
+        [{"byte_v2": spec}],
+        [available_memory],
+    )[0]
+
+    assert config.num_blocks == num_blocks
+    assert config.byte_v2_decoded_prefix_cache_slots == 2
+    assert config.byte_v2_decoded_prefix_cache_bytes == cache_bytes
+    assert (
+        sum(tensor.size for tensor in config.kv_cache_tensors)
+        + config.byte_v2_raw_fallback_sidecar_bytes
+        + config.byte_v2_raw_staging_workspace_bytes
+        + config.byte_v2_decoded_prefix_cache_bytes
+        == available_memory
+    )
+
+
+@pytest.mark.parametrize("value", ["", "invalid", "-1"])
+def test_byte_v2_decoded_prefix_cache_slots_fail_closed(monkeypatch, value):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_STATIC_W16_DECODED_PREFIX_CACHE_SLOTS", value)
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+
+    with pytest.raises(
+        ValueError,
+        match="BYTE_V2_STATIC_W16_DECODED_PREFIX_CACHE_SLOTS",
+    ):
+        get_kv_cache_configs(
+            vllm_config,
+            [{"byte_v2": new_byte_v2_kv_cache_spec()}],
+            [1 << 30],
+        )
+
+
+def test_byte_v2_decoded_prefix_cache_requires_static_w16(monkeypatch):
+    monkeypatch.setenv("BYTE_V2_FA2_HYBRID_RAW_FALLBACK", "1")
+    monkeypatch.setenv("BYTE_V2_STATIC_W16_DECODED_PREFIX_CACHE_SLOTS", "1")
+    monkeypatch.delenv("BYTE_V2_STATIC_W16_CODEBOOK", raising=False)
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "_byte_v2_raw_mutable_tail_q1_runtime_enabled",
+        lambda: False,
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=16))
+
+    with pytest.raises(ValueError, match="requires.*STATIC_W16_CODEBOOK"):
+        get_kv_cache_configs(
+            vllm_config,
+            [{"byte_v2": new_byte_v2_kv_cache_spec()}],
+            [1 << 30],
+        )
 
 
 def test_byte_v2_raw_fallback_block_planner_exact_floor_boundary():
@@ -2385,6 +2544,7 @@ def test_scheduler_config_promotes_byte_v2_reset_across_workers():
             byte_v2_raw_fallback_slots=1,
             byte_v2_raw_fallback_sidecar_bytes=65_588,
             byte_v2_raw_mutable_tail_q1=True,
+            byte_v2_static_w16_retain_cascade_q16=True,
         ),
     ]
 
@@ -2394,6 +2554,7 @@ def test_scheduler_config_promotes_byte_v2_reset_across_workers():
     assert not scheduler_config.has_byte_v2_layers
     assert scheduler_config.byte_v2_raw_fallback_slots == 1
     assert scheduler_config.byte_v2_raw_mutable_tail_q1
+    assert scheduler_config.byte_v2_static_w16_retain_cascade_q16
     assert scheduler_config.needs_kv_cache_zeroing
 
 

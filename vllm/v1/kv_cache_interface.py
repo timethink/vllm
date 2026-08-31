@@ -29,6 +29,9 @@ logger = init_logger(__name__)
 
 BYTE_V2_DEFAULT_RAW_STAGING_SLOTS = 128
 _BYTE_V2_RAW_STAGING_SLOTS_ENV = "BYTE_V2_FA2_RAW_STAGING_SLOTS"
+_BYTE_V2_DECODED_PREFIX_CACHE_SLOTS_ENV = (
+    "BYTE_V2_STATIC_W16_DECODED_PREFIX_CACHE_SLOTS"
+)
 
 
 def byte_v2_hybrid_raw_fallback_enabled() -> bool:
@@ -100,6 +103,26 @@ def byte_v2_raw_staging_slots() -> int:
     if slots <= 0:
         raise ValueError(
             f"{_BYTE_V2_RAW_STAGING_SLOTS_ENV} must be positive, got {value!r}"
+        )
+    return slots
+
+
+def byte_v2_decoded_prefix_cache_slots() -> int:
+    """Return the per-layer decoded-prefix cache capacity in raw pages."""
+    value = os.environ.get(_BYTE_V2_DECODED_PREFIX_CACHE_SLOTS_ENV)
+    if value is None:
+        return 0
+    try:
+        slots = int(value)
+    except ValueError as error:
+        raise ValueError(
+            f"{_BYTE_V2_DECODED_PREFIX_CACHE_SLOTS_ENV} must be a "
+            f"non-negative integer, got {value!r}"
+        ) from error
+    if slots < 0:
+        raise ValueError(
+            f"{_BYTE_V2_DECODED_PREFIX_CACHE_SLOTS_ENV} must be non-negative, "
+            f"got {value!r}"
         )
     return slots
 
@@ -520,12 +543,36 @@ class ByteV2FullAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        from vllm.v1.attention.backends.byte_v2_static_w16 import (
+            STATIC_W16_PAGE_BYTES,
+            byte_v2_static_w16_requested,
+        )
+
+        if byte_v2_static_w16_requested():
+            return STATIC_W16_PAGE_BYTES
         return self._page_layout().page_size_bytes
 
     @property
     def page_metadata_size_bytes(self) -> int:
-        """Return the page prefix that must be reset before block reuse."""
+        """Return the metadata range size reset before block reuse."""
+        from vllm.v1.attention.backends.byte_v2_static_w16 import (
+            byte_v2_static_w16_requested,
+        )
+
+        if byte_v2_static_w16_requested():
+            return 128
         return self._page_layout().aligned_metadata_bytes
+
+    @property
+    def page_metadata_offset_bytes(self) -> int:
+        """Return the byte offset of metadata reset on block reuse."""
+        from vllm.v1.attention.backends.byte_v2_static_w16 import (
+            byte_v2_static_w16_requested,
+        )
+
+        if byte_v2_static_w16_requested():
+            return 49_152
+        return 0
 
     def copy_with_new_block_size(self, block_size: int) -> Self:
         return replace(
@@ -1104,8 +1151,14 @@ class KVCacheConfig:
     """Raw staging slots in the runner-owned cross-layer workspace."""
     byte_v2_raw_staging_workspace_bytes: int = 0
     """Total bytes in the runner-owned ByteV2 staging workspace."""
+    byte_v2_decoded_prefix_cache_slots: int = 0
+    """Persistent decoded-prefix raw pages allocated per ByteV2 layer."""
+    byte_v2_decoded_prefix_cache_bytes: int = 0
+    """Total persistent decoded-prefix cache bytes for this worker."""
     byte_v2_raw_mutable_tail_q1: bool = False
     """Whether this cache plan reserves one mutable raw tail per request."""
+    byte_v2_static_w16_retain_cascade_q16: bool = False
+    """Whether this plan reserves one retained cascade-Q16 page per request."""
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -1,0 +1,8 @@
+results/
+ncu/
+analysis/a100/
+analysis/a100-ncu/
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+__pycache__/

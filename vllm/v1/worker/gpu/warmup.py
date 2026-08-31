@@ -102,16 +102,29 @@ def warmup_kernels(
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
     next_block_id = 1
+    should_zero_new_blocks = model_runner.kv_block_zeroer is not None
 
-    def _alloc_blocks(num_blocks: int) -> list[int]:
+    def _alloc_blocks(
+        num_blocks: int,
+        new_block_ids_to_zero: list[int] | None,
+    ) -> list[int]:
         nonlocal next_block_id
-        return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
+        block_ids = list(
+            range(next_block_id, next_block_id := next_block_id + num_blocks)
+        )
+        if new_block_ids_to_zero is not None:
+            new_block_ids_to_zero.extend(block_ids)
+        return block_ids
 
     # Step 1: Prefill all requests with 2 + num_spec_steps prompt tokens each.
+    prefill_block_ids_to_zero: list[int] | None = [] if should_zero_new_blocks else None
     new_reqs = [
         NewRequestData.from_request(
             Request(req_ids[i], prompt_token_ids, sampling_params, pooling_params),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+            block_ids=tuple(
+                _alloc_blocks(n, prefill_block_ids_to_zero)
+                for n in prefill_block_counts
+            ),
             prefill_token_ids=prompt_token_ids,
         )
         for i in range(num_reqs)
@@ -122,6 +135,7 @@ def warmup_kernels(
     prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
     prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
     prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+    prefill_output.new_block_ids_to_zero = prefill_block_ids_to_zero
 
     # Disable KV connector for warmup run.
     model_runner.kv_connector.set_disabled(True)
@@ -155,8 +169,15 @@ def warmup_kernels(
         cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
         cached_req_data.num_output_tokens = [1] * num_reqs
         new_block = any(decode_block_deltas)
+        decode_block_ids_to_zero: list[int] | None = (
+            [] if should_zero_new_blocks else None
+        )
         cached_req_data.new_block_ids = [
-            tuple(_alloc_blocks(n) for n in decode_block_deltas) if new_block else None
+            tuple(
+                _alloc_blocks(n, decode_block_ids_to_zero) for n in decode_block_deltas
+            )
+            if new_block
+            else None
             for _ in range(num_reqs)
         ]
 
@@ -173,6 +194,7 @@ def warmup_kernels(
             decode_output.num_scheduled_tokens.values()
         )
         decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        decode_output.new_block_ids_to_zero = decode_block_ids_to_zero
 
         _byte_v2_debug("decode execute start")
         worker_execute_model(decode_output)

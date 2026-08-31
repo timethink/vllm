@@ -62,6 +62,7 @@ from vllm.model_executor.layers.attention import (
 )
 from vllm.model_executor.layers.attention.attention import (
     bind_byte_v2_raw_staging_workspace,
+    reset_byte_v2_raw_fallback_pages,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
@@ -1123,6 +1124,7 @@ class GPUModelRunner(
         reset_fns = self._get_raw_fallback_reset_fns()
         if not block_ids or not reset_fns:
             return
+        self._invalidate_decoded_prefix_caches()
         if not hasattr(self, "_raw_fallback_ids_pin_memory"):
             self._init_raw_fallback_reset(self.pin_memory)
 
@@ -1145,8 +1147,45 @@ class GPUModelRunner(
         ids_pinned[:n_blocks].numpy()[:] = block_ids
         block_ids_tensor = ids_gpu[:n_blocks]
         block_ids_tensor.copy_(ids_pinned[:n_blocks], non_blocking=True)
-        for reset_fn in reset_fns:
-            reset_fn(block_ids_tensor)
+        reset_byte_v2_raw_fallback_pages(
+            self.compilation_config.static_forward_context,
+            block_ids_tensor,
+        )
+
+    def _invalidate_decoded_prefix_caches(self) -> None:
+        """Invalidate decoded prefixes before physical block reuse."""
+        self._byte_v2_cascade_prefix_signature: (
+            tuple[tuple[str, ...], tuple[tuple[int, ...], ...]] | None
+        ) = None
+        seen_impls: set[int] = set()
+        for layer in self.compilation_config.static_forward_context.values():
+            impl = getattr(layer, "impl", None)
+            if impl is None or id(impl) in seen_impls:
+                continue
+            seen_impls.add(id(impl))
+            invalidate = getattr(impl, "invalidate_decoded_prefix_cache", None)
+            if callable(invalidate):
+                invalidate()
+
+    def _cascade_prefix_cache_key(
+        self,
+        cascade_attn_prefix_lens: list[list[int]],
+    ) -> int:
+        """Return a stable key for one request-membership/prefix generation."""
+        signature = (
+            tuple(self.input_batch.req_ids),
+            tuple(tuple(group) for group in cascade_attn_prefix_lens),
+        )
+        if signature != getattr(
+            self,
+            "_byte_v2_cascade_prefix_signature",
+            None,
+        ):
+            self._byte_v2_cascade_prefix_epoch = (
+                getattr(self, "_byte_v2_cascade_prefix_epoch", 0) + 1
+            )
+            self._byte_v2_cascade_prefix_signature = signature
+        return self._byte_v2_cascade_prefix_epoch
 
     def _init_raw_fallback_reset(self, pin_memory: bool) -> None:
         """Allocate reusable block-ID staging buffers when reset is supported."""
@@ -2401,6 +2440,11 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
+            cascade_prefix_cache_key=(
+                self._cascade_prefix_cache_key(cascade_attn_prefix_lens)
+                if cascade_attn_prefix_lens is not None
+                else 0
+            ),
         )
 
         if self.dcp_world_size > 1:
@@ -6313,6 +6357,7 @@ class GPUModelRunner(
         from vllm.v1.core.kv_cache_utils import (
             _byte_v2_raw_fallback_slots_override,
             _byte_v2_raw_mutable_tail_q1_runtime_enabled,
+            _byte_v2_static_w16_retain_cascade_q16_runtime_enabled,
             _validate_byte_v2_raw_fallback_slots,
             get_byte_v2_raw_fallback_sidecar_bytes,
             get_byte_v2_raw_fallback_slots,
@@ -6340,9 +6385,16 @@ class GPUModelRunner(
         if byte_v2_hybrid_raw_fallback_enabled() and minimal_config.has_byte_v2_layers:
             raw_slots_override = _byte_v2_raw_fallback_slots_override()
             mutable_tail_enabled = _byte_v2_raw_mutable_tail_q1_runtime_enabled()
+            retain_cascade_q16_enabled = (
+                _byte_v2_static_w16_retain_cascade_q16_runtime_enabled()
+            )
             mutable_tail_slots = (
                 self.scheduler_config.max_num_seqs if mutable_tail_enabled else 0
             )
+            retained_cascade_slots = (
+                self.scheduler_config.max_num_seqs if retain_cascade_q16_enabled else 0
+            )
+            request_resident_raw_slots = mutable_tail_slots + retained_cascade_slots
             # The temporary CUDA Graph namespace can be larger than the final
             # memory-limited cache. Validate an explicit total only against the
             # absolute minimum here; the final planner validates it again
@@ -6350,12 +6402,12 @@ class GPUModelRunner(
             _validate_byte_v2_raw_fallback_slots(
                 0,
                 raw_slots_override,
-                mutable_tail_slots,
+                request_resident_raw_slots,
             )
             raw_slots = get_byte_v2_raw_fallback_slots(
                 minimal_config.num_blocks,
                 raw_slots_override,
-                mutable_tail_slots,
+                request_resident_raw_slots,
             )
             staging_slots = byte_v2_raw_staging_slots()
             minimal_config.byte_v2_raw_fallback_slots = raw_slots
@@ -6364,7 +6416,7 @@ class GPUModelRunner(
                     minimal_config.num_blocks,
                     minimal_config.num_byte_v2_layers,
                     raw_slots_override,
-                    mutable_tail_slots,
+                    request_resident_raw_slots,
                 )
             )
             minimal_config.byte_v2_raw_staging_slots = staging_slots
@@ -6375,6 +6427,9 @@ class GPUModelRunner(
                 )
             )
             minimal_config.byte_v2_raw_mutable_tail_q1 = mutable_tail_enabled
+            minimal_config.byte_v2_static_w16_retain_cascade_q16 = (
+                retain_cascade_q16_enabled
+            )
         self.initialize_kv_cache(minimal_config, is_profiling=True)
         self.cache_config.num_gpu_blocks = minimal_config.num_blocks
 

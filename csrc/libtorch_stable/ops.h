@@ -587,11 +587,40 @@ void byte_v2_commit_raw_staging_to_hybrid_cache(
     torch::stable::Tensor& valid_rows, int64_t codec_token_block,
     int64_t codec_dim_block, int64_t alloc_block_tokens);
 
+void byte_v2_static_w16_hydrate_raw_staging_from_hybrid_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& raw_pages, torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& staging_to_physical,
+    torch::stable::Tensor& valid_rows, torch::stable::Tensor& fatal);
+
+void byte_v2_static_w16_commit_raw_staging_to_hybrid_cache(
+    torch::stable::Tensor& raw_staging, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& raw_pages, torch::stable::Tensor& page_to_raw_slot,
+    torch::stable::Tensor& free_slots, torch::stable::Tensor& free_count,
+    torch::stable::Tensor& fatal, torch::stable::Tensor& staging_to_physical,
+    torch::stable::Tensor& valid_rows, int64_t k_base, int64_t v_base,
+    bool retain_safe_full_pages);
+
+void byte_v2_static_w16_update_hybrid_cache_raw_tail_q1(
+    torch::stable::Tensor& key, torch::stable::Tensor& value,
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor& raw_pages,
+    torch::stable::Tensor& slot_mapping,
+    torch::stable::Tensor& page_to_raw_slot, torch::stable::Tensor& free_slots,
+    torch::stable::Tensor& free_count, torch::stable::Tensor& fatal,
+    int64_t k_base, int64_t v_base);
+
 void byte_v2_reset_raw_fallback_pages(
     torch::stable::Tensor& page_to_raw_slot,
     torch::stable::Tensor& free_raw_slots,
     torch::stable::Tensor& free_raw_slot_count,
     torch::stable::Tensor& raw_pool_overflow,
+    torch::stable::Tensor& physical_block_ids);
+
+void byte_v2_reset_raw_fallback_pages_batched(
+    std::vector<torch::stable::Tensor>& page_to_raw_slots,
+    std::vector<torch::stable::Tensor>& free_raw_slots,
+    std::vector<torch::stable::Tensor>& free_raw_slot_counts,
+    std::vector<torch::stable::Tensor>& raw_pool_overflows,
     torch::stable::Tensor& physical_block_ids);
 
 void byte_v2_update_cache_raw_staging(
@@ -605,7 +634,8 @@ void byte_v2_update_cache_raw_staging(
     const std::vector<int64_t>& tile_policy, bool fuse_metadata_clear,
     bool bypass_serial_metadata, bool warp_parallel_histogram,
     bool fuse_single_token_staging, bool fuse_single_token_commit_release,
-    bool fuse_single_token_stage_metadata_clear);
+    bool fuse_single_token_stage_metadata_clear, int64_t static_k_high7_base,
+    int64_t static_v_high7_base);
 
 void byte_v2_update_hybrid_cache_raw_staging_q1(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
@@ -620,7 +650,8 @@ void byte_v2_update_hybrid_cache_raw_staging_q1(
     torch::stable::Tensor& free_raw_slot_count,
     torch::stable::Tensor& raw_pool_overflow,
     const std::vector<int64_t>& tile_policy,
-    std::optional<torch::stable::Tensor> page_unsafe_flags);
+    std::optional<torch::stable::Tensor> page_unsafe_flags,
+    int64_t static_k_high7_base, int64_t static_v_high7_base);
 
 void byte_v2_update_hybrid_cache_raw_tail_q1(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
@@ -636,7 +667,8 @@ void byte_v2_update_hybrid_cache_raw_tail_q1(
     torch::stable::Tensor& raw_pool_overflow,
     const std::vector<int64_t>& tile_policy,
     std::optional<torch::stable::Tensor> page_unsafe_flags,
-    bool fuse_commit_finalize);
+    bool fuse_commit_finalize, int64_t static_k_high7_base,
+    int64_t static_v_high7_base);
 
 void byte_v2_update_hybrid_cache_raw_staging_multi_token(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
@@ -652,7 +684,8 @@ void byte_v2_update_hybrid_cache_raw_staging_multi_token(
     torch::stable::Tensor& raw_pool_overflow,
     const std::vector<int64_t>& tile_policy,
     std::optional<torch::stable::Tensor> page_unsafe_flags,
-    bool demote_safe_raw_pages);
+    bool demote_safe_raw_pages, int64_t static_k_high7_base,
+    int64_t static_v_high7_base);
 
 void byte_v2_update_hybrid_cache_raw_staging_multi_token_retained(
     torch::stable::Tensor& key, torch::stable::Tensor& value,
@@ -667,7 +700,8 @@ void byte_v2_update_hybrid_cache_raw_staging_multi_token_retained(
     torch::stable::Tensor& free_raw_slot_count,
     torch::stable::Tensor& raw_pool_overflow,
     const std::vector<int64_t>& tile_policy,
-    std::optional<torch::stable::Tensor> page_unsafe_flags);
+    std::optional<torch::stable::Tensor> page_unsafe_flags,
+    int64_t static_k_high7_base, int64_t static_v_high7_base);
 
 void byte_v2_test_force_promote_raw_staging_q1(
     torch::stable::Tensor& raw_staging,

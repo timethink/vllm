@@ -710,12 +710,30 @@ def bind_byte_v2_raw_staging_workspace(
     planned_bytes = int(
         getattr(kv_cache_config, "byte_v2_raw_staging_workspace_bytes", 0)
     )
+    decoded_prefix_cache_slots = int(
+        getattr(kv_cache_config, "byte_v2_decoded_prefix_cache_slots", 0)
+    )
+    planned_decoded_prefix_cache_bytes = int(
+        getattr(kv_cache_config, "byte_v2_decoded_prefix_cache_bytes", 0)
+    )
     num_raw_slots = int(getattr(kv_cache_config, "byte_v2_raw_fallback_slots", 0))
     planned_raw_tail_q1 = bool(
         getattr(kv_cache_config, "byte_v2_raw_mutable_tail_q1", False)
     )
+    planned_retain_cascade_q16 = bool(
+        getattr(
+            kv_cache_config,
+            "byte_v2_static_w16_retain_cascade_q16",
+            False,
+        )
+    )
     num_blocks = int(getattr(kv_cache_config, "num_blocks", 0))
-    if use_ubatching and (num_staging_slots > 0 or planned_bytes > 0):
+    if use_ubatching and (
+        num_staging_slots > 0
+        or planned_bytes > 0
+        or decoded_prefix_cache_slots > 0
+        or planned_decoded_prefix_cache_bytes > 0
+    ):
         raise RuntimeError(
             "ByteV2 hybrid raw fallback does not support ubatching because its "
             "raw staging workspace is single-lane"
@@ -749,6 +767,16 @@ def bind_byte_v2_raw_staging_workspace(
                 f"{runtime_raw_tail_q1}. All workers must use the same native "
                 "extension and initialization environment."
             )
+        runtime_retain_cascade_q16 = bool(
+            getattr(impl, "static_w16_retain_cascade_q16", False)
+        )
+        if runtime_retain_cascade_q16 != planned_retain_cascade_q16:
+            raise RuntimeError(
+                "ByteV2 cascade-Q16 retention capability mismatch: planner "
+                f"resolved {planned_retain_cascade_q16}, but attention "
+                f"resolved {runtime_retain_cascade_q16}. All workers must use "
+                "the same native extension and initialization environment."
+            )
         seen_impls.add(id(impl))
         spec = spec_fn(layer.kv_cache, num_staging_slots)
         if spec is not None:
@@ -762,10 +790,30 @@ def bind_byte_v2_raw_staging_workspace(
                 num_blocks=num_blocks,
                 num_raw_slots=num_raw_slots,
             )
+            if decoded_prefix_cache_slots > 0:
+                bind_decoded_prefix_cache = getattr(
+                    impl,
+                    "bind_decoded_prefix_cache_plan",
+                    None,
+                )
+                if not callable(bind_decoded_prefix_cache):
+                    raise RuntimeError(
+                        "ByteV2 attention implementation cannot bind its "
+                        "decoded-prefix cache plan"
+                    )
+                bind_decoded_prefix_cache(
+                    layer.kv_cache,
+                    decoded_prefix_cache_slots,
+                )
             specs_and_impls.append((spec, impl, layer.kv_cache))
 
     if not specs_and_impls:
-        if num_staging_slots != 0 or planned_bytes != 0:
+        if (
+            num_staging_slots != 0
+            or planned_bytes != 0
+            or decoded_prefix_cache_slots != 0
+            or planned_decoded_prefix_cache_bytes != 0
+        ):
             raise RuntimeError(
                 "The KV-cache planner reserved a ByteV2 raw staging workspace, "
                 "but no active attention implementation requested it"
@@ -793,6 +841,23 @@ def bind_byte_v2_raw_staging_workspace(
             "ByteV2 raw staging workspace budget mismatch: planner reserved "
             f"{planned_bytes} bytes, runtime requires {actual_bytes} bytes"
         )
+    actual_decoded_prefix_cache_bytes = 0
+    for _, impl, _ in specs_and_impls:
+        cache_nbytes = getattr(impl, "decoded_prefix_cache_nbytes", None)
+        if not callable(cache_nbytes):
+            if planned_decoded_prefix_cache_bytes > 0:
+                raise RuntimeError(
+                    "ByteV2 attention implementation cannot report "
+                    "decoded-prefix cache bytes"
+                )
+            continue
+        actual_decoded_prefix_cache_bytes += int(cache_nbytes())
+    if actual_decoded_prefix_cache_bytes != planned_decoded_prefix_cache_bytes:
+        raise RuntimeError(
+            "ByteV2 decoded-prefix cache budget mismatch: planner reserved "
+            f"{planned_decoded_prefix_cache_bytes} bytes, runtime requires "
+            f"{actual_decoded_prefix_cache_bytes} bytes"
+        )
     allocate = getattr(first_spec, "allocate", None)
     if not callable(allocate):
         raise RuntimeError("ByteV2 raw staging workspace spec is not allocatable")
@@ -815,6 +880,62 @@ def bind_byte_v2_raw_staging_workspace(
             )
         bind(workspace)
     return workspace
+
+
+def reset_byte_v2_raw_fallback_pages(
+    static_forward_context: dict[str, Any],
+    physical_block_ids: torch.Tensor,
+) -> None:
+    """Reset ByteV2 sidecars, batching compatible layers into one launch.
+
+    The batched entry point is optional so a Python checkout remains usable
+    with an older native extension. Implementations that do not expose the
+    four reset tensors continue to use their existing per-layer hook.
+    """
+    from vllm.v1.attention.backends import byte_v2_ops
+
+    can_batch = byte_v2_ops.byte_v2_batched_raw_fallback_reset_is_available()
+    page_to_raw_slots: list[torch.Tensor] = []
+    free_raw_slots: list[torch.Tensor] = []
+    free_raw_slot_counts: list[torch.Tensor] = []
+    raw_pool_overflows: list[torch.Tensor] = []
+    fallback_reset_fns: list[Any] = []
+
+    for layer in static_forward_context.values():
+        impl = getattr(layer, "impl", None)
+        reset_fn = getattr(impl, "reset_raw_fallback_pages", None)
+        if not callable(reset_fn):
+            continue
+        reset_tensors_fn = getattr(impl, "raw_fallback_reset_tensors", None)
+        if not can_batch or not callable(reset_tensors_fn):
+            fallback_reset_fns.append(reset_fn)
+            continue
+        reset_tensors = reset_tensors_fn()
+        if reset_tensors is None:
+            fallback_reset_fns.append(reset_fn)
+            continue
+        if len(reset_tensors) != 4 or not all(
+            isinstance(tensor, torch.Tensor) for tensor in reset_tensors
+        ):
+            raise RuntimeError(
+                "ByteV2 raw_fallback_reset_tensors must return four tensors"
+            )
+        page_to_raw_slot, free_slots, free_count, fatal = reset_tensors
+        page_to_raw_slots.append(page_to_raw_slot)
+        free_raw_slots.append(free_slots)
+        free_raw_slot_counts.append(free_count)
+        raw_pool_overflows.append(fatal)
+
+    if page_to_raw_slots:
+        byte_v2_ops.byte_v2_reset_raw_fallback_pages_batched(
+            page_to_raw_slots,
+            free_raw_slots,
+            free_raw_slot_counts,
+            raw_pool_overflows,
+            physical_block_ids,
+        )
+    for reset_fn in fallback_reset_fns:
+        reset_fn(physical_block_ids)
 
 
 def unified_kv_cache_update(

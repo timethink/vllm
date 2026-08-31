@@ -351,7 +351,8 @@ template <typename Policy = DefaultByteV2TilePolicy,
           typename CodecPayloadPolicy = ByteV2CodecPayloadPolicy<Policy>,
           int NumKvHeads = 8, int PageHeaderBytes = 128,
           int KvHeadMetaBytes = 96, int AlignmentBytes = 128,
-          int OutlierValueBits = 8, int OutlierPoolEntries = 1024>
+          int OutlierValueBits = 8, int OutlierPoolEntries = 1024,
+          int OutlierDescriptorBytes = 2>
 struct ByteV2PageLayoutV5 {
   static_assert(NumKvHeads > 0);
   static_assert(PageHeaderBytes >= 8);
@@ -360,6 +361,8 @@ struct ByteV2PageLayoutV5 {
   static_assert(OutlierValueBits > 0);
   static_assert(OutlierPoolEntries >= Policy::CodecTileElems);
   static_assert(OutlierPoolEntries <= 65535);
+  static_assert(OutlierDescriptorBytes == 1 || OutlierDescriptorBytes == 2);
+  static_assert(OutlierDescriptorBytes == 2 || OutlierPoolEntries <= 256);
   static_assert(Policy::CodecTilesPerKPage <= 32);
   static_assert(Policy::CodecTilesPerVPage <= 32);
 
@@ -370,6 +373,7 @@ struct ByteV2PageLayoutV5 {
   static constexpr int RawElementBytesValue = 2;
   static constexpr int OutlierEntriesPerTileValue = Policy::CodecTileElems;
   static constexpr int OutlierPoolEntriesValue = OutlierPoolEntries;
+  static constexpr int OutlierDescriptorBytesValue = OutlierDescriptorBytes;
   static constexpr bool IncludeRawPayloadValue = false;
   static constexpr bool PagePooledOutliersValue = true;
 
@@ -380,7 +384,8 @@ struct ByteV2PageLayoutV5 {
   static constexpr int MacroPages = Policy::AllocBlocksPerComputeTile;
   static constexpr int TilesPerKvHead =
       Policy::CodecTilesPerKPage + Policy::CodecTilesPerVPage;
-  static constexpr int KvHeadRequiredMetaBytes = 32 + 4 * TilesPerKvHead;
+  static constexpr int KvHeadRequiredMetaBytes =
+      32 + 2 * OutlierDescriptorBytes * TilesPerKvHead;
   static_assert(KvHeadMetaBytes >= KvHeadRequiredMetaBytes);
   static constexpr int MetadataBytes =
       PageHeaderBytes + NumKvHeads * KvHeadMetaBytes;
@@ -432,6 +437,25 @@ struct ByteV2PageLayoutV5 {
     page[offset + 1] = static_cast<uint8_t>(value >> 8);
   }
 
+  VLLM_BYTE_V2_HOST_DEVICE static int load_outlier_descriptor(
+      const uint8_t* page, int offset) {
+    if constexpr (OutlierDescriptorBytes == 1) {
+      return static_cast<int>(page[offset]);
+    } else {
+      return static_cast<int>(load_u16(page, offset));
+    }
+  }
+
+  VLLM_BYTE_V2_HOST_DEVICE static void store_outlier_descriptor(uint8_t* page,
+                                                                int offset,
+                                                                int value) {
+    if constexpr (OutlierDescriptorBytes == 1) {
+      page[offset] = static_cast<uint8_t>(value);
+    } else {
+      store_u16(page, offset, static_cast<uint16_t>(value));
+    }
+  }
+
   VLLM_BYTE_V2_HOST_DEVICE static constexpr int kv_head_meta_offset(
       int kv_head) {
     return PageHeaderBytes + kv_head * KvHeadMetaBytes;
@@ -481,84 +505,129 @@ struct ByteV2PageLayoutV5 {
 
   VLLM_BYTE_V2_HOST_DEVICE static constexpr int k_outlier_count_offset(
       int kv_head, int dim_tile, int token_tile = 0) {
-    return kv_head_meta_offset(kv_head) + 32 +
-           2 * k_tile_index(dim_tile, token_tile);
+    if constexpr (OutlierDescriptorBytes == 1) {
+      return kv_head_meta_offset(kv_head) + 32 +
+             2 * k_tile_index(dim_tile, token_tile);
+    } else {
+      return kv_head_meta_offset(kv_head) + 32 +
+             OutlierDescriptorBytes * k_tile_index(dim_tile, token_tile);
+    }
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static constexpr int v_outlier_count_offset(
       int kv_head, int dim_tile, int token_tile = 0) {
-    return kv_head_meta_offset(kv_head) + 32 +
-           2 * (Policy::CodecTilesPerKPage +
-                v_tile_index(dim_tile, token_tile));
+    if constexpr (OutlierDescriptorBytes == 1) {
+      return kv_head_meta_offset(kv_head) + 32 +
+             2 * (Policy::CodecTilesPerKPage +
+                  v_tile_index(dim_tile, token_tile));
+    } else {
+      return kv_head_meta_offset(kv_head) + 32 +
+             OutlierDescriptorBytes * (Policy::CodecTilesPerKPage +
+                                       v_tile_index(dim_tile, token_tile));
+    }
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static constexpr int k_outlier_pool_index_offset(
       int kv_head, int dim_tile, int token_tile = 0) {
-    return kv_head_meta_offset(kv_head) + 32 + 2 * TilesPerKvHead +
-           2 * k_tile_index(dim_tile, token_tile);
+    if constexpr (OutlierDescriptorBytes == 1) {
+      return k_outlier_count_offset(kv_head, dim_tile, token_tile) + 1;
+    } else {
+      return kv_head_meta_offset(kv_head) + 32 +
+             OutlierDescriptorBytes * TilesPerKvHead +
+             OutlierDescriptorBytes * k_tile_index(dim_tile, token_tile);
+    }
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static constexpr int v_outlier_pool_index_offset(
       int kv_head, int dim_tile, int token_tile = 0) {
-    return kv_head_meta_offset(kv_head) + 32 + 2 * TilesPerKvHead +
-           2 * (Policy::CodecTilesPerKPage +
-                v_tile_index(dim_tile, token_tile));
+    if constexpr (OutlierDescriptorBytes == 1) {
+      return v_outlier_count_offset(kv_head, dim_tile, token_tile) + 1;
+    } else {
+      return kv_head_meta_offset(kv_head) + 32 +
+             OutlierDescriptorBytes * TilesPerKvHead +
+             OutlierDescriptorBytes * (Policy::CodecTilesPerKPage +
+                                       v_tile_index(dim_tile, token_tile));
+    }
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static int k_outlier_count(const uint8_t* page,
                                                       int kv_head, int dim_tile,
                                                       int token_tile = 0) {
-    return static_cast<int>(
-        load_u16(page, k_outlier_count_offset(kv_head, dim_tile, token_tile)));
+    const int stored = load_outlier_descriptor(
+        page, k_outlier_count_offset(kv_head, dim_tile, token_tile));
+    if constexpr (OutlierDescriptorBytes == 1) {
+      const uint32_t tile_bit = uint32_t{1}
+                                << k_tile_index(dim_tile, token_tile);
+      const uint32_t outlier_mask = *reinterpret_cast<const uint32_t*>(
+          page + k_outlier_mask_offset(kv_head));
+      return (outlier_mask & tile_bit) != 0 ? stored + 1 : 0;
+    } else {
+      return stored;
+    }
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static int v_outlier_count(const uint8_t* page,
                                                       int kv_head, int dim_tile,
                                                       int token_tile = 0) {
-    return static_cast<int>(
-        load_u16(page, v_outlier_count_offset(kv_head, dim_tile, token_tile)));
+    const int stored = load_outlier_descriptor(
+        page, v_outlier_count_offset(kv_head, dim_tile, token_tile));
+    if constexpr (OutlierDescriptorBytes == 1) {
+      const uint32_t tile_bit = uint32_t{1}
+                                << v_tile_index(dim_tile, token_tile);
+      const uint32_t outlier_mask = *reinterpret_cast<const uint32_t*>(
+          page + v_outlier_mask_offset(kv_head));
+      return (outlier_mask & tile_bit) != 0 ? stored + 1 : 0;
+    } else {
+      return stored;
+    }
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static void set_k_outlier_count(
       uint8_t* page, int kv_head, int dim_tile, int token_tile, int count) {
-    store_u16(page, k_outlier_count_offset(kv_head, dim_tile, token_tile),
-              static_cast<uint16_t>(count));
+    const int stored =
+        OutlierDescriptorBytes == 1 && count > 0 ? count - 1 : count;
+    store_outlier_descriptor(
+        page, k_outlier_count_offset(kv_head, dim_tile, token_tile), stored);
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static void set_v_outlier_count(
       uint8_t* page, int kv_head, int dim_tile, int token_tile, int count) {
-    store_u16(page, v_outlier_count_offset(kv_head, dim_tile, token_tile),
-              static_cast<uint16_t>(count));
+    const int stored =
+        OutlierDescriptorBytes == 1 && count > 0 ? count - 1 : count;
+    store_outlier_descriptor(
+        page, v_outlier_count_offset(kv_head, dim_tile, token_tile), stored);
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static int k_outlier_pool_index(const uint8_t* page,
                                                            int kv_head,
                                                            int dim_tile,
                                                            int token_tile = 0) {
-    return static_cast<int>(load_u16(
-        page, k_outlier_pool_index_offset(kv_head, dim_tile, token_tile)));
+    return load_outlier_descriptor(
+        page, k_outlier_pool_index_offset(kv_head, dim_tile, token_tile));
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static int v_outlier_pool_index(const uint8_t* page,
                                                            int kv_head,
                                                            int dim_tile,
                                                            int token_tile = 0) {
-    return static_cast<int>(load_u16(
-        page, v_outlier_pool_index_offset(kv_head, dim_tile, token_tile)));
+    return load_outlier_descriptor(
+        page, v_outlier_pool_index_offset(kv_head, dim_tile, token_tile));
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static void set_k_outlier_pool_index(
       uint8_t* page, int kv_head, int dim_tile, int token_tile,
       int pool_index) {
-    store_u16(page, k_outlier_pool_index_offset(kv_head, dim_tile, token_tile),
-              static_cast<uint16_t>(pool_index));
+    store_outlier_descriptor(
+        page, k_outlier_pool_index_offset(kv_head, dim_tile, token_tile),
+        pool_index);
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static void set_v_outlier_pool_index(
       uint8_t* page, int kv_head, int dim_tile, int token_tile,
       int pool_index) {
-    store_u16(page, v_outlier_pool_index_offset(kv_head, dim_tile, token_tile),
-              static_cast<uint16_t>(pool_index));
+    store_outlier_descriptor(
+        page, v_outlier_pool_index_offset(kv_head, dim_tile, token_tile),
+        pool_index);
   }
 
   VLLM_BYTE_V2_HOST_DEVICE static constexpr int k_payload_offset(
@@ -615,6 +684,21 @@ using ByteV2PageLayoutV6 =
     ByteV2PageLayoutV5<Policy, CodecPayloadPolicy, NumKvHeads, PageHeaderBytes,
                        KvHeadMetaBytes, AlignmentBytes, OutlierValueBits,
                        OutlierPoolEntries>;
+
+// V7 compacts the page-pooled outlier directory from separate uint16 planes to
+// one adjacent {uint8 count_minus_one, uint8 pool_index} pair per codec tile.
+// The pair is ignored when the corresponding outlier-mask bit is clear; when
+// set, count_minus_one represents counts 1 through 256 without a branch. The
+// dense codec and pool entry formats are unchanged.
+template <typename Policy = DefaultByteV2TilePolicy,
+          typename CodecPayloadPolicy = ByteV2CodecPayloadPolicy<Policy>,
+          int NumKvHeads = 8, int PageHeaderBytes = 128,
+          int KvHeadMetaBytes = 64, int AlignmentBytes = 128,
+          int OutlierValueBits = 8, int OutlierPoolEntries = 256>
+using ByteV2PageLayoutV7 =
+    ByteV2PageLayoutV5<Policy, CodecPayloadPolicy, NumKvHeads, PageHeaderBytes,
+                       KvHeadMetaBytes, AlignmentBytes, OutlierValueBits,
+                       OutlierPoolEntries, 1>;
 
 template <typename Policy = DefaultByteV2TilePolicy, int NumKvHeads = 8,
           int RawElementBytes = 2, int AlignmentBytes = 128>
