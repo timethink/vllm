@@ -37,6 +37,11 @@ using SplitZipLayout = ByteV2PageLayoutV5<>;
 using Policy = Layout::TilePolicy;
 using RawLayout = ByteV2RawStagingLayout<Policy, Layout::NumKvHeadsValue>;
 
+// Older NVCC versions diagnose a non-dependent false static assertion while
+// parsing a function template, even when an if constexpr caller discards it.
+template <typename...>
+struct DependentFalse : std::false_type {};
+
 // Reader-only arithmetic Static-W16 page.  The dense representation keeps
 // one sign/mantissa byte and one four-bit contiguous exponent-window code per
 // BF16 value.  Sixteen tagged ranges index one page-shared 128-entry exact
@@ -2530,7 +2535,9 @@ struct StaticW16LoaderSharedPageDescriptorImpl
       const Params& params, int valid_rows, AccTensor& acc, AFragment& tCrA,
       const ASmemTensor& tCsA, const KSmemTensor& sK, TiledMma tiled_mma,
       TiledCopyA smem_tiled_copy_A, ThrCopyA smem_thr_copy_A) {
-    static_assert(DirectFragmentK);
+    static_assert(
+        DirectFragmentK || DependentFalse<Params>::value,
+        "direct-fragment K GEMM requires a direct-fragment loader layout");
     fa2::static_w16_direct_k_fragment_gemm(params, valid_rows, acc, tCrA, tCsA,
                                            sK, tiled_mma, smem_tiled_copy_A,
                                            smem_thr_copy_A);

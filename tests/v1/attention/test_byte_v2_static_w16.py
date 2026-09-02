@@ -280,6 +280,47 @@ def test_static_w16_runtime_requires_canonical_fa2_reader(monkeypatch):
     assert byte_v2_ops.byte_v2_static_w16_runtime_is_available()
 
 
+def test_static_w16_fa2_direct_fragment_dispatch_contract():
+    repo_root = Path(__file__).resolve().parents[3]
+    loader_source = (
+        repo_root / "csrc/libtorch_stable/byte_v2/byte_v2_fa2_loader.cuh"
+    ).read_text(encoding="utf-8")
+    fa2_patch_source = (
+        repo_root / "cmake/patches/vllm_flash_attn_byte_v2.patch"
+    ).read_text(encoding="utf-8")
+
+    assert "static_assert(DirectFragmentK);" not in loader_source
+    assert "DirectFragmentK || DependentFalse<Params>::value" in loader_source
+    assert "static constexpr bool Enabled = Loader::DirectFragmentK;" in (
+        fa2_patch_source
+    )
+    assert (
+        "ExternalKvLoaderDirectFragmentKConfig<ExternalKvLoader>::Enabled"
+        in fa2_patch_source
+    )
+
+    direct_call = "ExternalKvLoader::direct_fragment_k_gemm("
+    call_offsets = [
+        offset
+        for offset in range(len(fa2_patch_source))
+        if fa2_patch_source.startswith(direct_call, offset)
+    ]
+    assert len(call_offsets) == 2
+    for call_offset in call_offsets:
+        branch_offset = fa2_patch_source.rfind(
+            "if constexpr (Direct_fragment_k) {", 0, call_offset
+        )
+        fallback_offset = fa2_patch_source.find(
+            "} else if (active_query_warp) {", call_offset
+        )
+        assert 0 < call_offset - branch_offset < 200
+        assert 0 < fallback_offset - call_offset < 600
+        assert (
+            "FLASH_NAMESPACE::gemm("
+            in fa2_patch_source[fallback_offset : fallback_offset + 500]
+        )
+
+
 def test_static_w16_attention_routes_to_canonical_reader(monkeypatch):
     selected_ops = []
     calls = []
